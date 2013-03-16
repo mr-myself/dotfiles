@@ -1,0 +1,17 @@
+Host heroku
+User git
+HostName heroku.com
+IdentityFile ~/.ssh/id_rsa_heroku
+Port 22
+TCPKeepAlive yes
+IdentitiesOnly yes
+
+Host keisuke.hoshino
+HostName bitbucket.org
+IdentityFile ~/.ssh/id_dsa
+# git clone git@keisuke.hoshino:gaiax/payforward.git
+
+Host mr_kei
+HostName bitbucket.org
+IdentityFile ~/.ssh/id_rsa
+# git clone git@mr_kei:mr_kei/signpost.git
