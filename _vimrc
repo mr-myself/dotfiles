@@ -9,15 +9,16 @@ endif
 " let NeoBundle manage NeoBundle
 " required!
 NeoBundle 'Shougo/neobundle.vim'
-"NeoBundle 'Shougo/neocomplcache' "補完機能
-NeoBundle 'thinca/vim-visualstar'
+NeoBundle 'Shougo/neocomplcache' "補完機能
 NeoBundle 'Shougo/vimproc' "非同期実行
+NeoBundle 'thinca/vim-visualstar'
 NeoBundle 'Shougo/vimshell'
 NeoBundle 'Shougo/unite.vim'
 NeoBundle 'git://github.com/thinca/vim-quickrun.git' "\rで実行
 NeoBundle 'Lokaltog/vim-easymotion'
 NeoBundle 'tomtom/tcomment_vim'
 NeoBundle 'molokai' "カラースキーマ名
+NeoBundle 'othree/eregex.vim'
 
 filetype plugin on
 
@@ -52,6 +53,10 @@ let g:rsenseUseOmniFunc = 1
 
 noremap ; :
 noremap : ;
+
+noremap / :M/
+
+map ,ptv :'<,'>! perltidy
 
 " 保存時に行末の空白を除去する
 autocmd BufWritePre * :%s/\s\+$//ge
