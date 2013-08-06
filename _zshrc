@@ -10,14 +10,25 @@ ZSH_THEME="robbyrussell"
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
-alias vi=/usr/local/bin/vim
-alias tmux="tmux -u"
+alias vi='vim'
+alias l='ls -la'
+alias ll='ls -la'
+
+# alias for git
+alias ds='sudo ntpdate ntp.nict.jp'
+alias ce='carton exec'
+
+alias iqube='iqube --api_key=8fa3f97fec900568e1bf3bfc85cb65de875b5c4f/VELAac'
+alias iqubew='iqube --api_key=8fa3f97fec900568e1bf3bfc85cb65de875b5c4f/VELAac -w'
 
 # Set to this to use case-sensitive completion
 # CASE_SENSITIVE="true"
 
-# Comment this out to disable weekly auto-update checks
+# Comment this out to disable bi-weekly auto-update checks
 # DISABLE_AUTO_UPDATE="true"
+
+# Uncomment to change how many often would you like to wait before auto-updates occur? (in days)
+# export UPDATE_ZSH_DAYS=13
 
 # Uncomment following line if you want to disable colors in ls
 # DISABLE_LS_COLORS="true"
@@ -36,12 +47,11 @@ plugins=(git)
 source $ZSH/oh-my-zsh.sh
 
 # Customize to your needs...
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/local/bin/imlib2-config:/sbin:/bin:/usr/sbin:/usr/bin:/root/bin
+export PATH=$PATH:$HOME/node_modules/.bin
+#source ~/perl5/perlbrew/etc/bashrc
 
-export LANG=ja_JP.UTF-8
-
-export PERL_LOCAL_LIB_ROOT="/home/homepage/perl5";
-export PERL_MB_OPT="--install_base /home/homepage/perl5";
-export PERL_MM_OPT="INSTALL_BASE=/home/homepage/perl5";
-export PERL5LIB="/home/homepage/perl5/lib/perl5/i686-linux:/home/homepage/perl5/lib/perl5";
-export PATH="/home/homepage/perl5/bin:/usr/local/pgsql/lib:$PATH";
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/src/postgresql-9.2.1/src/interfaces/libpq
+export PATH="$HOME/.rbenv/bin:$PATH"
+eval "$(rbenv init -)"
+export PATH="$HOME/.plenv/bin:$PATH"
+eval "$(plenv init -)"

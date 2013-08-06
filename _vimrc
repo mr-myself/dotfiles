@@ -14,6 +14,7 @@ NeoBundle 'git://github.com/thinca/vim-quickrun.git' "\rで実行
 NeoBundle 'Lokaltog/vim-easymotion'
 NeoBundle 'tomtom/tcomment_vim'
 NeoBundle 'othree/eregex.vim'
+NeoBundle 'yanktmp.vim'
 
 filetype plugin on
 
@@ -53,6 +54,10 @@ inoremap <C-j> <Down>
 inoremap <C-k> <Up>
 inoremap <C-h> <Left>
 inoremap <C-l> <Right>
+
+nnoremap sy :call YanktmpYank()<CR>
+nnoremap sp :call YanktmpPaste_p()<CR>
+nnoremap sP :call YanktmpPaste_P()<CR>
 
 " OS依存
 " OSのクリップボードを使用する
@@ -121,7 +126,7 @@ let g:jscomplete_use = ['dom',  'moz',  'es6th']
 
 " CofeeScript syntax + 自動compile
 NeoBundle 'kchmck/vim-coffee-script'
-autocmd BufWritePost *.coffee silent CoffeeMake! -cb | cwindow | redraw!
+autocmd BufWritePost *.coffee silent CoffeeMake! -cb |$ cwindow | redraw!
 " js BDDツール
 NeoBundle 'claco/jasmine.vim'
 " indentの深さに色を付ける
@@ -274,7 +279,7 @@ nnoremap U      :<C-u>GundoToggle<CR>
 " 例えば:Alignta = で=でそろえてくれる
 NeoBundle 'h1mesuke/vim-alignta.git'
 set ambiwidth=double
-xnoremap <silent> a: :Alignta  01 :<CR>
+"xnoremap <silent> a: :Alignta  00 :<CR>
 xnoremap al :Alignta<Space>
 
 " キャメル・アンダースコア記法を扱いやすく
@@ -314,7 +319,7 @@ let g:ctrlp_custom_ignore = {
 
 " メモを簡単に取る
 NeoBundle 'glidenote/memolist.vim'
-let g:memolist_path = $HOME . "/Dropbox/アプリ/memolist"
+let g:memolist_path = $HOME . "/memolist"
 let g:memolist_qfixgrep = 1
 nnoremap <silent> ,mn :MemoNew<CR>
 nnoremap <silent> ,ml :MemoList<CR>
@@ -672,8 +677,8 @@ set ruler
 " ステータスラインを常に表示する
 set laststatus=2
 
-" <F11>キーで'paste'と'nopaste'を切り替える
-set pastetoggle=<F11>
+" Ctrl+eキーで'paste'と'nopaste'を切り替える
+set pastetoggle=<C-e>
 
 set cindent
 set tabstop=4
@@ -789,10 +794,6 @@ set clipboard+=unnamedplus,unnamed
 set mouse=a
 set guioptions+=a
 set ttymouse=xterm2
-
-" テンプレートの設定
-autocmd BufNewFile *.rb 0r ~/dotfiles/templates/rb.tpl
-autocmd BufNewFile *.pl 0r ~/dotfiles/templates/pl.tpl
 
 " .vimrcを瞬時に開く
 nnoremap <Space><Space>. :e $MYVIMRC<CR>
