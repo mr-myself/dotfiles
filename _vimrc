@@ -41,7 +41,7 @@ highlight Comment ctermfg=DarkCyan
 "setlocal formatoptions-=o " 挿入モードで改行した時に # を自動挿入しない
 
 
-imap ap / :M/
+" imap ap / :M/
 
 map ,ptv :'<,'>! perltidy
 
@@ -564,7 +564,7 @@ let g:neocomplcache_enable_fuzzy_completion = 1
 let g:neocomplcache_fuzzy_completion_start_length = 2
 
 let g:neosnippet#enable_snipmate_compatibility = 1
-let g:neosnippet#snippets_directory='~/.vim/snipmate-snippets/snippets, ~/dotfiles/snippets,  ~/.vim/snipmate-snippets-rubymotion/snippets'
+let g:neosnippet#snippets_directory='~/.vim/bundle/snipmate-snippets/snippets'
 
 " Define dictionary.
 let g:neocomplcache_dictionary_filetype_lists = {
@@ -618,8 +618,8 @@ smap <expr><TAB> neosnippet#jumpable() ? "\<Plug>(neosnippet_expand_or_jump)" : 
 inoremap <expr><S-TAB>  pumvisible() ? "\<C-p>" : "\<S-TAB>"
 
 " Plugin key-mappings.
-"imap <C-k>     <Plug>(neosnippet_expand_or_jump)
-"smap <C-k>     <Plug>(neosnippet_expand_or_jump)
+imap <C-v>     <Plug>(neosnippet_expand_or_jump)
+smap <C-v>     <Plug>(neosnippet_expand_or_jump)
 
 " For snippet_complete marker.
 if has('conceal')
