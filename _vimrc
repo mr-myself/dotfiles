@@ -15,6 +15,10 @@ NeoBundle 'Lokaltog/vim-easymotion'
 NeoBundle 'tomtom/tcomment_vim'
 NeoBundle 'othree/eregex.vim'
 NeoBundle 'yanktmp.vim'
+NeoBundle 'bling/vim-airline'
+NeoBundle 'alpaca-tc/vim-rails'
+
+let g:airline_powerline_fonts = 1
 
 filetype plugin on
 
@@ -319,7 +323,7 @@ let g:ctrlp_custom_ignore = {
 
 " メモを簡単に取る
 NeoBundle 'glidenote/memolist.vim'
-let g:memolist_path = $HOME . "/memolist"
+let g:memolist_path = $HOME . "/Dropbox/memolist"
 let g:memolist_qfixgrep = 1
 nnoremap <silent> ,mn :MemoNew<CR>
 nnoremap <silent> ,ml :MemoList<CR>
