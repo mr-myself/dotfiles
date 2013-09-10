@@ -17,6 +17,7 @@ NeoBundle 'othree/eregex.vim'
 NeoBundle 'yanktmp.vim'
 NeoBundle 'bling/vim-airline'
 NeoBundle 'alpaca-tc/vim-rails'
+NeoBundle 'slim-template/vim-slim'
 
 let g:airline_powerline_fonts = 1
 
