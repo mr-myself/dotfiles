@@ -18,14 +18,13 @@ NeoBundle 'yanktmp.vim'
 NeoBundle 'bling/vim-airline'
 NeoBundle 'alpaca-tc/vim-rails'
 NeoBundle 'slim-template/vim-slim'
+NeoBundle 'digitaltoad/vim-jade'
 
 let g:airline_powerline_fonts = 1
 
 filetype plugin on
 
 syntax on
-"colorscheme desert
-"colorscheme autumn
 set title
 set encoding=utf-8
 set fileencodings=utf-8,sjis,iso-2022-jp,euc-jp
@@ -33,27 +32,15 @@ set fileformats=unix,dos,mac
 set wrapscan
 set ruler
 set tabstop=4
-"set textwidth=0
 set autoindent
 set showmode
 set number
 set expandtab
 set runtimepath+=/home/homepage/.vim/plugin/
 set backspace=2
-"set formatoptions=q
 highlight Comment ctermfg=DarkCyan
-"setlocal formatoptions-=r " 挿入モードで改行した時に # を自動挿入しない
-"setlocal formatoptions-=o " 挿入モードで改行した時に # を自動挿入しない
-
-
-" imap ap / :M/
 
 map ,ptv :'<,'>! perltidy
-
-" 保存時に行末の空白を除去する
-autocmd BufWritePre * :%s/\s\+$//ge
-" 保存時にtabをスペースに変換する
-"autocmd BufWritePre * :%s/\t/    /ge
 
 inoremap <C-j> <Down>
 inoremap <C-k> <Up>
@@ -125,37 +112,12 @@ NeoBundle 'hail2u/vim-css3-syntax'
 NeoBundle 'jiangmiao/simple-javascript-indenter'
 NeoBundle 'jQuery.git'
 NeoBundle 'jelera/vim-javascript-syntax.git'
-NeoBundle 'teramako/jscomplete-vim.git'
-" DOMとMozilla関連とES6のメソッドを補完
-let g:jscomplete_use = ['dom',  'moz',  'es6th']
+NeoBundle 'Shougo/neosnippet-snippets'
 
 " CofeeScript syntax + 自動compile
 NeoBundle 'kchmck/vim-coffee-script'
-autocmd BufWritePost *.coffee silent CoffeeMake! -cb |$ cwindow | redraw!
-" js BDDツール
-NeoBundle 'claco/jasmine.vim'
-" indentの深さに色を付ける
-NeoBundle 'nathanaelkane/vim-indent-guides'
-let g:indent_guides_enable_on_vim_startup = 1
-let g:indent_guides_start_level           = 2
-let g:indent_guides_auto_colors           = 1
-let g:indent_guides_guide_size            = 1
-
-" 選択部分のキーワードを*を押して検索
-NeoBundle 'thinca/vim-visualstar'
-
-" Vimperator風に移動できる
-" 実行：\\bで後方へ移動、\\wで前方へ移動
-NeoBundle 'Lokaltog/vim-easymotion'
-"嫌だったのでspace spaceに変更
-let g:EasyMotion_leader_key = '<Space>'
-let g:EasyMotion_grouping   = 1
-let g:EasyMotion_keys       = 'fjdkslaureiwoqpvncm'
-let g:EasyMotion_do_shade   = 0
-
-" 簡単にコメントアウトする
-" gcc or C-_でトグル
-NeoBundle 'tomtom/tcomment_vim'
+"autocmd BufWritePost *.coffee silent make! -cb |$ cwindow | redraw!
+autocmd QuickFixCmdPost * nested cwindow | redraw!
 
 " color shcheme
 NeoBundle 'ujihisa/unite-colorscheme'
@@ -190,9 +152,6 @@ let g:yankring_max_display            = 70
 " Yankの履歴参照
 nmap ,y :YRShow<CR>
 
-" 英語の補完を行う
-NeoBundle 'ujihisa/neco-look.git'
-
 " for quickrun.vim
 let g:quickrun_config            = {}
 let g:quickrun_config.objc       = {
@@ -214,16 +173,6 @@ let g:quickrun_config.coffee     = {
       \   'exec' : ['%c -cbp %s']
       \ }
 
-" VimからRSecを実行する
-NeoBundle "skwp/vim-rspec.git"
-nnoremap <silent> ,rs :RunSpec<CR>
-nnoremap <silent> ,rl :RunSpecLine<CR>
-
-" vimでzencodingする
-" Ctrl+y,
-NeoBundle "mattn/zencoding-vim.git"
-let g:user_zen_settings = { 'indentation' : '    ', }
-
 " Programming perl
 NeoBundle "c9s/perlomni.vim"
 NeoBundle "mattn/perlvalidate-vim.git"
@@ -238,14 +187,6 @@ vnoremap ,pt <Esc>:'<,'>! perltidy -se<CR>
 NeoBundle 'moznion/vim-cpanfile'
 NeoBundle 'moznion/syntastic-cpanfile'
 
-" ()や''でくくったりするための補助
-" text-objectの支援
-" vi' で'の中身を選択
-" va' で'も含めて選択 だが
-" cs'" cs"' などと囲っているものに対する操作ができる
-" visualモードのときはSを代用
-NeoBundle "tpope/vim-surround"
-
 " %の拡張
 NeoBundle "tmhedberg/matchit.git"
 
@@ -254,8 +195,6 @@ NeoBundle "smartchr"
 " inoremap <expr> = smartchr#loop(' = ', ' => ', '=', ' == ')
 inoremap <expr> , smartchr#one_of(', ', ',')
 
-" endfunction とかを自動入力
-NeoBundle 'tpope/vim-endwise'
 
 " 前回の操作を.で繰り返す
 NeoBundle 'repeat.vim'
@@ -263,38 +202,13 @@ NeoBundle 'repeat.vim'
 " Ruby環境
 NeoBundle 'vim-ruby/vim-ruby.git'
 NeoBundle 'tpope/vim-rbenv.git'
-" NeoBundle 'tpope/vim-rails.git'
-" NeoBundle 'taichouchou2/vim-rsense'
 au BufNewFile, BufRead Gemfile setl filetype = Gemfile
 au BufWritePost Gemfile call vimproc#system('rbenv ctags')
-
-" let g:rubycomplete_buffer_loading = 1
-" let g:rubycomplete_classes_in_global = 1
-" let g:rubycomplete_rails = 1
-" imap <C-o> <C-x><C-o>
-
-" Vimでプレゼンする？
-NeoBundle 'thinca/vim-showtime.git'
+NeoBundle 'tpope/vim-endwise' "endを自動入力
 
 " undo treeを表示する
 NeoBundle 'sjl/gundo.vim.git'
 nnoremap U      :<C-u>GundoToggle<CR>
-
-" 整列を割と自動でやってくれる
-" 例えば:Alignta = で=でそろえてくれる
-NeoBundle 'h1mesuke/vim-alignta.git'
-set ambiwidth=double
-"xnoremap <silent> a: :Alignta  00 :<CR>
-xnoremap al :Alignta<Space>
-
-" キャメル・アンダースコア記法を扱いやすく
-" ,w ,e ,b
-" v,w
-" d,w
-NeoBundle 'bkad/CamelCaseMotion.git'
-map w ,w
-map e ,e
-map b ,b
 
 " ステータスラインをかっこ良く
 NeoBundle 'Lokaltog/vim-powerline.git'
@@ -303,56 +217,14 @@ let g:Powerline_symbols='fancy'
 " vimからgitをいじる
 NeoBundle 'kmnk/vim-unite-giti.git'
 
-" 読み込みの遅延を測定する
-" 以下で実行
-" :BenchVimrc
-NeoBundle 'mattn/benchvimrc-vim.git'
-
-" HTML5
-NeoBundle 'othree/html5.vim.git'
-
-" テキストオブジェクトで置換
-NeoBundle 'kana/vim-operator-replace.git'
-NeoBundle 'kana/vim-operator-user.git'
-map R <Plug>(operator-replace)
-
 " ファイルを曖昧文字から探し出す
 NeoBundle 'kien/ctrlp.vim.git'
 let g:ctrlp_custom_ignore = {
   \ 'dir':  '\v[\/]\.?(extlib|git|hg|svn)$',
   \ }
 
-" メモを簡単に取る
-NeoBundle 'glidenote/memolist.vim'
-let g:memolist_path = $HOME . "/Dropbox/memolist"
-let g:memolist_qfixgrep = 1
-nnoremap <silent> ,mn :MemoNew<CR>
-nnoremap <silent> ,ml :MemoList<CR>
-nnoremap <silent> ,mg :MemoGrep<CR>
-nnoremap <silent> ,mf :exe "CtrlP" g:memolist_path<cr><f5>
-
-" DayOne投稿用(開発中)
-NeoBundle 'kazuph/dayone.vim'
-nnoremap <silent> ,dn :DayOneNew<CR>
-nnoremap <silent> ,dl :DayOneList<CR>
-nnoremap <silent> ,dg :DayOneGrep<CR>
-
-" RubyMotionの設定
-" TODO:Rubyのときは発動しないようにする
-" NeoBundle 'kazuph/snipmate-snippets-rubymotion.git'
-
-" Haskell
-NeoBundle 'haskell.vim'
-NeoBundle 'dag/vim2hs.git'
-NeoBundle 'eagletmt/ghcmod-vim.git'
-NeoBundle 'ujihisa/neco-ghc.git'
-
 " tmuxやscreenでもヤンクをクリップボードへコピー
 NeoBundle 'kana/vim-fakeclip.git'
-
-" Vimがしゃべるとうれしい・・・よね？
-NeoBundle 'supermomonga/shaberu.vim'
-let g:shaberu_user_define_say_command = 'say -v Kyoko '
 
 " 賢いf
 NeoBundle 'rhysd/clever-f.vim'
@@ -360,8 +232,6 @@ NeoBundle 'rhysd/clever-f.vim'
 " カーソル移動を加速する
 NeoBundle 'rhysd/accelerated-jk.git'
 let g:accelerated_jk_acceleration_table = [10,5,3]
-"nmap j <Plug>(accelerated_jk_gj)
-"nmap k <Plug>(accelerated_jk_gk)
 
 " 日本語固定モード
 NeoBundle 'fuenor/im_control.vim'
@@ -370,26 +240,11 @@ let IM_CtrlMode = 4
 ""ctrl+iで日本語入力固定モードをOnOff
 inoremap <silent> <C-i> <C-^><C-r>=IMState('FixMode')<CR>
 
-" 久しぶりにProcessingが書きたいんだ!
-NeoBundle 'sophacles/vim-processing.git'
-
-" AppleScriptを書く
-NeoBundle 'applescript.vim.git'
-
 " ST2のようにテキスト操作
 NeoBundle 'terryma/vim-multiple-cursors.git'
 
-" 急遽バイナリを弄りたく
-NeoBundle 'Shougo/vinarise'
-NeoBundle 's-yukikaze/vinarise-plugin-peanalysis'
-
-" ちょっとゴニョゴニョしたいときに
-NeoBundle 'scratch.vim'
-
 " gitの差分を表示するぜ
 NeoBundle 'airblade/vim-gitgutter'
-nnoremap <silent> ,gg :<C-u>GitGutterToggle<CR>
-nnoremap <silent> ,gh :<C-u>GitGutterLineHighlightsToggle<CR>
 
 " 以下shougoさんの独壇場
 NeoBundle 'Shougo/neocomplcache',  '',  'default'
@@ -442,10 +297,7 @@ call neobundle#config('vimfiler',  {
       \    'explorer' : 1,
       \ }
       \ })
-" NeoBundleLazy 'Shougo/vimfiler', {
-" \   'autoload' : { 'commands' : [ 'VimFiler' ] },
-" \   'depends': [ 'Shougo/unite.vim' ],
-" \ }
+
 let s:bundle = neobundle#get('vimfiler')
 function! s:bundle.hooks.on_source(bundle)
   let g:vimfiler_as_default_explorer = 1
@@ -474,13 +326,6 @@ call neobundle#config('unite.vim', {
       \                   'complete' : 'customlist, unite#complete_source'},
       \                 'UniteWithCursorWord',  'UniteWithInput']
       \ }})
-" NeoBundleLazy 'Shougo/unite.vim', {
-"       \ 'autoload' : {
-"       \     'commands' : ['Unite', 'UniteWithBufferDir',
-"       \                  'UniteWithCursorWord', 'UniteWithInput'],
-"       \     'functions' : 'unite#start'
-"       \     }
-"       \ }
 
 let s:bundle = neobundle#get('unite.vim')
 function! s:bundle.hooks.on_source(bundle)
@@ -519,46 +364,11 @@ function! s:bundle.hooks.on_source(bundle)
   endfunction
   call unite#custom_default_action('source/bookmark/directory', 'vimfiler')
 endfunction
-"------------------------------------------------------ unite.vim
-" ファイル一覧
-nnoremap <silent> ,uf :<C-u>UniteWithBufferDir -buffer-name=files file<CR>
-" ブックマーク一覧
-nnoremap <silent> ,ub :<C-u>Unite bookmark<CR>
-" ブックマーク追加
-nnoremap <silent> ,ua :<C-u>UniteBookmarkAdd<CR>
-" yank一覧
-nnoremap <silent> ,uy :<C-u>Unite -buffer-name=register register<CR>
-" 常用セット
-nnoremap <silent> ,uu :<C-u>Unite buffer file_mru<CR>
-" tag
-nnoremap <silent> ,ut :Unite tag/include<CR>
-" unite-grep
-nnoremap <silent> ,ug :Unite -no-quit -winheight=15 grep<CR>
-" source
-nnoremap <silent> ,us :Unite source<CR>
-" ref
-nnoremap <silent> ,ur :Unite ref/
-" color scheme の変更
-nnoremap <silent> ,uc :Unite colorscheme<CR>
-" outline表示
-nnoremap <silent> ,uo : <C-u>Unite -no-quit -vertical -winwidth=30 outline<CR>
-" git status
-nnoremap <silent> ,gs :Unite giti/status<CR>
-" git log
-nnoremap <silent> ,gl :Unite giti/log<CR>
 
-"-------------------------------------------------------------------setting neocomplcache
 " Disable AutoComplPop.
 let g:acp_enableAtStartup = 0
 " Use neocomplcache.
 let g:neocomplcache_enable_at_startup = 1
-" Use smartcase.
-" let g:neocomplcache_enable_smart_case = 1
-" Use camel case completion.
-" let g:neocomplcache_enable_camel_case_completion = 1
-" Use underbar completion.
-" let g:neocomplcache_enable_underbar_completion = 1
-" Set minimum syntax keyword length.
 let g:neocomplcache_min_syntax_length = 1
 let g:neocomplcache_lock_buffer_name_pattern = '\*ku\*'
 " "リスト表示
@@ -591,16 +401,10 @@ let g:neocomplcache_keyword_patterns['default'] = '\h\w*'
 inoremap <expr><C-g>     neocomplcache#undo_completion()
 "inoremap <expr><C-l>     neocomplcache#complete_common_string()
 
-" Recommended key-mappings.
-" <CR>: close popup and save indent.
 inoremap <silent> <CR> <C-r>=<SID>my_cr_function()<CR>
 function! s:my_cr_function()
   return neocomplcache#smart_close_popup() . "\<CR>"
-  " For no inserting <CR> key.
-  "return pumvisible() ? neocomplcache#close_popup() : "\<CR>"
 endfunction
-" <C-h>, <BS>: close popup and delete backword char.
-"inoremap <expr><C-h> neocomplcache#smart_close_popup()."\<C-h>"
 inoremap <expr><BS> neocomplcache#smart_close_popup()."\<C-h>"
 inoremap <expr><C-y>  neocomplcache#close_popup()
 inoremap <expr><C-e>  neocomplcache#cancel_popup()
@@ -693,12 +497,16 @@ autocmd FileType aspvbs     setlocal sw=4 sts=4 ts=4 et
 autocmd FileType c          setlocal sw=4 sts=4 ts=4 et
 autocmd FileType cpp        setlocal sw=4 sts=4 ts=4 et
 autocmd FileType cs         setlocal sw=4 sts=4 ts=4 et
+autocmd FileType scss       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType css        setlocal sw=2 sts=2 ts=2 et
 autocmd FileType diff       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType eruby      setlocal sw=4 sts=4 ts=4 et
 autocmd FileType html       setlocal sw=2 sts=2 ts=2 et
+autocmd FileType slim       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType java       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType javascript setlocal sw=2 sts=2 ts=2 et
+autocmd FileType json       setlocal sw=2 sts=2 ts=2 et
+autocmd FileType jade       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType coffee     setlocal sw=2 sts=2 ts=2 et
 autocmd FileType perl       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType php        setlocal sw=4 sts=4 ts=4 et
@@ -758,29 +566,6 @@ autocmd BufWritePre * :%s/\s\+$//ge
 " 保存時にtabをスペースに変換する
 autocmd BufWritePre * :%s/\t/    /ge
 
-" vimgrep検索時に結果一覧を自動的に開く
-augroup grepopen
-  autocmd!
-  autocmd QuickFixCmdPost vimgrep cw
-  autocmd QuickFixCmdPost grep cw
-augroup END
-
-" CTRL-hjklでウィンドウ移動
-" nnoremap 0 ^
-" nnoremap 9 $
-
-"カーソルを表示行で移動する。物理行移動は<C-n>, <C-p>
-" nnoremap j gj
-" nnoremap k gk
-
-" スクロールしても常にカーソルが中央にあるようにする
-" 飽きた
-" set scrolloff=1000
-
-" visualmodeでインテントを＞＜の連打で変更できるようにする
-vnoremap < <gv
-vnoremap > >gv
-
 " ファイルを開いた時に最後のカーソル位置を再現する
 au BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
 
@@ -790,7 +575,6 @@ if has('persistent_undo')
   set undofile
 endif
 
-" OS依存
 " OSのクリップボードを使用する
 " set clipboard=unnamed
 set clipboard+=unnamedplus,unnamed
@@ -817,17 +601,6 @@ nnoremap <Space><Space>.. :<C-u>source $MYVIMRC<CR>
 " 念の為C-cでEsc
 inoremap <C-c> <Esc>
 
-" テキスト全選択
-nnoremap <silent><S-z> gg<S-v>G
-
-" 検索語が真ん中に来るようにする
-nmap n nzz
-nmap N Nzz
-nmap * *zz
-nmap # #zz
-nmap g* g*zz
-nmap g# g#zz
-
 " ヘルプを3倍の速度で引く
 nnoremap <C-h>  :<C-u>help<Space><C-r><C-w><CR>
 
@@ -840,41 +613,5 @@ nnoremap g/ :<C-u>%s/<C-R><C-w>//gc<Left><Left><Left>
 " ビジュアルモードで選択した部分を置換
 vnoremap g/ y:<C-u>%s/<C-R>"//gc<Left><Left><Left>
 
-" 行末までをヤンク
-nmap Y y$
-
-" コマンドモードのマッピング
-cmap <C-a> <Home>
-cmap <C-b> <Left>
-cmap <C-f> <Right>
-cmap <C-d> <Del>
-
-" インサートモードのマッピング
-inoremap <C-e> <End>
-inoremap <C-a> <C-o>^
-inoremap <C-f> <Right>
-inoremap <C-b> <Left>
-inoremap <C-d> <Del>
-
 " バックアップを取らない
 set nobackup
-
-" no bell
-set vb t_vb=
-
-" :CDでカレントディレクトリを移動する
-command! -nargs=? -complete=dir -bang CD  call s:ChangeCurrentDir('<args>', '<bang>')
-function! s:ChangeCurrentDir(directory, bang)
-    if a:directory == ''
-        lcd %:p:h
-    else
-        execute 'lcd' . a:directory
-    endif
-
-    if a:bang == ''
-        pwd
-    endif
-endfunction
-
-" Change current directory.
-nnoremap <silent> <Space>cd :<C-u>CD<CR>
