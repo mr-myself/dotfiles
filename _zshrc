@@ -13,6 +13,7 @@ tmux set-option -gw mode-mouse off
 alias vi='vim'
 alias l='ls -la'
 alias ll='ls -la'
+alias sl='ls'
 alias ce='carton exec'
 alias be='bundle exec'
 alias pe='plenv exec'
@@ -27,6 +28,9 @@ alias gti='git'
 alias pull='git pull'
 alias push='git push'
 alias gs='git status'
+alias ga='git add'
+alias gc='git commit'
+alias grall='git rm $(git ls-files --deleted)'
 
 # Set to this to use case-sensitive completion
 # CASE_SENSITIVE="true"

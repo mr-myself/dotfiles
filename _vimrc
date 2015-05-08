@@ -19,7 +19,9 @@ NeoBundle 'bling/vim-airline'
 NeoBundle 'alpaca-tc/vim-rails'
 NeoBundle 'slim-template/vim-slim'
 NeoBundle 'digitaltoad/vim-jade'
+NeoBundle 'kakkyz81/evervim'
 
+let g:evervim_devtoken='S=s77:U=81fc4e:E=1521b35992a:C=14ac3846b38:P=1cd:A=en-devtoken:V=2:H=fa7856e10da89a7f422725f5b141653f'
 let g:airline_powerline_fonts = 1
 
 filetype plugin on
@@ -457,6 +459,7 @@ au BufNewFile,BufRead *.erb        set filetype=html
 au BufNewFile,BufRead *.tt         set filetype=html
 au BufNewFile,BufRead *.tt2        set filetype=html
 au BufNewFile,BufRead *.scss       set filetype=scss
+au BufNewFile,BufRead *.sass       set filetype=sass
 au BufNewFile,BufRead cpanfile     set filetype=cpanfile
 au BufNewFile,BufRead cpanfile     set syntax=perl.cpanfile
 au BufRead, BufNewFile jquery.*.js set ft=javascript syntax=jquery
@@ -498,6 +501,7 @@ autocmd FileType c          setlocal sw=4 sts=4 ts=4 et
 autocmd FileType cpp        setlocal sw=4 sts=4 ts=4 et
 autocmd FileType cs         setlocal sw=4 sts=4 ts=4 et
 autocmd FileType scss       setlocal sw=2 sts=2 ts=2 et
+autocmd FileType sass       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType css        setlocal sw=2 sts=2 ts=2 et
 autocmd FileType diff       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType eruby      setlocal sw=4 sts=4 ts=4 et
