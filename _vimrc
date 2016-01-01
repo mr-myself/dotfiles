@@ -1,13 +1,16 @@
-set nocompatible
 filetype off
 filetype plugin indent off
 
+set nocompatible
 if has('vim_starting')
   set runtimepath+=~/.vim/bundle/neobundle.vim/
-  call neobundle#rc(expand('~/.vim/bundle/'))
 endif
+
+
 " let NeoBundle manage NeoBundle
 " required!
+call neobundle#begin(expand('~/.vim/bundle/'))
+
 NeoBundle 'Shougo/neobundle.vim'
 NeoBundle 'thinca/vim-visualstar'
 NeoBundle 'git://github.com/thinca/vim-quickrun.git' "\rで実行
@@ -20,6 +23,115 @@ NeoBundle 'alpaca-tc/vim-rails'
 NeoBundle 'slim-template/vim-slim'
 NeoBundle 'digitaltoad/vim-jade'
 NeoBundle 'kakkyz81/evervim'
+NeoBundle 'thinca/vim-qfreplace.git'
+NeoBundle 'thinca/vim-ref' " APIのドキュメントを参照する Shift+K
+NeoBundle 'othree/eregex.vim'
+NeoBundle "tmhedberg/matchit.git"
+NeoBundle "smartchr"
+NeoBundle 'repeat.vim'
+NeoBundle 'sjl/gundo.vim.git'
+NeoBundle 'Lokaltog/vim-powerline.git' " tmuxやscreenでもヤンクをクリップボードへコピー
+NeoBundle 'kana/vim-fakeclip.git'
+NeoBundle 'rhysd/clever-f.vim' " カーソル移動を加速する
+NeoBundle 'rhysd/accelerated-jk.git'
+NeoBundle 'fuenor/im_control.vim'
+NeoBundle 'terryma/vim-multiple-cursors.git'
+NeoBundle 'airblade/vim-gitgutter'
+NeoBundle "sudar/vim-arduino-syntax"
+
+" Javascript
+NeoBundle 'pangloss/vim-javascript.git'
+NeoBundle 'open-browser.vim'
+NeoBundle 'mattn/webapi-vim'
+NeoBundle 'tell-k/vim-browsereload-mac'
+NeoBundle 'hail2u/vim-css3-syntax'
+NeoBundle 'jiangmiao/simple-javascript-indenter'
+NeoBundle 'jQuery.git'
+NeoBundle 'jelera/vim-javascript-syntax.git'
+NeoBundle 'Shougo/neosnippet-snippets'
+NeoBundle "YankRing.vim"
+NeoBundle 'kchmck/vim-coffee-script' " CofeeScript syntax + 自動compile
+
+" color shcheme
+NeoBundle 'ujihisa/unite-colorscheme'
+NeoBundle 'ujihisa/unite-font'
+NeoBundle 'tomasr/molokai'
+
+NeoBundle 'Shougo/vimproc', {
+      \     'build': {
+      \        'windows': 'make_mingw64.mak',
+      \        'unix': 'make -f make_unix.mak',
+      \        'mac': 'make -f make_mac.mak'
+      \     }
+      \   }
+
+
+" Ruby
+NeoBundle 'vim-ruby/vim-ruby.git'
+NeoBundle 'tpope/vim-rbenv.git'
+NeoBundle 'tpope/vim-endwise' "endを自動入力
+NeoBundle 'kmnk/vim-unite-giti.git'
+
+NeoBundle 'Shougo/neocomplcache',  '',  'default'
+call neobundle#config('neocomplcache',  {
+      \ 'lazy' : 1,
+      \ 'autoload' : {
+      \   'commands' : 'NeoComplCacheEnable',
+      \ }})
+NeoBundle 'Shougo/neocomplcache-rsense',  '',  'default'
+call neobundle#config('neocomplcache-rsense',  {
+      \ 'lazy' : 1,
+      \ 'depends' : 'Shougo/neocomplcache',
+      \ 'autoload' : { 'filetypes' : 'ruby' }
+      \ })
+NeoBundle 'Shougo/neosnippet',  '',  'default'
+call neobundle#config('neosnippet',  {
+      \ 'lazy' : 1,
+      \ 'autoload' : {
+      \   'insert' : 1,
+      \   'filetypes' : 'snippet',
+      \   'unite_sources' : ['snippet',  'neosnippet/user',  'neosnippet/runtime'],
+      \ }})
+NeoBundle 'kazuph/snipmate-snippets.git'
+NeoBundle 'tsukkee/unite-tag.git'
+NeoBundle 'h1mesuke/unite-outline'
+
+" NeoBundle 'Shougo/vimfiler.git'
+NeoBundle 'Shougo/vimfiler',  '',  'default'
+call neobundle#config('vimfiler',  {
+      \ 'lazy' : 1,
+      \ 'depends' : 'Shougo/unite.vim',
+      \ 'autoload' : {
+      \    'commands' : [
+      \                  { 'name' : 'VimFiler',
+      \                    'complete' : 'customlist, vimfiler#complete' },
+      \                  { 'name' : 'VimFilerExplorer',
+      \                    'complete' : 'customlist, vimfiler#complete' },
+      \                  { 'name' : 'Edit',
+      \                    'complete' : 'customlist, vimfiler#complete' },
+      \                  { 'name' : 'Write',
+      \                    'complete' : 'customlist, vimfiler#complete' },
+      \                  'Read',  'Source'],
+      \    'mappings' : ['<Plug>(vimfiler_switch)'],
+      \    'explorer' : 1,
+      \ }
+      \ })
+NeoBundleLazy 'Shougo/vimshell', {
+\   'autoload' : { 'commands' : [ 'VimShell' ] },
+\   'depends': [ 'Shougo/vimproc' ],
+\ }
+NeoBundle 'Shougo/unite.vim',  '',  'default'
+call neobundle#config('unite.vim', {
+      \ 'lazy' : 1,
+      \ 'autoload' : {
+      \   'commands' : [{ 'name' : 'Unite',
+      \                   'complete' : 'customlist, unite#complete_source'},
+      \                 'UniteWithCursorWord',  'UniteWithInput']
+      \ }})
+
+
+call neobundle#end()
+
 
 let g:evervim_devtoken='S=s77:U=81fc4e:E=1521b35992a:C=14ac3846b38:P=1cd:A=en-devtoken:V=2:H=fa7856e10da89a7f422725f5b141653f'
 let g:airline_powerline_fonts = 1
@@ -102,52 +214,16 @@ endfunction
 au! BufWritePost *.pm call s:check_package_name()
 
 " JS支援
-NeoBundle 'pangloss/vim-javascript.git'
 let g:html_indent_inctags  = "html, body, head, tbody"
 let g:html_indent_autotags = "th, td, tr, tfoot, thead"
 let g:html_indent_script1  = "inc"
 let g:html_indent_style1   = "inc"
-NeoBundle 'open-browser.vim'
-NeoBundle 'mattn/webapi-vim'
-NeoBundle 'tell-k/vim-browsereload-mac'
-NeoBundle 'hail2u/vim-css3-syntax'
-NeoBundle 'jiangmiao/simple-javascript-indenter'
-NeoBundle 'jQuery.git'
-NeoBundle 'jelera/vim-javascript-syntax.git'
-NeoBundle 'Shougo/neosnippet-snippets'
-
-" CofeeScript syntax + 自動compile
-NeoBundle 'kchmck/vim-coffee-script'
 "autocmd BufWritePost *.coffee silent make! -cb |$ cwindow | redraw!
 autocmd QuickFixCmdPost * nested cwindow | redraw!
 
-" color shcheme
-NeoBundle 'ujihisa/unite-colorscheme'
-NeoBundle 'ujihisa/unite-font'
-NeoBundle 'tomasr/molokai'
-colorscheme molokai
-
-" Shogoさんの力を借りる
-NeoBundle 'Shougo/vimproc', {
-      \     'build': {
-      \        'windows': 'make_mingw64.mak',
-      \        'unix': 'make -f make_unix.mak',
-      \        'mac': 'make -f make_mac.mak'
-      \     }
-      \   }
-
-NeoBundle 'thinca/vim-qfreplace.git'
-" APIのドキュメントを参照する
-" Shift+K
-NeoBundle 'thinca/vim-ref'
-
-" 正規表現をPerl風に
-" :%S///gc
-NeoBundle 'othree/eregex.vim'
 nnoremap / :M/
 
 " ヤンクを辿れるようにする
-NeoBundle "YankRing.vim"
 let g:yankring_manual_clipboard_check = 0
 let g:yankring_max_history            = 30
 let g:yankring_max_display            = 70
@@ -175,130 +251,32 @@ let g:quickrun_config.coffee     = {
       \   'exec' : ['%c -cbp %s']
       \ }
 
-" Programming perl
-NeoBundle "c9s/perlomni.vim"
-NeoBundle "mattn/perlvalidate-vim.git"
-NeoBundle "petdance/vim-perl"
-NeoBundle "y-uuki/unite-perl-module.vim"
-NeoBundle "y-uuki/perl-local-lib-path.vim"
-autocmd FileType perl PerlLocalLibPath
-nnoremap ,pt <Esc>:%! perltidy -se<CR>
-vnoremap ,pt <Esc>:'<,'>! perltidy -se<CR>
-
-" cpanfile用
-NeoBundle 'moznion/vim-cpanfile'
-NeoBundle 'moznion/syntastic-cpanfile'
-
-" %の拡張
-NeoBundle "tmhedberg/matchit.git"
-
-" =と押して = となるようにする他
-NeoBundle "smartchr"
 " inoremap <expr> = smartchr#loop(' = ', ' => ', '=', ' == ')
 inoremap <expr> , smartchr#one_of(', ', ',')
 
-
-" 前回の操作を.で繰り返す
-NeoBundle 'repeat.vim'
-
 " Ruby環境
-NeoBundle 'vim-ruby/vim-ruby.git'
-NeoBundle 'tpope/vim-rbenv.git'
 au BufNewFile, BufRead Gemfile setl filetype = Gemfile
 au BufWritePost Gemfile call vimproc#system('rbenv ctags')
-NeoBundle 'tpope/vim-endwise' "endを自動入力
 
 " undo treeを表示する
-NeoBundle 'sjl/gundo.vim.git'
 nnoremap U      :<C-u>GundoToggle<CR>
 
 " ステータスラインをかっこ良く
-NeoBundle 'Lokaltog/vim-powerline.git'
 let g:Powerline_symbols='fancy'
 
-" vimからgitをいじる
-NeoBundle 'kmnk/vim-unite-giti.git'
-
-" ファイルを曖昧文字から探し出す
-NeoBundle 'kien/ctrlp.vim.git'
-let g:ctrlp_custom_ignore = {
-  \ 'dir':  '\v[\/]\.?(extlib|git|hg|svn)$',
-  \ }
-
-" tmuxやscreenでもヤンクをクリップボードへコピー
-NeoBundle 'kana/vim-fakeclip.git'
-
-" 賢いf
-NeoBundle 'rhysd/clever-f.vim'
-
-" カーソル移動を加速する
-NeoBundle 'rhysd/accelerated-jk.git'
 let g:accelerated_jk_acceleration_table = [10,5,3]
 
-" 日本語固定モード
-NeoBundle 'fuenor/im_control.vim'
 "<C-^>でIM制御が行える場合の設定
 let IM_CtrlMode = 4
 ""ctrl+iで日本語入力固定モードをOnOff
 inoremap <silent> <C-i> <C-^><C-r>=IMState('FixMode')<CR>
 
-" ST2のようにテキスト操作
-NeoBundle 'terryma/vim-multiple-cursors.git'
-
-" gitの差分を表示するぜ
-NeoBundle 'airblade/vim-gitgutter'
-
-" 以下shougoさんの独壇場
-NeoBundle 'Shougo/neocomplcache',  '',  'default'
-call neobundle#config('neocomplcache',  {
-      \ 'lazy' : 1,
-      \ 'autoload' : {
-      \   'commands' : 'NeoComplCacheEnable',
-      \ }})
-NeoBundle 'Shougo/neocomplcache-rsense',  '',  'default'
-call neobundle#config('neocomplcache-rsense',  {
-      \ 'lazy' : 1,
-      \ 'depends' : 'Shougo/neocomplcache',
-      \ 'autoload' : { 'filetypes' : 'ruby' }
-      \ })
-NeoBundle 'Shougo/neosnippet',  '',  'default'
-call neobundle#config('neosnippet',  {
-      \ 'lazy' : 1,
-      \ 'autoload' : {
-      \   'insert' : 1,
-      \   'filetypes' : 'snippet',
-      \   'unite_sources' : ['snippet',  'neosnippet/user',  'neosnippet/runtime'],
-      \ }})
 
 set completeopt-=preview
-NeoBundle 'kazuph/snipmate-snippets.git'
-NeoBundle 'tsukkee/unite-tag.git'
 autocmd BufEnter *
             \   if empty(&buftype)
             \|      nnoremap <buffer> <C-]> :<C-u>UniteWithCursorWord -immediately tag<CR>
             \|  endif
-NeoBundle 'h1mesuke/unite-outline'
-
-" NeoBundle 'Shougo/vimfiler.git'
-NeoBundle 'Shougo/vimfiler',  '',  'default'
-call neobundle#config('vimfiler',  {
-      \ 'lazy' : 1,
-      \ 'depends' : 'Shougo/unite.vim',
-      \ 'autoload' : {
-      \    'commands' : [
-      \                  { 'name' : 'VimFiler',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  { 'name' : 'VimFilerExplorer',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  { 'name' : 'Edit',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  { 'name' : 'Write',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  'Read',  'Source'],
-      \    'mappings' : ['<Plug>(vimfiler_switch)'],
-      \    'explorer' : 1,
-      \ }
-      \ })
 
 let s:bundle = neobundle#get('vimfiler')
 function! s:bundle.hooks.on_source(bundle)
@@ -310,24 +288,10 @@ autocmd FileType vimfiler
         \ nnoremap <buffer><silent>/
         \ :<C-u>Unite file -default-action=vimfiler<CR>
 
-" NeoBundle 'Shougo/vimshell.git'
-NeoBundleLazy 'Shougo/vimshell', {
-\   'autoload' : { 'commands' : [ 'VimShell' ] },
-\   'depends': [ 'Shougo/vimproc' ],
-\ }
 let s:bundle = neobundle#get('vimshell')
 function! s:bundle.hooks.on_source(bundle)
 endfunction
 nnoremap ,vs :VimShell<CR>
-
-NeoBundle 'Shougo/unite.vim',  '',  'default'
-call neobundle#config('unite.vim', {
-      \ 'lazy' : 1,
-      \ 'autoload' : {
-      \   'commands' : [{ 'name' : 'Unite',
-      \                   'complete' : 'customlist, unite#complete_source'},
-      \                 'UniteWithCursorWord',  'UniteWithInput']
-      \ }})
 
 let s:bundle = neobundle#get('unite.vim')
 function! s:bundle.hooks.on_source(bundle)
@@ -619,3 +583,4 @@ vnoremap g/ y:<C-u>%s/<C-R>"//gc<Left><Left><Left>
 
 " バックアップを取らない
 set nobackup
+colorscheme molokai
