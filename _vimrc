@@ -13,7 +13,7 @@ call neobundle#begin(expand('~/.vim/bundle/'))
 
 NeoBundle 'Shougo/neobundle.vim'
 NeoBundle 'thinca/vim-visualstar'
-NeoBundle 'git://github.com/thinca/vim-quickrun.git' "\rで実行
+NeoBundle 'git@github.com/thinca/vim-quickrun.git' "\rで実行
 NeoBundle 'Lokaltog/vim-easymotion'
 NeoBundle 'tomtom/tcomment_vim'
 NeoBundle 'othree/eregex.vim'
@@ -145,7 +145,7 @@ set fileencodings=utf-8,sjis,iso-2022-jp,euc-jp
 set fileformats=unix,dos,mac
 set wrapscan
 set ruler
-set tabstop=4
+set tabstop=2
 set autoindent
 set showmode
 set number
@@ -457,7 +457,7 @@ set laststatus=2
 set pastetoggle=<C-e>
 
 set cindent
-set tabstop=4
+set tabstop=2
 set shiftwidth=4
 autocmd FileType apache     setlocal sw=4 sts=4 ts=4 et
 autocmd FileType aspvbs     setlocal sw=4 sts=4 ts=4 et

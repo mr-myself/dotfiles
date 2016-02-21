@@ -6,7 +6,7 @@ ZSH=$HOME/.oh-my-zsh
 # Optionally, if you set this to "random", it'll load a random theme each
 # time that oh-my-zsh is loaded.
 ZSH_THEME="robbyrussell"
-tmux set-option -gw mode-mouse off
+tmux set-option -gw mouse off
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
@@ -80,9 +80,6 @@ export PATH=/Applications/Vagrant/bin:$PATH
 export RBENV_ROOT=/usr/local/var/rbenv
 export PATH="$RBENV_ROOT/bin:$PATH"
 eval "$(rbenv init -)"
-
-export PATH="$HOME/.plenv/bin:$PATH"
-eval "$(plenv init -)"
 
 ### Added by the Heroku Toolbelt
 export PATH="/usr/local/heroku/bin:$PATH"
