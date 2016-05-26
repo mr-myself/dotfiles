@@ -13,7 +13,7 @@ call neobundle#begin(expand('~/.vim/bundle/'))
 
 NeoBundle 'Shougo/neobundle.vim'
 NeoBundle 'thinca/vim-visualstar'
-NeoBundle 'git@github.com/thinca/vim-quickrun.git' "\rで実行
+NeoBundle 'thinca/vim-quickrun.git' "\rで実行
 NeoBundle 'Lokaltog/vim-easymotion'
 NeoBundle 'tomtom/tcomment_vim'
 NeoBundle 'othree/eregex.vim'
@@ -38,6 +38,7 @@ NeoBundle 'fuenor/im_control.vim'
 NeoBundle 'terryma/vim-multiple-cursors.git'
 NeoBundle 'airblade/vim-gitgutter'
 NeoBundle "sudar/vim-arduino-syntax"
+NeoBundle 'Shougo/neocomplete.vim'
 
 " Javascript
 NeoBundle 'pangloss/vim-javascript.git'
@@ -48,10 +49,8 @@ NeoBundle 'hail2u/vim-css3-syntax'
 NeoBundle 'jiangmiao/simple-javascript-indenter'
 NeoBundle 'jQuery.git'
 NeoBundle 'jelera/vim-javascript-syntax.git'
-NeoBundle 'Shougo/neosnippet-snippets'
 NeoBundle "YankRing.vim"
 NeoBundle 'kchmck/vim-coffee-script' " CofeeScript syntax + 自動compile
-
 " color shcheme
 NeoBundle 'ujihisa/unite-colorscheme'
 NeoBundle 'ujihisa/unite-font'
@@ -71,28 +70,6 @@ NeoBundle 'vim-ruby/vim-ruby.git'
 NeoBundle 'tpope/vim-rbenv.git'
 NeoBundle 'tpope/vim-endwise' "endを自動入力
 NeoBundle 'kmnk/vim-unite-giti.git'
-
-NeoBundle 'Shougo/neocomplcache',  '',  'default'
-call neobundle#config('neocomplcache',  {
-      \ 'lazy' : 1,
-      \ 'autoload' : {
-      \   'commands' : 'NeoComplCacheEnable',
-      \ }})
-NeoBundle 'Shougo/neocomplcache-rsense',  '',  'default'
-call neobundle#config('neocomplcache-rsense',  {
-      \ 'lazy' : 1,
-      \ 'depends' : 'Shougo/neocomplcache',
-      \ 'autoload' : { 'filetypes' : 'ruby' }
-      \ })
-NeoBundle 'Shougo/neosnippet',  '',  'default'
-call neobundle#config('neosnippet',  {
-      \ 'lazy' : 1,
-      \ 'autoload' : {
-      \   'insert' : 1,
-      \   'filetypes' : 'snippet',
-      \   'unite_sources' : ['snippet',  'neosnippet/user',  'neosnippet/runtime'],
-      \ }})
-NeoBundle 'kazuph/snipmate-snippets.git'
 NeoBundle 'tsukkee/unite-tag.git'
 NeoBundle 'h1mesuke/unite-outline'
 
@@ -141,7 +118,7 @@ filetype plugin on
 syntax on
 set title
 set encoding=utf-8
-set fileencodings=utf-8,sjis,iso-2022-jp,euc-jp
+set fileencodings=ucs-bom,utf-8,iso-2022-jp,sjis,cp932,euc-jp,cp20932
 set fileformats=unix,dos,mac
 set wrapscan
 set ruler
@@ -251,6 +228,9 @@ let g:quickrun_config.coffee     = {
       \   'exec' : ['%c -cbp %s']
       \ }
 
+" for neocomplete
+let g:neocomplete#enable_at_startup = 1
+
 " inoremap <expr> = smartchr#loop(' = ', ' => ', '=', ' == ')
 inoremap <expr> , smartchr#one_of(', ', ',')
 
@@ -333,47 +313,6 @@ endfunction
 
 " Disable AutoComplPop.
 let g:acp_enableAtStartup = 0
-" Use neocomplcache.
-let g:neocomplcache_enable_at_startup = 1
-let g:neocomplcache_min_syntax_length = 1
-let g:neocomplcache_lock_buffer_name_pattern = '\*ku\*'
-" "リスト表示
-let g:neocomplcache_max_list = 300
-let g:neocomplcache_max_keyword_width = 20
-
-let g:neocomplcache_enable_fuzzy_completion = 1
-let g:neocomplcache_fuzzy_completion_start_length = 2
-
-let g:neosnippet#enable_snipmate_compatibility = 1
-let g:neosnippet#snippets_directory='~/.vim/bundle/snipmate-snippets/snippets'
-
-" Define dictionary.
-let g:neocomplcache_dictionary_filetype_lists = {
-      \ 'default' : '',
-      \ 'vimshell' : $HOME.'/.vimshell_hist',
-      \ 'perl'     : $HOME . '/dotfiles/dict/perl.dict',
-      \ 'ruby'     : $HOME . '/dotfiles/dict/ruby.dict',
-      \ 'scheme'   : $HOME.'/.gosh_completions',
-      \ 'cpanfile' : $HOME . '/.vim/bundle/vim-cpanfile/dict/cpanfile.dict'
-      \ }
-
-" Define keyword.
-if !exists('g:neocomplcache_keyword_patterns')
-  let g:neocomplcache_keyword_patterns = {}
-endif
-let g:neocomplcache_keyword_patterns['default'] = '\h\w*'
-
-" Plugin key-mappings.
-inoremap <expr><C-g>     neocomplcache#undo_completion()
-"inoremap <expr><C-l>     neocomplcache#complete_common_string()
-
-inoremap <silent> <CR> <C-r>=<SID>my_cr_function()<CR>
-function! s:my_cr_function()
-  return neocomplcache#smart_close_popup() . "\<CR>"
-endfunction
-inoremap <expr><BS> neocomplcache#smart_close_popup()."\<C-h>"
-inoremap <expr><C-y>  neocomplcache#close_popup()
-inoremap <expr><C-e>  neocomplcache#cancel_popup()
 
 " Enable omni completion.
 autocmd FileType css setlocal omnifunc=csscomplete#CompleteCSS
@@ -388,13 +327,9 @@ endif
 let g:neocomplcache_omni_patterns.perl = '\h\w*->\h\w*|\h\w*::'
 
 " <TAB>: completion.
-imap <expr><TAB> pumvisible() ? "\<C-n>" : neosnippet#jumpable() ? "\<Plug>(neosnippet_expand_or_jump)" : "\<TAB>"
-smap <expr><TAB> neosnippet#jumpable() ? "\<Plug>(neosnippet_expand_or_jump)" : "\<TAB>"
+imap <expr><TAB> "\<TAB>"
+smap <expr><TAB> "\<TAB>"
 inoremap <expr><S-TAB>  pumvisible() ? "\<C-p>" : "\<S-TAB>"
-
-" Plugin key-mappings.
-imap <C-v>     <Plug>(neosnippet_expand_or_jump)
-smap <C-v>     <Plug>(neosnippet_expand_or_jump)
 
 " For snippet_complete marker.
 if has('conceal')
@@ -468,11 +403,11 @@ autocmd FileType scss       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType sass       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType css        setlocal sw=2 sts=2 ts=2 et
 autocmd FileType diff       setlocal sw=4 sts=4 ts=4 et
-autocmd FileType eruby      setlocal sw=4 sts=4 ts=4 et
+autocmd FileType eruby      setlocal sw=2 sts=2 ts=2 et
 autocmd FileType html       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType slim       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType java       setlocal sw=4 sts=4 ts=4 et
-autocmd FileType javascript setlocal sw=2 sts=2 ts=2 et
+autocmd FileType javascript setlocal sw=4 sts=4 ts=4 et
 autocmd FileType json       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType jade       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType coffee     setlocal sw=2 sts=2 ts=2 et
@@ -554,14 +489,6 @@ set ttymouse=xterm2
 
 " .vimrcを瞬時に開く
 nnoremap <Space><Space>. :e $MYVIMRC<CR>
-
-" snippets/perl.snipを瞬時に開く
-nnoremap <Space><Space>ps :e $HOME/dotfiles/snippets/perl.snip<CR>
-nnoremap <Space><Space>pd :e $HOME/dotfiles/dict/perl.dict<CR>
-
-" snippets/ruby.snipを瞬時に開く
-nnoremap <Space><Space>rs :e $HOME/dotfiles/snippets/ruby.snip<CR>
-nnoremap <Space><Space>rd :e $HOME/dotfiles/dict/ruby.dict<CR>
 
 " vimrcの設定を反映
 nnoremap <Space><Space>.. :<C-u>source $MYVIMRC<CR>
