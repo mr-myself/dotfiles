@@ -83,3 +83,14 @@ eval "$(rbenv init -)"
 
 ### Added by the Heroku Toolbelt
 export PATH="/usr/local/heroku/bin:$PATH"
+
+# added by travis gem
+[ -f /Users/keisuke.hoshino/.travis/travis.sh ] && source /Users/keisuke.hoshino/.travis/travis.sh
+export PATH="/usr/local/sbin:$PATH"
+
+function peco-vim {
+  vim "$( ls | peco )"
+}
+
+# nodebrew
+export PATH=$HOME/.nodebrew/current/bin:$PATH
