@@ -2,6 +2,7 @@ filetype off
 filetype plugin indent off
 
 set nocompatible
+
 if has('vim_starting')
   set runtimepath+=~/.vim/bundle/neobundle.vim/
 endif
@@ -37,6 +38,7 @@ NeoBundle 'terryma/vim-multiple-cursors.git'
 NeoBundle 'airblade/vim-gitgutter'
 NeoBundle "sudar/vim-arduino-syntax"
 NeoBundle 'Shougo/neocomplete.vim'
+NeoBundle 'wakatime/vim-wakatime'
 
 " Javascript
 NeoBundle 'pangloss/vim-javascript.git'
@@ -60,6 +62,9 @@ NeoBundle 'tpope/vim-endwise' "endを自動入力
 NeoBundle 'kmnk/vim-unite-giti.git'
 NeoBundle 'tsukkee/unite-tag.git'
 NeoBundle 'h1mesuke/unite-outline'
+
+" Elixir
+NeoBundle 'elixir-lang/vim-elixir'
 
 " Async task execution
 NeoBundle 'Shougo/vimproc', {
@@ -117,7 +122,7 @@ let g:html_indent_script1  = "inc"
 let g:html_indent_style1   = "inc"
 autocmd QuickFixCmdPost * nested cwindow | redraw!
 
-let g:yankring_manual_clipboard_check = 0
+"let g:yankring_manual_clipboard_check = 0
 let g:yankring_max_history            = 30
 let g:yankring_max_display            = 70
 nmap ,y :YRShow<CR>
@@ -279,10 +284,14 @@ set backspace=2
 set mouse=a " ターミナルでマウスを使用できるようにする
 set guioptions+=a
 set ttymouse=xterm2
-set clipboard+=unnamedplus,unnamed " set clipboard=unnamed
+"set clipboard+=unnamed,unnamedplus " set clipboard=unnamed
 set lazyredraw
 set nobackup
 set helplang=ja
+
+if $TMUX == ''
+  set clipboard+=unnamed,unnamedplus
+end
 
 highlight Comment ctermfg=DarkCyan
 
@@ -352,7 +361,8 @@ autocmd FileType html       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType slim       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType java       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType javascript setlocal sw=4 sts=4 ts=4 et
-autocmd FileType json       setlocal sw=2 sts=2 ts=2 et
+autocmd FileType jsx        setlocal sw=2 sts=2 ts=2 et
+autocmd FileType json       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType jade       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType coffee     setlocal sw=2 sts=2 ts=2 et
 autocmd FileType perl       setlocal sw=4 sts=4 ts=4 et

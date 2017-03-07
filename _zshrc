@@ -22,6 +22,7 @@ alias iqube='plenv exec iqube --api_key=8fa3f97fec900568e1bf3bfc85cb65de875b5c4f
 alias iqubew='plenv exec iqube --api_key=8fa3f97fec900568e1bf3bfc85cb65de875b5c4f/VELAac --week'
 alias spec='rspec'
 alias ack='pe ack'
+alias webserver="twistd -n web --path ."
 
 #git周辺の設定
 alias gti='git'
@@ -94,3 +95,16 @@ function peco-vim {
 
 # nodebrew
 export PATH=$HOME/.nodebrew/current/bin:$PATH
+
+# for tag-ag (https://github.com/aykamko/tag)
+if (( $+commands[tag] )); then
+  tag() { command tag "$@"; source ${TAG_ALIAS_FILE:-/tmp/tag_aliases} 2>/dev/null }
+  alias ag=tag
+fi
+alias ipython='ipython --pylab'
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+eval $(/usr/libexec/path_helper -s)
+
+export PATH=~/Library/Python/2.7/bin:$PATH
