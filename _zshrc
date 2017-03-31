@@ -77,11 +77,6 @@ export DYLD_LIBRARY_PATH=/usr/local/mysql/lib:$DYLD_LIBRARY_PATH
 export PATH=$PATH:/usr/bin/vagrant
 export PATH=/Applications/Vagrant/bin:$PATH
 
-#export PATH="$HOME/.rbenv/bin:$PATH"
-export RBENV_ROOT=/usr/local/var/rbenv
-export PATH="$RBENV_ROOT/bin:$PATH"
-eval "$(rbenv init -)"
-
 ### Added by the Heroku Toolbelt
 export PATH="/usr/local/heroku/bin:$PATH"
 
@@ -108,3 +103,9 @@ eval "$(pyenv init -)"
 eval $(/usr/libexec/path_helper -s)
 
 export PATH=~/Library/Python/2.7/bin:$PATH
+
+#export PATH="$HOME/.rbenv/bin:$PATH"
+export RBENV_ROOT=/usr/local/var/rbenv
+export PATH="$RBENV_ROOT/bin:$PATH"
+eval "$(rbenv init -)"
+
