@@ -15,14 +15,10 @@ alias vi='vim'
 alias l='ls -la'
 alias ll='ls -la'
 alias sl='ls'
-alias ce='carton exec'
 alias be='bundle exec'
 alias pe='plenv exec'
 alias re='rbenv exec'
-alias iqube='plenv exec iqube --api_key=8fa3f97fec900568e1bf3bfc85cb65de875b5c4f/VELAac'
-alias iqubew='plenv exec iqube --api_key=8fa3f97fec900568e1bf3bfc85cb65de875b5c4f/VELAac --week'
 alias spec='rspec'
-alias ack='pe ack'
 alias webserver="twistd -n web --path ."
 
 #git周辺の設定
@@ -33,6 +29,9 @@ alias gs='git status'
 alias ga='git add'
 alias gc='git commit'
 alias grall='git rm $(git ls-files --deleted)'
+
+# mac crontab
+alias crontabopen='env EDITOR=nano crontab -e'
 
 # Set to this to use case-sensitive completion
 # CASE_SENSITIVE="true"
