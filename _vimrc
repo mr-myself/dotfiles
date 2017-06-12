@@ -1,115 +1,108 @@
+if &compatible
+  set nocompatible
+endif
+
+"dein.vimのディレクトリ
+let s:dein_dir = expand('~/.cache/dein')
+let s:dein_repo_dir = s:dein_dir . '/repos/github.com/Shougo/dein.vim'
+
+" なければgit clone
+if !isdirectory(s:dein_repo_dir)
+  execute '!git clone https://github.com/Shougo/dein.vim' s:dein_repo_dir
+endif
+execute 'set runtimepath^=' . s:dein_repo_dir
+
+if dein#load_state(s:dein_dir)
+  call dein#begin(s:dein_dir)
+
+  call dein#add('Shougo/dein.vim')
+  call dein#add('Shougo/neocomplete.vim')
+  call dein#add('Shougo/vimproc.vim', {'build' : 'make'})
+
+  " below plugins should be loading from dein.toml
+  call dein#add('thinca/vim-visualstar')
+  call dein#add('thinca/vim-quickrun.git')
+  call dein#add('Lokaltog/vim-easymotion')
+  call dein#add('tomtom/tcomment_vim')
+  call dein#add('othree/eregex.vim')
+  call dein#add('yanktmp.vim')
+  call dein#add('bling/vim-airline')
+  call dein#add('alpaca-tc/vim-rails')
+  call dein#add('slim-template/vim-slim')
+  call dein#add('digitaltoad/vim-jade')
+  call dein#add('kakkyz81/evervim')
+  call dein#add('thinca/vim-qfreplace.git')
+  call dein#add('thinca/vim-ref')
+  call dein#add('othree/eregex.vim')
+  call dein#add("tmhedberg/matchit.git")
+  call dein#add('repeat.vim')
+  call dein#add('sjl/gundo.vim.git')
+  call dein#add('Lokaltog/vim-powerline.git')
+  call dein#add('kana/vim-fakeclip.git')
+  call dein#add('rhysd/clever-f.vim')
+  call dein#add('rhysd/accelerated-jk.git')
+  call dein#add('fuenor/im_control.vim')
+  call dein#add('terryma/vim-multiple-cursors.git')
+  call dein#add('airblade/vim-gitgutter')
+  call dein#add('sudar/vim-arduino-syntax')
+  call dein#add('Shougo/vimshell')
+
+  " below plugins should be loading from dein_lazy.toml
+  call dein#add('pangloss/vim-javascript.git')
+  call dein#add('open-browser.vim')
+  call dein#add('mattn/webapi-vim')
+  call dein#add('tell-k/vim-browsereload-mac')
+  call dein#add('hail2u/vim-css3-syntax')
+  call dein#add('jiangmiao/simple-javascript-indenter')
+  call dein#add('jQuery.git')
+  call dein#add('jelera/vim-javascript-syntax.git')
+  call dein#add('Shougo/neosnippet-snippets')
+  call dein#add('YankRing.vim')
+  call dein#add('kchmck/vim-coffee-script')
+
+  call dein#add('vim-ruby/vim-ruby.git')
+  call dein#add('tpope/vim-rbenv.git')
+  call dein#add('tpope/vim-endwise.git')
+  call dein#add('kmnk/vim-unite-giti.git')
+
+  call dein#add('elixir-lang/vim-elixir')
+
+  call dein#add('Shougo/neocomplete.vim')
+  call dein#add('Shougo/neosnippet')
+  call dein#add('kazuph/snipmate-snippets.git')
+  call dein#add('tsukkee/unite-tag.git')
+  call dein#add('h1mesuke/unite-outline')
+  call dein#add('Shougo/vimfiler')
+  call dein#add('Shougo/unite.vim')
+
+  call dein#add('tomasr/molokai')
+
+  "let g:rc_dir    = expand('~/.vim/rc')
+  "let s:toml      = g:rc_dir . '/dein.toml'
+  "let s:lazy_toml = g:rc_dir . '/dein_lazy.toml'
+
+  ""TOML を読み込み、キャッシュしておく
+  "call dein#load_toml(s:toml,      {'lazy': 0})
+  "call dein#load_toml(s:lazy_toml, {'lazy': 1})
+
+  call dein#end()
+  call dein#save_state()
+endif
+
+if dein#check_install()
+  call dein#install()
+endif
+
+syntax enable
+
 filetype off
 filetype plugin indent off
 
 set nocompatible
-if has('vim_starting')
-  set runtimepath+=~/.vim/bundle/neobundle.vim/
-endif
-
-" required!
-call neobundle#begin(expand('~/.vim/bundle/'))
-
-NeoBundle 'Shougo/neobundle.vim'
-NeoBundle 'thinca/vim-visualstar'
-NeoBundle 'thinca/vim-quickrun.git'
-NeoBundle 'Lokaltog/vim-easymotion'
-NeoBundle 'tomtom/tcomment_vim'
-NeoBundle 'othree/eregex.vim'
-NeoBundle 'yanktmp.vim'
-NeoBundle 'bling/vim-airline'
-NeoBundle 'alpaca-tc/vim-rails'
-NeoBundle 'slim-template/vim-slim'
-NeoBundle 'digitaltoad/vim-jade'
-NeoBundle 'kakkyz81/evervim'
-NeoBundle 'thinca/vim-qfreplace.git'
-NeoBundle 'thinca/vim-ref' " API: Shift+K
-NeoBundle 'othree/eregex.vim'
-NeoBundle "tmhedberg/matchit.git"
-NeoBundle "smartchr"
-NeoBundle 'repeat.vim'
-NeoBundle 'sjl/gundo.vim.git'
-NeoBundle 'Lokaltog/vim-powerline.git' " Yank on system clipboard
-NeoBundle 'kana/vim-fakeclip.git'
-NeoBundle 'rhysd/clever-f.vim' " Fast cursor moving
-NeoBundle 'rhysd/accelerated-jk.git'
-NeoBundle 'fuenor/im_control.vim'
-NeoBundle 'terryma/vim-multiple-cursors.git'
-NeoBundle 'airblade/vim-gitgutter'
-NeoBundle "sudar/vim-arduino-syntax"
-NeoBundle 'Shougo/neocomplete.vim'
-
-" Javascript
-NeoBundle 'pangloss/vim-javascript.git'
-NeoBundle 'open-browser.vim'
-NeoBundle 'mattn/webapi-vim'
-NeoBundle 'tell-k/vim-browsereload-mac'
-NeoBundle 'hail2u/vim-css3-syntax'
-NeoBundle 'jiangmiao/simple-javascript-indenter'
-NeoBundle 'jQuery.git'
-NeoBundle 'jelera/vim-javascript-syntax.git'
-NeoBundle "YankRing.vim"
-NeoBundle 'kchmck/vim-coffee-script'
-NeoBundle 'ujihisa/unite-colorscheme'
-NeoBundle 'ujihisa/unite-font'
-NeoBundle 'tomasr/molokai'
-
-" Ruby
-NeoBundle 'vim-ruby/vim-ruby.git'
-NeoBundle 'tpope/vim-rbenv.git'
-NeoBundle 'tpope/vim-endwise' "endを自動入力
-NeoBundle 'kmnk/vim-unite-giti.git'
-NeoBundle 'tsukkee/unite-tag.git'
-NeoBundle 'h1mesuke/unite-outline'
-
-" Async task execution
-NeoBundle 'Shougo/vimproc', {
-      \     'build': {
-      \        'windows': 'make_mingw64.mak',
-      \        'unix': 'make -f make_unix.mak',
-      \        'mac': 'make -f make_mac.mak'
-      \     }
-      \   }
-
-NeoBundle 'Shougo/vimfiler',  '',  'default'
-call neobundle#config('vimfiler',  {
-      \ 'lazy' : 1,
-      \ 'depends' : 'Shougo/unite.vim',
-      \ 'autoload' : {
-      \    'commands' : [
-      \                  { 'name' : 'VimFiler',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  { 'name' : 'VimFilerExplorer',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  { 'name' : 'Edit',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  { 'name' : 'Write',
-      \                    'complete' : 'customlist, vimfiler#complete' },
-      \                  'Read',  'Source'],
-      \    'mappings' : ['<Plug>(vimfiler_switch)'],
-      \    'explorer' : 1,
-      \ }
-      \ })
-
-NeoBundleLazy 'Shougo/vimshell', {
-\   'autoload' : { 'commands' : [ 'VimShell' ] },
-\   'depends': [ 'Shougo/vimproc' ],
-\ }
-
-NeoBundle 'Shougo/unite.vim',  '',  'default'
-call neobundle#config('unite.vim', {
-      \ 'lazy' : 1,
-      \ 'autoload' : {
-      \   'commands' : [{ 'name' : 'Unite',
-      \                   'complete' : 'customlist, unite#complete_source'},
-      \                 'UniteWithCursorWord',  'UniteWithInput']
-      \ }})
-
-call neobundle#end()
-
 
 let g:evervim_devtoken='S=s77:U=81fc4e:E=1521b35992a:C=14ac3846b38:P=1cd:A=en-devtoken:V=2:H=fa7856e10da89a7f422725f5b141653f'
 let g:airline_powerline_fonts = 1
-
+"
 " Javascript
 let g:html_indent_inctags  = "html, body, head, tbody"
 let g:html_indent_autotags = "th, td, tr, tfoot, thead"
@@ -120,7 +113,7 @@ autocmd QuickFixCmdPost * nested cwindow | redraw!
 let g:yankring_manual_clipboard_check = 0
 let g:yankring_max_history            = 30
 let g:yankring_max_display            = 70
-nmap ,y :YRShow<CR>
+nnoremap ,y :YRShow<CR>
 
 " for quickrun.vim
 let g:quickrun_config            = {}
@@ -161,58 +154,10 @@ autocmd BufEnter *
             \|      nnoremap <buffer> <C-]> :<C-u>UniteWithCursorWord -immediately tag<CR>
             \|  endif
 
-let s:bundle = neobundle#get('vimfiler')
-function! s:bundle.hooks.on_source(bundle)
-  let g:vimfiler_as_default_explorer = 1
-  let g:vimfiler_safe_mode_by_default = 0
-endfunction
 nnoremap ,vf :VimFiler -split -simple -winwidth=35 -no-quit<CR>
-autocmd FileType vimfiler
-        \ nnoremap <buffer><silent>/
-        \ :<C-u>Unite file -default-action=vimfiler<CR>
 
-let s:bundle = neobundle#get('vimshell')
-function! s:bundle.hooks.on_source(bundle)
-endfunction
 nnoremap ,vs :VimShell<CR>
 
-let s:bundle = neobundle#get('unite.vim')
-function! s:bundle.hooks.on_source(bundle)
-  let g:unite_update_time = 1000
-  let g:unite_enable_start_insert=1
-  let g:unite_source_file_mru_filename_format = ''
-  let g:unite_source_grep_default_opts = "-Hn --color=never"
-  let g:loaded_unite_source_bookmark = 1
-  let g:loaded_unite_source_tab = 1
-  let g:loaded_unite_source_window = 1
-  " the silver searcher を unite-grep のバックエンドにする
-  if executable('ag')
-    let g:unite_source_grep_command = 'ag'
-    let g:unite_source_grep_default_opts = '--nocolor --nogroup --column'
-    let g:unite_source_grep_recursive_opt = ''
-    let g:unite_source_grep_max_candidates = 200
-  endif
-
-  " ウィンドウを分割して開く
-  au FileType unite nnoremap <silent> <buffer> <expr> <C-j> unite#do_action('split')
-  au FileType unite inoremap <silent> <buffer> <expr> <C-j> unite#do_action('split')
-  " ウィンドウを縦に分割して開く
-  au FileType unite nnoremap <silent> <buffer> <expr> <C-l> unite#do_action('vsplit')
-  au FileType unite inoremap <silent> <buffer> <expr> <C-l> unite#do_action('vsplit')
-  au FileType unite nnoremap <silent> <buffer> <ESC><ESC> q
-  au FileType unite inoremap <silent> <buffer> <ESC><ESC> <ESC>q
-
-  autocmd FileType unite call s:unite_my_settings()
-  function! s:unite_my_settings()
-    " Overwrite settings.
-    imap <buffer> jj <Plug>(unite_insert_leave)
-    imap <buffer> <ESC> <ESC><ESC>
-    imap <buffer> <C-w> <Plug>(unite_delete_backward_path)
-    nnoremap <buffer> t G
-    startinsert
-  endfunction
-  call unite#custom_default_action('source/bookmark/directory', 'vimfiler')
-endfunction
 
 " Disable AutoComplPop.
 let g:acp_enableAtStartup = 0
@@ -279,10 +224,14 @@ set backspace=2
 set mouse=a " ターミナルでマウスを使用できるようにする
 set guioptions+=a
 set ttymouse=xterm2
-set clipboard+=unnamedplus,unnamed " set clipboard=unnamed
+"set clipboard+=unnamed,unnamedplus " set clipboard=unnamed
 set lazyredraw
 set nobackup
 set helplang=ja
+
+if $TMUX == ''
+  set clipboard+=unnamed,unnamedplus
+end
 
 highlight Comment ctermfg=DarkCyan
 
@@ -291,7 +240,6 @@ inoremap <C-k> <Up>
 inoremap <C-h> <Left>
 inoremap <C-l> <Right>
 inoremap <C-c> <Esc>
-inoremap <expr> , smartchr#one_of(', ', ',')
 "ctrl+iで日本語入力固定モードをOnOff
 inoremap <silent> <C-i> <C-^><C-r>=IMState('FixMode')<CR>
 imap <expr><TAB> "\<TAB>"
@@ -320,7 +268,7 @@ nnoremap g/ :<C-u>%s/<C-R><C-w>//gc<Left><Left><Left>
 vnoremap g/ y:<C-u>%s/<C-R>"//gc<Left><Left><Left>
 
 " eregex
-nnoremap / :M/
+"nnoremap / :M/
 
 
 " 認識されないっぽいファイルタイプを追加
@@ -352,12 +300,13 @@ autocmd FileType html       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType slim       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType java       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType javascript setlocal sw=4 sts=4 ts=4 et
-autocmd FileType json       setlocal sw=2 sts=2 ts=2 et
+autocmd FileType jsx        setlocal sw=2 sts=2 ts=2 et
+autocmd FileType json       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType jade       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType coffee     setlocal sw=2 sts=2 ts=2 et
 autocmd FileType perl       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType php        setlocal sw=4 sts=4 ts=4 et
-autocmd FileType python     setlocal sw=4 sts=4 ts=4 et
+autocmd FileType python     setlocal sw=2 sts=2 ts=2 et
 autocmd FileType ruby       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType haml       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType sh         setlocal sw=4 sts=4 ts=4 et
@@ -411,6 +360,5 @@ if has('persistent_undo')
   set undodir=~/.vim/undo
   set undofile
 endif
-
 
 colorscheme molokai
