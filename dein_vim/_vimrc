@@ -330,7 +330,7 @@ autocmd FileType xml setlocal omnifunc=xmlcomplete#CompleteTags
 " For Ruby
 au BufNewFile, BufRead Gemfile setl filetype = Gemfile
 au BufWritePost Gemfile call vimproc#system('rbenv ctags')
-autocmd BufNewFile *.rb 0r $HOME/.vim/template/ruby-script.txt
+"autocmd BufNewFile *.rb 0r $HOME/.vim/template/ruby-script.txt
 
 " 全角スペースの表示
 highlight ZenkakuSpace cterm=underline ctermfg=lightblue guibg=darkgray
