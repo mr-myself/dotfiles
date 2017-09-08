@@ -20,6 +20,7 @@ alias pe='plenv exec'
 alias re='rbenv exec'
 alias spec='rspec'
 alias webserver="twistd -n web --path ."
+alias gore="gore --autoimport"
 
 #git周辺の設定
 alias gti='git'
@@ -81,5 +82,7 @@ export PATH="$PATH:`yarn global bin`"
 
 export GOPATH="$HOME/mr-myself/projects/go"
 export PATH=$GOPATH/bin:$PATH
+
+export PATH="$HOME/.fastlane/bin:$PATH"
 
 export EDITOR=vim

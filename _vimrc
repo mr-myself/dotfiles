@@ -29,6 +29,7 @@ if dein#load_state(s:dein_dir)
   call dein#add('bling/vim-airline')
   call dein#add('alpaca-tc/vim-rails')
   call dein#add('slim-template/vim-slim')
+  call dein#add('yosssi/vim-ace')
   call dein#add('digitaltoad/vim-jade')
   call dein#add('kakkyz81/evervim')
   call dein#add('thinca/vim-qfreplace.git')
@@ -64,8 +65,9 @@ if dein#load_state(s:dein_dir)
   call dein#add('tpope/vim-rbenv.git')
   call dein#add('tpope/vim-endwise.git')
   call dein#add('kmnk/vim-unite-giti.git')
-
+  call dein#add('fatih/vim-go.git')
   call dein#add('elixir-lang/vim-elixir')
+  call dein#add('vim-syntastic/syntastic.git')
 
   call dein#add('Shougo/neocomplete.vim')
   call dein#add('Shougo/neosnippet')
@@ -325,12 +327,26 @@ autocmd FileType css setlocal omnifunc=csscomplete#CompleteCSS
 autocmd FileType html,markdown setlocal omnifunc=htmlcomplete#CompleteTags
 autocmd FileType javascript setlocal omnifunc=javascriptcomplete#CompleteJS
 autocmd FileType xml setlocal omnifunc=xmlcomplete#CompleteTags
+autocmd BufNewFile,BufRead *.go setlocal noexpandtab tabstop=4 shiftwidth=4
 
 
 " For Ruby
 au BufNewFile, BufRead Gemfile setl filetype = Gemfile
 au BufWritePost Gemfile call vimproc#system('rbenv ctags')
 autocmd BufNewFile *.rb 0r $HOME/.vim/template/ruby-script.txt
+
+" For Go from vim-go
+let g:go_highlight_types = 1
+let g:go_highlight_fields = 1
+let g:go_highlight_functions = 1
+let g:go_highlight_methods = 1
+let g:go_metalinter_enabled = ['vet', 'golint', 'errcheck']
+let g:go_metalinter_autosave = 1
+let g:go_metalinter_autosave_enabled = ['vet', 'golint']
+let g:syntastic_go_checkers = ['go', 'golint', 'errcheck']
+let g:syntastic_aggregate_errors = 1
+let g:rehash256 = 1
+let g:molokai_original = 1
 
 " 全角スペースの表示
 highlight ZenkakuSpace cterm=underline ctermfg=lightblue guibg=darkgray
