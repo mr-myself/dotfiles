@@ -21,6 +21,7 @@ alias re='rbenv exec'
 alias spec='rspec'
 alias webserver="twistd -n web --path ."
 alias gore="gore --autoimport"
+alias fig="docker-compose"
 
 #git周辺の設定
 alias gti='git'
@@ -73,16 +74,48 @@ eval $(/usr/libexec/path_helper -s)
 
 export PATH=~/Library/Python/2.7/bin:$PATH
 
-export PATH="$HOME/.rbenv/bin:$PATH"
-export RBENV_ROOT=/usr/local/var/rbenv
-export PATH="$RBENV_ROOT/bin:$PATH"
+#export PATH="$HOME/.rbenv/bin:$PATH"
+#export RBENV_ROOT=/usr/local/var/rbenv
+#export PATH="$RBENV_ROOT/bin:$PATH"
 eval "$(rbenv init -)"
 
 export PATH="$PATH:`yarn global bin`"
 
-export GOPATH="$HOME/mr-myself/projects/go"
+export GOPATH="$HOME/mr-myself/go"
 export PATH=$GOPATH/bin:$PATH
 
 export PATH="$HOME/.fastlane/bin:$PATH"
+export PATH="/usr/local/opt/openssl/bin:$PATH"
 
 export EDITOR=vim
+
+# tabtab source for serverless package
+# uninstall by removing these lines or running `tabtab uninstall serverless`
+[[ -f /usr/local/lib/node_modules/serverless/node_modules/tabtab/.completions/serverless.zsh ]] && . /usr/local/lib/node_modules/serverless/node_modules/tabtab/.completions/serverless.zsh
+# tabtab source for sls package
+# uninstall by removing these lines or running `tabtab uninstall sls`
+[[ -f /usr/local/lib/node_modules/serverless/node_modules/tabtab/.completions/sls.zsh ]] && . /usr/local/lib/node_modules/serverless/node_modules/tabtab/.completions/sls.zsh
+
+# The next line updates PATH for the Google Cloud SDK.
+if [ -f '/Users/keisuke.hoshiuno/Downloads/google-cloud-sdk/path.zsh.inc' ]; then . '/Users/keisuke.hoshiuno/Downloads/google-cloud-sdk/path.zsh.inc'; fi
+
+# The next line enables shell command completion for gcloud.
+if [ -f '/Users/keisuke.hoshiuno/Downloads/google-cloud-sdk/completion.zsh.inc' ]; then . '/Users/keisuke.hoshiuno/Downloads/google-cloud-sdk/completion.zsh.inc'; fi
+
+
+# added by Anaconda3 2018.12 installer
+# >>> conda init >>>
+# !! Contents within this block are managed by 'conda init' !!
+__conda_setup="$(CONDA_REPORT_ERRORS=false '/anaconda3/bin/conda' shell.bash hook 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    \eval "$__conda_setup"
+else
+    if [ -f "/anaconda3/etc/profile.d/conda.sh" ]; then
+        . "/anaconda3/etc/profile.d/conda.sh"
+        CONDA_CHANGEPS1=false conda activate base
+    else
+        \export PATH="/anaconda3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+# <<< conda init <<<

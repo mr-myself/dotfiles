@@ -16,7 +16,6 @@ if dein#load_state(s:dein_dir)
   call dein#begin(s:dein_dir)
 
   call dein#add('Shougo/dein.vim')
-  call dein#add('Shougo/neocomplete.vim')
   call dein#add('Shougo/vimproc.vim', {'build' : 'make'})
 
   " below plugins should be loading from dein.toml
@@ -31,7 +30,7 @@ if dein#load_state(s:dein_dir)
   call dein#add('slim-template/vim-slim')
   call dein#add('yosssi/vim-ace')
   call dein#add('digitaltoad/vim-jade')
-  call dein#add('kakkyz81/evervim')
+  "call dein#add('kakkyz81/evervim')
   call dein#add('thinca/vim-qfreplace.git')
   call dein#add('thinca/vim-ref')
   call dein#add('othree/eregex.vim')
@@ -47,6 +46,7 @@ if dein#load_state(s:dein_dir)
   call dein#add('airblade/vim-gitgutter')
   call dein#add('sudar/vim-arduino-syntax')
   call dein#add('Shougo/vimshell')
+  call dein#add('leafgarland/typescript-vim')
 
   " below plugins should be loading from dein_lazy.toml
   call dein#add('pangloss/vim-javascript.git')
@@ -57,19 +57,22 @@ if dein#load_state(s:dein_dir)
   call dein#add('jiangmiao/simple-javascript-indenter')
   call dein#add('vim-scripts/jQuery.git')
   call dein#add('jelera/vim-javascript-syntax.git')
+  call dein#add('leafgarland/typescript-vim.git')
   call dein#add('Shougo/neosnippet-snippets')
   call dein#add('vim-scripts/YankRing.vim')
   call dein#add('kchmck/vim-coffee-script')
+  call dein#add('posva/vim-vue')
 
   call dein#add('vim-ruby/vim-ruby.git')
   call dein#add('tpope/vim-rbenv.git')
   call dein#add('tpope/vim-endwise.git')
   call dein#add('kmnk/vim-unite-giti.git')
   call dein#add('fatih/vim-go.git')
+  call dein#add('fatih/vim-go')
+  call dein#add('AndrewRadev/splitjoin.vim')
   call dein#add('elixir-lang/vim-elixir')
   call dein#add('vim-syntastic/syntastic.git')
 
-  call dein#add('Shougo/neocomplete.vim')
   call dein#add('Shougo/neosnippet')
   call dein#add('kazuph/snipmate-snippets.git')
   call dein#add('tsukkee/unite-tag.git')
@@ -91,6 +94,25 @@ if dein#load_state(s:dein_dir)
   call dein#save_state()
 endif
 
+call dein#add('roxma/nvim-yarp')
+call dein#add('roxma/vim-hug-neovim-rpc')
+call dein#add('Shougo/deoplete.nvim')
+call dein#add('deoplete-plugins/deoplete-go', {'build': 'make'})
+
+" deoplete for Ruby
+call dein#add('uplus/deoplete-solargraph')
+call dein#add('fishbullet/deoplete-ruby')
+call dein#add('osyo-manga/vim-monster')
+let g:monster#completion#rcodetools#backend = "async_rct_complete"
+let g:deoplete#sources#omni#input_patterns = {
+      \ "ruby" : '[^. *\t]\.\w*\|\h\w*::',
+      \}
+let g:monster#completion#backend = 'solargraph' " gem install solargraph
+
+
+
+
+
 if dein#check_install()
   call dein#install()
 endif
@@ -101,6 +123,7 @@ filetype off
 filetype plugin indent off
 
 set nocompatible
+
 
 let g:evervim_devtoken='S=s77:U=81fc4e:E=1521b35992a:C=14ac3846b38:P=1cd:A=en-devtoken:V=2:H=fa7856e10da89a7f422725f5b141653f'
 let g:airline_powerline_fonts = 1
@@ -138,8 +161,6 @@ let g:quickrun_config.coffee     = {
       \   'exec' : ['%c -cbp %s']
       \ }
 
-" for neocomplete
-let g:neocomplete#enable_at_startup = 1
 
 " undo treeを表示する
 nnoremap U      :<C-u>GundoToggle<CR>
@@ -164,17 +185,20 @@ nnoremap ,vs :VimShell<CR>
 " Disable AutoComplPop.
 let g:acp_enableAtStartup = 0
 
-" Enable heavy omni completion.
-if !exists('g:neocomplcache_omni_patterns')
-  let g:neocomplcache_omni_patterns = {}
-endif
-let g:neocomplcache_omni_patterns.perl = '\h\w*->\h\w*|\h\w*::'
-
 " For snippet_complete marker.
 if has('conceal')
   set conceallevel=2 concealcursor=i
 endif
 
+" Use deoplete.
+let g:deoplete#enable_at_startup = 1
+set runtimepath+=~/.cache/dein/repos/github.com/roxma/vim-hug-neovim-rpc/
+set runtimepath+=~/.cache/dein/repos/github.com/roxma/nvim-yarp/
+set runtimepath+=~/.cache/dein/repos/github.com/Shougo/deoplete.nvim/
+call deoplete#custom#option('omni_patterns', {
+      \ 'go': '[^. *\t]\.\w*',
+      \ 'rb': '[^. *\t]\.\w*'
+      \})
 
 "--------------
 " BasicSetting
@@ -230,6 +254,7 @@ set ttymouse=xterm2
 set lazyredraw
 set nobackup
 set helplang=ja
+set autowrite
 
 if $TMUX == ''
   set clipboard+=unnamed,unnamedplus
@@ -301,8 +326,10 @@ autocmd FileType eruby      setlocal sw=2 sts=2 ts=2 et
 autocmd FileType html       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType slim       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType java       setlocal sw=4 sts=4 ts=4 et
-autocmd FileType javascript setlocal sw=4 sts=4 ts=4 et
+autocmd FileType javascript setlocal sw=2 sts=2 ts=2 et
+autocmd FileType vue        setlocal sw=2 sts=2 ts=2 et
 autocmd FileType jsx        setlocal sw=2 sts=2 ts=2 et
+autocmd FileType ts         setlocal sw=2 sts=2 ts=2 et
 autocmd FileType json       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType jade       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType coffee     setlocal sw=2 sts=2 ts=2 et
@@ -328,14 +355,17 @@ autocmd FileType html,markdown setlocal omnifunc=htmlcomplete#CompleteTags
 autocmd FileType javascript setlocal omnifunc=javascriptcomplete#CompleteJS
 autocmd FileType xml setlocal omnifunc=xmlcomplete#CompleteTags
 autocmd BufNewFile,BufRead *.go setlocal noexpandtab tabstop=4 shiftwidth=4
+autocmd FileType vue syntax sync fromstart
 
 
 " For Ruby
 au BufNewFile, BufRead Gemfile setl filetype = Gemfile
 au BufWritePost Gemfile call vimproc#system('rbenv ctags')
-autocmd BufNewFile *.rb 0r $HOME/.vim/template/ruby-script.txt
 
 " For Go from vim-go
+let g:go_gocode_propose_source = 0
+let g:go_gocode_unimported_packages = 1
+
 let g:go_highlight_types = 1
 let g:go_highlight_fields = 1
 let g:go_highlight_functions = 1
@@ -347,6 +377,30 @@ let g:syntastic_go_checkers = ['go', 'golint', 'errcheck']
 let g:syntastic_aggregate_errors = 1
 let g:rehash256 = 1
 let g:molokai_original = 1
+let g:go_fmt_command = "goimports"
+
+let g:pymode_rope = 0
+
+" For vue.js
+let g:ft = ''
+function! NERDCommenter_before()
+  if &ft == 'vue'
+    let g:ft = 'vue'
+    let stack = synstack(line('.'), col('.'))
+    if len(stack) > 0
+      let syn = synIDattr((stack)[0], 'name')
+      if len(syn) > 0
+        exe 'setf ' . substitute(tolower(syn), '^vue_', '', '')
+      endif
+    endif
+  endif
+endfunction
+function! NERDCommenter_after()
+  if g:ft == 'vue'
+    setf vue
+    let g:ft = ''
+  endif
+endfunction
 
 " 全角スペースの表示
 highlight ZenkakuSpace cterm=underline ctermfg=lightblue guibg=darkgray
