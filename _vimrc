@@ -62,6 +62,7 @@ if dein#load_state(s:dein_dir)
   call dein#add('vim-scripts/YankRing.vim')
   call dein#add('kchmck/vim-coffee-script')
   call dein#add('posva/vim-vue')
+  call dein#add('jason0x43/vim-js-indent')
 
   call dein#add('vim-ruby/vim-ruby.git')
   call dein#add('tpope/vim-rbenv.git')
@@ -329,6 +330,7 @@ autocmd FileType java       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType javascript setlocal sw=2 sts=2 ts=2 et
 autocmd FileType vue        setlocal sw=2 sts=2 ts=2 et
 autocmd FileType jsx        setlocal sw=2 sts=2 ts=2 et
+autocmd FileType tsx        setlocal sw=2 sts=2 ts=2 et
 autocmd FileType ts         setlocal sw=2 sts=2 ts=2 et
 autocmd FileType json       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType jade       setlocal sw=2 sts=2 ts=2 et
@@ -357,6 +359,8 @@ autocmd FileType xml setlocal omnifunc=xmlcomplete#CompleteTags
 autocmd BufNewFile,BufRead *.go setlocal noexpandtab tabstop=4 shiftwidth=4
 autocmd FileType vue syntax sync fromstart
 
+" For Python
+let g:syntastic_python_pylint_exe = 'python -m pylint'
 
 " For Ruby
 au BufNewFile, BufRead Gemfile setl filetype = Gemfile
