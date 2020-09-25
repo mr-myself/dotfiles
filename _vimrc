@@ -26,7 +26,7 @@ if dein#load_state(s:dein_dir)
   call dein#add('othree/eregex.vim')
   call dein#add('vim-scripts/yanktmp.vim')
   call dein#add('bling/vim-airline')
-  call dein#add('alpaca-tc/vim-rails')
+  " call dein#add('alpaca-tc/vim-rails')
   call dein#add('slim-template/vim-slim')
   call dein#add('yosssi/vim-ace')
   call dein#add('digitaltoad/vim-jade')
@@ -73,6 +73,7 @@ if dein#load_state(s:dein_dir)
   call dein#add('AndrewRadev/splitjoin.vim')
   call dein#add('elixir-lang/vim-elixir')
   call dein#add('vim-syntastic/syntastic.git')
+  call dein#add('neomake/neomake')
 
   call dein#add('Shougo/neosnippet')
   call dein#add('kazuph/snipmate-snippets.git')
@@ -109,10 +110,6 @@ let g:deoplete#sources#omni#input_patterns = {
       \ "ruby" : '[^. *\t]\.\w*\|\h\w*::',
       \}
 let g:monster#completion#backend = 'solargraph' " gem install solargraph
-
-
-
-
 
 if dein#check_install()
   call dein#install()
@@ -308,6 +305,7 @@ au BufNewFile,BufRead *.pde        set filetype=processing
 au BufNewFile,BufRead *.erb        set filetype=html
 au BufNewFile,BufRead *.tt         set filetype=html
 au BufNewFile,BufRead *.tt2        set filetype=html
+au BufNewFile,BufRead *.tmpl       set filetype=html
 au BufNewFile,BufRead *.scss       set filetype=scss
 au BufNewFile,BufRead *.sass       set filetype=sass
 au BufNewFile,BufRead cpanfile     set filetype=cpanfile
@@ -337,7 +335,7 @@ autocmd FileType jade       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType coffee     setlocal sw=2 sts=2 ts=2 et
 autocmd FileType perl       setlocal sw=4 sts=4 ts=4 et
 autocmd FileType php        setlocal sw=4 sts=4 ts=4 et
-autocmd FileType python     setlocal sw=2 sts=2 ts=2 et
+autocmd FileType python     setlocal sw=4 sts=4 ts=4 et
 autocmd FileType ruby       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType haml       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType sh         setlocal sw=4 sts=4 ts=4 et
@@ -351,6 +349,7 @@ autocmd FileType yaml       setlocal sw=2 sts=2 ts=2 et
 autocmd FileType zsh        setlocal sw=4 sts=4 ts=4 et
 autocmd FileType scala      setlocal sw=2 sts=2 ts=2 et
 autocmd FileType scheme     setlocal sw=2 sts=2 ts=2 et
+autocmd FileType tmpl       setlocal sw=2 sts=2 ts=2 et
 
 autocmd FileType css setlocal omnifunc=csscomplete#CompleteCSS
 autocmd FileType html,markdown setlocal omnifunc=htmlcomplete#CompleteTags
@@ -361,6 +360,7 @@ autocmd FileType vue syntax sync fromstart
 
 " For Python
 let g:syntastic_python_pylint_exe = 'python -m pylint'
+let g:neomake_python_enabled_makers = ['flake8']
 
 " For Ruby
 au BufNewFile, BufRead Gemfile setl filetype = Gemfile
