@@ -74,6 +74,8 @@ if dein#load_state(s:dein_dir)
   call dein#add('elixir-lang/vim-elixir')
   call dein#add('vim-syntastic/syntastic.git')
   call dein#add('neomake/neomake')
+  call dein#add('rust-lang/rust.vim')
+  call dein#add('tomlion/vim-solidity')
 
   call dein#add('Shougo/neosnippet')
   call dein#add('kazuph/snipmate-snippets.git')
@@ -423,8 +425,14 @@ highlight CursorLine ctermbg=black guibg=black
 
 " 保存時に行末の空白を除去する
 autocmd BufWritePre * :%s/\s\+$//ge
-" 保存時にtabをスペースに変換する
-autocmd BufWritePre * :%s/\t/    /ge
+
+let _curfile=expand("%:r")
+if _curfile == 'Makefile'
+  set noexpandtab
+else
+  " 保存時にtabをスペースに変換する
+  autocmd BufWritePre * :%s/\t/    /ge
+endif
 
 " Remember the last cursor position
 au BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif

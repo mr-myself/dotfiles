@@ -6,7 +6,7 @@ ZSH=$HOME/.oh-my-zsh
 # Optionally, if you set this to "random", it'll load a random theme each
 # time that oh-my-zsh is loaded.
 ZSH_THEME="robbyrussell"
-tmux set-option -gw mouse off
+# tmux set-option -gw mouse off
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
@@ -80,9 +80,9 @@ eval "$(rbenv init -)"
 
 export PATH="$PATH:`yarn global bin`"
 
-export GOPATH="$HOME/mr-myself/go"
-export PATH=$GOPATH/bin:$PATH
+export GOPATH="$HOME/go"
 export GO111MODULE=on
+# export PATH=$GOPATH/bin:$PATH
 
 export PATH="$HOME/.fastlane/bin:$PATH"
 export PATH="/usr/local/opt/openssl/bin:$PATH"
@@ -115,4 +115,10 @@ source <(kubectl completion zsh)
 export PATH="/usr/local/opt/gettext/bin/:$PATH"
 export PATH="/usr/local/opt/mysql@5.7/bin:$PATH"
 
- export PATH="$HOME/.nodebrew/current/bin:$PATH"
+export PATH="$HOME/.nodebrew/current/bin:$PATH"
+
+export DEPLOY_KEY=$(cat ~/.ssh/keisuke.hoshino | base64)
+
+export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PATH"
+
+export PATH=$PATH:$GOPATH/bin
