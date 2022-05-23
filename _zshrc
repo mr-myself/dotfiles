@@ -10,7 +10,7 @@ ZSH_THEME="robbyrussell"
 # Example aliases
 # alias zshconfig="mate ~/.zshrc"
 # alias ohmyzsh="mate ~/.oh-my-zsh"
-alias vim='/usr/local/bin/vim'
+alias vim='/usr/bin/vim'
 alias vi='vim'
 alias l='ls -la'
 alias ll='ls -la'
@@ -22,7 +22,7 @@ alias spec='rspec'
 alias webserver="twistd -n web --path ."
 alias gore="gore --autoimport"
 alias fig="docker-compose"
-alias py="python3"
+alias py="python"
 
 #git周辺の設定
 alias gti='git'
@@ -65,9 +65,11 @@ export PATH=$HOME/.nodebrew/current/bin:$PATH
 
 # for tag-ag (https://github.com/aykamko/tag)
 if (( $+commands[tag] )); then
+  export TAG_SEARCH_PROG=ag  # replace with rg for ripgrep
   tag() { command tag "$@"; source ${TAG_ALIAS_FILE:-/tmp/tag_aliases} 2>/dev/null }
-  alias ag=tag
+  alias ag=tag  # replace with rg for ripgrep
 fi
+
 alias ipython='ipython --pylab'
 export PYENV_ROOT="$HOME/.pyenv"
 export PATH="$PYENV_ROOT/bin:$PATH"
