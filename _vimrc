@@ -102,6 +102,7 @@ call dein#add('roxma/nvim-yarp')
 call dein#add('roxma/vim-hug-neovim-rpc')
 call dein#add('Shougo/deoplete.nvim')
 call dein#add('deoplete-plugins/deoplete-go', {'build': 'make'})
+call dein#add('github/copilot.vim')
 
 " deoplete for Ruby
 call dein#add('uplus/deoplete-solargraph')
