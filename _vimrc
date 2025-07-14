@@ -33,7 +33,6 @@ if dein#load_state(s:dein_dir)
   "call dein#add('kakkyz81/evervim')
   call dein#add('thinca/vim-qfreplace.git')
   call dein#add('thinca/vim-ref')
-  call dein#add('othree/eregex.vim')
   call dein#add("tmhedberg/matchit.git")
   call dein#add('vim-scripts/repeat.vim')
   call dein#add('sjl/gundo.vim.git')
@@ -57,7 +56,6 @@ if dein#load_state(s:dein_dir)
   call dein#add('jiangmiao/simple-javascript-indenter')
   call dein#add('vim-scripts/jQuery.git')
   call dein#add('jelera/vim-javascript-syntax.git')
-  call dein#add('leafgarland/typescript-vim.git')
   call dein#add('Shougo/neosnippet-snippets')
   call dein#add('vim-scripts/YankRing.vim')
   call dein#add('kchmck/vim-coffee-script')
@@ -68,7 +66,6 @@ if dein#load_state(s:dein_dir)
   call dein#add('tpope/vim-rbenv.git')
   call dein#add('tpope/vim-endwise.git')
   call dein#add('kmnk/vim-unite-giti.git')
-  call dein#add('fatih/vim-go.git')
   call dein#add('fatih/vim-go')
   call dein#add('AndrewRadev/splitjoin.vim')
   call dein#add('elixir-lang/vim-elixir')
@@ -76,6 +73,8 @@ if dein#load_state(s:dein_dir)
   call dein#add('neomake/neomake')
   call dein#add('rust-lang/rust.vim')
   call dein#add('tomlion/vim-solidity')
+  call dein#add('Exafunction/codeium.vim')
+
 
   call dein#add('Shougo/neosnippet')
   call dein#add('kazuph/snipmate-snippets.git')
@@ -120,10 +119,9 @@ endif
 
 syntax enable
 
+set nocompatible
 filetype off
 filetype plugin indent off
-
-set nocompatible
 
 
 let g:evervim_devtoken='S=s77:U=81fc4e:E=1521b35992a:C=14ac3846b38:P=1cd:A=en-devtoken:V=2:H=fa7856e10da89a7f422725f5b141653f'
@@ -222,7 +220,7 @@ set laststatus=2
 set pastetoggle=<C-e> " Ctrl+eキーで'paste'と'nopaste'を切り替える
 set cindent
 set tabstop=2
-set shiftwidth=4
+set shiftwidth=2
 set autoread
 set expandtab
 set cmdheight=2
@@ -236,17 +234,7 @@ set display=uhex
 set t_Co=256
 set cursorline
 set title
-set encoding=utf-8
-set fileencodings=ucs-bom,utf-8,iso-2022-jp,sjis,cp932,euc-jp,cp20932
-set fileformats=unix,dos,mac
-set wrapscan
-set ruler
-set tabstop=2
-set autoindent
-set showmode
-set number
-set expandtab
-set runtimepath+=/home/homepage/.vim/plugin/
+set runtimepath+=~/.vim/plugin/
 set backspace=2
 set mouse=a " ターミナルでマウスを使用できるようにする
 set guioptions+=a
@@ -270,9 +258,8 @@ inoremap <C-l> <Right>
 inoremap <C-c> <Esc>
 "ctrl+iで日本語入力固定モードをOnOff
 inoremap <silent> <C-i> <C-^><C-r>=IMState('FixMode')<CR>
-imap <expr><TAB> "\<TAB>"
-smap <expr><TAB> "\<TAB>"
-inoremap <expr><S-TAB>  pumvisible() ? "\<C-p>" : "\<S-TAB>"
+inoremap <silent><expr> <TAB> pumvisible() ? "\<C-n>" : "\<TAB>"
+inoremap <silent><expr> <S-TAB> pumvisible() ? "\<C-p>" : "\<S-TAB>"
 
 nnoremap sy :call YanktmpYank()<CR>
 nnoremap sp :call YanktmpPaste_p()<CR>
