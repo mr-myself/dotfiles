@@ -1,0 +1,10 @@
+provider: claude
+language: ja
+persona_providers:
+  planner: claude
+  coder: claude
+  architecture-reviewer: codex
+  qa-reviewer: codex
+  testing-reviewer: codex
+  ai-antipattern-reviewer: codex
+  supervisor: codex

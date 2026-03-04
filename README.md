@@ -15,6 +15,9 @@ vim
 zsh
 - ln -s ~/dotfiles/_zshrc ~/.zshrc
 
+takt
+- ln -s ~/mr-myself/setup/dotfiles/_takt ~/.takt
+
 ## And more
 I recommend you to use 'oh-my-zsh'!
 https://github.com/robbyrussell/oh-my-zsh
