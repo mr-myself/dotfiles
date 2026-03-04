@@ -23,11 +23,13 @@ alias re='rbenv exec'
 alias spec='rspec'
 alias webserver="twistd -n web --path ."
 alias gore="gore --autoimport"
-alias fig="docker-compose"
+alias fig="docker compose"
 alias py="python"
 alias python="python3"
 alias k="kubectl"
 alias ipython='ipython --pylab'
+alias cursor="open -a Cursor"
+alias ai="ollama run llama3.2"
 
 # Git aliases
 alias gti='git'
@@ -113,6 +115,18 @@ fi
 if [ -f '/Users/keisuke/mr-myself/google-cloud-sdk/completion.zsh.inc' ]; then 
   . '/Users/keisuke/mr-myself/google-cloud-sdk/completion.zsh.inc'
 fi
+
+export PATH="/Users/keisuke/mr-myself/istio-1.19.0/bin:$PATH"
+export COMVEX_GIT_HOOKS_DIR="/Users/keisuke/mr-myself/organization/comvex/git-hooks"
+export PATH="/opt/homebrew/opt/node@23/bin:$PATH"
+
+# pnpm
+export PNPM_HOME="/Users/keisuke/Library/pnpm"
+case ":$PATH:" in
+  *":$PNPM_HOME:"*) ;;
+  *) export PATH="$PNPM_HOME:$PATH" ;;
+esac
+# pnpm end
 
 # tag-ag (https://github.com/aykamko/tag)
 if (( $+commands[tag] )); then
