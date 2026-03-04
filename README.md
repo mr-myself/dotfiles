@@ -15,8 +15,11 @@ vim
 zsh
 - ln -s ~/dotfiles/_zshrc ~/.zshrc
 
-takt
+takt (global)
 - ln -s ~/mr-myself/setup/dotfiles/_takt ~/.takt
+
+takt (per-project)
+- ln -s ~/mr-myself/setup/dotfiles/_takt/projects/track-manager ~/mr-myself/organization/xmile/track-manager/.takt
 
 ## And more
 I recommend you to use 'oh-my-zsh'!
