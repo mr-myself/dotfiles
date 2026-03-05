@@ -21,6 +21,9 @@ takt (global)
 takt (per-project)
 - ln -s ~/mr-myself/setup/dotfiles/_takt/projects/track-manager ~/mr-myself/organization/xmile/track-manager/.takt
 
+squad
+- ln -s ~/mr-myself/setup/dotfiles/squad ~/.local/bin/squad
+
 ## And more
 I recommend you to use 'oh-my-zsh'!
 https://github.com/robbyrussell/oh-my-zsh

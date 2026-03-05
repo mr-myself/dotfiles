@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# squad - AI 3-agent team orchestration via tmux panes
+# ==============================================================================
+
+usage() {
+  cat <<'EOF'
+Usage: squad <task>
+
+Split the current tmux pane into 3 AI agents:
+  Manager (Claude Code) - left, talks to you
+  Coder   (Claude Code) - right-top, implements code
+  Advisor (Codex)       - right-bottom, plans and reviews
+
+Example:
+  squad "CSVインポート機能を追加"
+EOF
+  exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+TASK="$1"
+WORKDIR="$(pwd)"
+
+if [[ -z "${TMUX:-}" ]]; then
+  echo "Error: squad must be run inside tmux" >&2
+  exit 1
+fi
+
+for cmd in claude codex; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Error: $cmd is not installed or not in PATH" >&2
+    exit 1
+  }
+done
+
+# --- Setup work directory -----------------------------------------------------
+
+SQUAD_DIR="/tmp/squad-$$"
+mkdir -p "$SQUAD_DIR"
+
+# --- Create panes -------------------------------------------------------------
+
+CODER_PANE=$(tmux split-window -h -c "$WORKDIR" -d -P -F '#{pane_id}')
+ADVISOR_PANE=$(tmux split-window -v -c "$WORKDIR" -d -t "$CODER_PANE" -P -F '#{pane_id}')
+
+tmux select-pane -T "Manager"
+tmux select-pane -t "$CODER_PANE" -T "Coder"
+tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
+tmux set-option pane-border-status top
+tmux set-option pane-border-format " #{pane_title} "
+
+# --- Helper scripts (run in agent panes) --------------------------------------
+
+cat > "$SQUAD_DIR/run-coder" << 'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+echo ">>> Coder starting..."
+claude -p --dangerously-skip-permissions "$(cat "$TASK_FILE")" 2>&1 | tee "$RESULT_FILE"
+echo ""
+echo ">>> Coder finished."
+HELPER
+chmod +x "$SQUAD_DIR/run-coder"
+
+cat > "$SQUAD_DIR/run-coder-continue" << 'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+echo ">>> Coder continuing..."
+claude -p --dangerously-skip-permissions --continue "$(cat "$TASK_FILE")" 2>&1 | tee "$RESULT_FILE"
+echo ""
+echo ">>> Coder finished."
+HELPER
+chmod +x "$SQUAD_DIR/run-coder-continue"
+
+cat > "$SQUAD_DIR/run-advisor" << 'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+echo ">>> Advisor starting..."
+codex exec --full-auto "$(cat "$TASK_FILE")" -o "$RESULT_FILE" 2>&1
+echo ""
+cat "$RESULT_FILE" 2>/dev/null || true
+echo ""
+echo ">>> Advisor finished."
+HELPER
+chmod +x "$SQUAD_DIR/run-advisor"
+
+cat > "$SQUAD_DIR/run-review" << 'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+RESULT_FILE="$1"
+echo ">>> Advisor reviewing..."
+codex exec review --uncommitted --full-auto -o "$RESULT_FILE" 2>&1
+echo ""
+cat "$RESULT_FILE" 2>/dev/null || true
+echo ""
+echo ">>> Advisor review finished."
+HELPER
+chmod +x "$SQUAD_DIR/run-review"
+
+# --- Manager system prompt ----------------------------------------------------
+
+cat > "$SQUAD_DIR/manager-prompt.md" << PROMPT
+# You are a Development Manager (部長)
+
+You coordinate a Coder and an Advisor in separate tmux panes.
+You do NOT write code yourself. Playing Manager禁止.
+Speak Japanese to PO (user). Write English for agents.
+
+## CRITICAL RULES
+
+- NEVER run codex or claude commands directly. ALL work MUST go through tmux send-keys to the agent panes.
+- NEVER skip the Advisor planning step, even for simple tasks.
+- ALWAYS follow the full workflow in order.
+- The PO (user) must be able to see agent work in the tmux panes.
+
+## How to send tasks to agents
+
+Write the task to a file, then use tmux send-keys to run the helper script in the agent's pane.
+You MUST run these as Bash commands.
+
+STEP A - Send planning task to Advisor:
+  cat > $SQUAD_DIR/advisor-task.txt << 'EOF'
+  (your planning request in English)
+  EOF
+  tmux send-keys -t $ADVISOR_PANE '$SQUAD_DIR/run-advisor $SQUAD_DIR/advisor-task.txt $SQUAD_DIR/advisor-result.txt' Enter
+
+STEP B - Check if Advisor is done:
+  tmux capture-pane -t $ADVISOR_PANE -p -S -5
+  (look for ">>> Advisor finished." in the output)
+
+STEP C - Read Advisor result:
+  cat $SQUAD_DIR/advisor-result.txt
+
+STEP D - Send implementation task to Coder:
+  cat > $SQUAD_DIR/coder-task.txt << 'EOF'
+  (your implementation instructions in English)
+  EOF
+  tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt' Enter
+
+STEP E - Check if Coder is done:
+  tmux capture-pane -t $CODER_PANE -p -S -5
+  (look for ">>> Coder finished." in the output)
+
+STEP F - Read Coder result:
+  cat $SQUAD_DIR/coder-result.txt
+
+STEP G - Ask Advisor to review code changes:
+  tmux send-keys -t $ADVISOR_PANE '$SQUAD_DIR/run-review $SQUAD_DIR/review-result.txt' Enter
+
+STEP H - Read review result:
+  cat $SQUAD_DIR/review-result.txt
+
+STEP I - Send fix instructions to Coder (continues previous session):
+  cat > $SQUAD_DIR/coder-task.txt << 'EOF'
+  (fix instructions in English)
+  EOF
+  tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder-continue $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt' Enter
+
+## Workflow (MUST follow in this exact order)
+
+1. Do STEP A: Send the task to Advisor pane for an implementation plan
+2. Do STEP B repeatedly until Advisor is done
+3. Do STEP C: Read the plan
+4. Show the plan to PO (in Japanese) and ask for approval
+5. Do STEP D: Send the approved plan to Coder pane
+6. Do STEP E repeatedly until Coder is done
+7. Do STEP F: Read what Coder did
+8. Do STEP G: Ask Advisor to review
+9. Do STEP B repeatedly until Advisor review is done
+10. Do STEP H: Read the review
+11. If MUST FIX issues: Do STEP I to send fixes to Coder, then repeat from step 6
+12. Report completion to PO (in Japanese)
+PROMPT
+
+# --- Launch Manager -----------------------------------------------------------
+
+exec claude --dangerously-skip-permissions \
+  --allowedTools "Bash Read Glob Grep" \
+  --append-system-prompt "$(cat "$SQUAD_DIR/manager-prompt.md")" \
+  "$TASK"
