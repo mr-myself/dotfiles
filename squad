@@ -289,11 +289,11 @@ fi
 if [[ -n "${SQUAD_RUBOCOP_COMMAND:-}" ]]; then
   RUBOCOP_COMMAND="$SQUAD_RUBOCOP_COMMAND"
 elif [[ -f "$REPO_ROOT/compose.ci.yml" ]] && command -v docker >/dev/null 2>&1; then
-  RUBOCOP_COMMAND="docker compose -f compose.ci.yml run --rm app bundle exec rubocop --fail-level W --display-only-fail-level-offenses"
+  RUBOCOP_COMMAND="docker compose -f compose.ci.yml run --rm app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 elif [[ -f "$REPO_ROOT/compose.yml" ]] && command -v docker >/dev/null 2>&1; then
-  RUBOCOP_COMMAND="docker compose run --rm app bundle exec rubocop --fail-level W --display-only-fail-level-offenses"
+  RUBOCOP_COMMAND="docker compose run --rm app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 elif command -v bundle >/dev/null 2>&1; then
-  RUBOCOP_COMMAND="bundle exec rubocop --fail-level W --display-only-fail-level-offenses"
+  RUBOCOP_COMMAND="bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 else
   echo "Error: no RuboCop command could be detected." >&2
   echo "Set SQUAD_RUBOCOP_COMMAND to the project-specific command." >&2
@@ -742,10 +742,41 @@ trap finish EXIT
 
 set_title "RuboCop since $(date '+%H:%M:%S')"
 log ">>> RuboCop starting..."
-bash -lc "$(cat "$COMMAND_FILE")" 2>&1 |
-  tee "$RESULT_FILE" |
+RUBOCOP_FILES=()
+while IFS= read -r file; do
+  case "$file" in
+    app/*|config/*|db/*|lib/*|spec/*|test/*|Gemfile|Rakefile|config.ru|*.rb|*.rake|*.gemspec|*.jbuilder|*.builder)
+      [[ -f "$file" ]] && RUBOCOP_FILES+=("$file")
+      ;;
+  esac
+done < <(
+  {
+    git diff --name-only --diff-filter=ACMRT HEAD --
+    git ls-files --others --exclude-standard
+  } | sort -u
+)
+
+if [[ "${#RUBOCOP_FILES[@]}" -eq 0 ]]; then
+  {
+    log ">>> RuboCop skipped: no changed Rails/Ruby files."
+    printf 'No changed Rails/Ruby files for RuboCop.\n'
+  } | tee "$RESULT_FILE"
+  exit 0
+fi
+
+{
+  printf 'RuboCop target files:\n'
+  printf '%s\n' "${RUBOCOP_FILES[@]}"
+} > "$RESULT_FILE"
+log ">>> RuboCop target files:"
+printf '%s\n' "${RUBOCOP_FILES[@]}" |
+  while IFS= read -r line; do log "  $line"; done
+
+printf '%q\n' "${RUBOCOP_FILES[@]}" > "${RESULT_FILE%.txt}.files"
+bash -lc "$(cat "$COMMAND_FILE") \"\$@\"" bash "${RUBOCOP_FILES[@]}" 2>&1 |
+  tee -a "$RESULT_FILE" |
   while IFS= read -r line; do log "$line"; done
-log ">>> RuboCop finished without warnings."
+log ">>> RuboCop finished without warnings for changed Rails/Ruby files."
 HELPER
 chmod +x "$SQUAD_DIR/run-rubocop"
 
@@ -796,6 +827,7 @@ worktrees under the repository such as .claude/worktree or .claude/worktrees.
 - The PO must be able to see agent work in the tmux panes.
 - Use the run-wait helper to wait for completion. NEVER poll with capture-pane.
 - After each Coder run, ALWAYS run the RuboCop helper and require exit status 0.
+  The helper runs RuboCop only on changed Rails/Ruby files, never the full repo.
 - The Coder MUST run relevant automated tests for the task. If tests cannot run,
   report the exact blocker to PO and do not claim completion.
 - RuboCop success is required independently of the Coder's report.
@@ -866,8 +898,9 @@ Always run this after Coder implementation and after each fix:
   cat '$SQUAD_DIR/rubocop-status.txt'
   cat '$SQUAD_DIR/rubocop-result.txt'
 
-RuboCop status must be 0. The configured command uses --fail-level W, so
-warnings also fail verification.
+RuboCop status must be 0. The helper targets only changed Rails/Ruby files. If
+there are no changed Rails/Ruby files, the helper records that and returns 0.
+The configured command uses --fail-level W, so warnings also fail verification.
 
 ### Ask Advisor to review
 
