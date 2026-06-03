@@ -98,6 +98,12 @@ window_exists() {
     awk -v target="$target_window_id" '$0 == target { found = 1 } END { exit !found }'
 }
 
+branch_exists() {
+  local branch_name="$1"
+  git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch_name" ||
+    git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$branch_name"
+}
+
 list_runs() {
   local state_file title status
   printf '%-24s  %-9s  %s\n' "RUN ID" "STATUS" "TITLE"
@@ -131,11 +137,15 @@ close_run() {
 resume_run() {
   local old_manager_pane old_coder_pane old_advisor_pane old_window_name
   local new_window
+  local target_session="${2:-}"
 
-  [[ -n "${TMUX:-}" ]] || {
-    echo "Error: squad resume must be run inside tmux" >&2
+  # Without an explicit target session, resume must run inside tmux (existing
+  # behavior). With --session, we create the window in that session directly and
+  # do not require $TMUX (e.g. when launched from an external tool).
+  if [[ -z "$target_session" && -z "${TMUX:-}" ]]; then
+    echo "Error: squad resume must be run inside tmux (or pass --session <name>)" >&2
     exit 1
-  }
+  fi
 
   load_run "${1:-}"
   [[ -d "$WORKDIR" ]] || {
@@ -153,7 +163,11 @@ resume_run() {
   old_advisor_pane="${ADVISOR_PANE:-}"
   old_window_name="${CURRENT_WINDOW_NAME:-squad}"
 
-  new_window="$(tmux new-window -d -c "$WORKDIR" -P -F '#{window_id} #{pane_id}')"
+  if [[ -n "$target_session" ]]; then
+    new_window="$(tmux new-window -d -t "${target_session}:" -c "$WORKDIR" -P -F '#{window_id} #{pane_id}')"
+  else
+    new_window="$(tmux new-window -d -c "$WORKDIR" -P -F '#{window_id} #{pane_id}')"
+  fi
   read -r WINDOW_ID MANAGER_PANE <<< "$new_window"
   CODER_PANE="$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')"
   ADVISOR_PANE="$(tmux split-window -v -c "$WORKDIR" -d -t "$CODER_PANE" -P -F '#{pane_id}')"
@@ -199,7 +213,17 @@ case "$1" in
     exit 0
     ;;
   resume)
-    resume_run "${2:-}"
+    shift
+    resume_session=""
+    if [[ "${1:-}" == "--session" ]]; then
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --session requires a value" >&2
+        exit 1
+      fi
+      resume_session="$2"
+      shift 2
+    fi
+    resume_run "${1:-}" "$resume_session"
     exit 0
     ;;
 esac
@@ -243,7 +267,14 @@ STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
 REPO_NAME="$(basename "$REPO_ROOT")"
 SQUAD_DIR="$SQUAD_RUN_ROOT/$RUN_ID"
 WORKDIR="$SQUAD_WORKTREE_ROOT/$REPO_NAME-$RUN_ID"
-BRANCH="squad/$RUN_ID"
+if [[ -n "$TICKET_ID" ]]; then
+  BRANCH="feat/$TICKET_ID"
+  if branch_exists "$BRANCH"; then
+    BRANCH="feat/$TICKET_ID-$RUN_ID"
+  fi
+else
+  BRANCH="feat/squad-$RUN_ID"
+fi
 MANAGER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 CODER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
