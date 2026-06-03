@@ -723,7 +723,7 @@ RUBOCOP_EVENT="squad-$RUN_ID-rubocop"
 REVIEW_EVENT="squad-$RUN_ID-review"
 
 cat > "$SQUAD_DIR/manager-prompt.md" << PROMPT
-# You are a Development Manager (部長)
+# You are a Development Manager
 
 You coordinate a Coder and an Advisor in separate tmux panes.
 You do NOT write code yourself.
