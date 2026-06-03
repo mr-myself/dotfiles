@@ -76,6 +76,7 @@ write_state() {
     printf 'WORKDIR=%q\n' "$WORKDIR"
     printf 'BRANCH=%q\n' "$BRANCH"
     printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    printf 'WINDOW_SHORT_NAME=%q\n' "${WINDOW_SHORT_NAME:-squad}"
     printf 'MANAGER_SESSION_ID=%q\n' "$MANAGER_SESSION_ID"
     printf 'CODER_SESSION_ID=%q\n' "$CODER_SESSION_ID"
     printf 'RUBOCOP_COMMAND=%q\n' "$RUBOCOP_COMMAND"
@@ -157,6 +158,7 @@ resume_run() {
   CODER_PANE="$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')"
   ADVISOR_PANE="$(tmux split-window -v -c "$WORKDIR" -d -t "$CODER_PANE" -P -F '#{pane_id}')"
   CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$WINDOW_ID" '#W')"
+  WINDOW_SHORT_NAME="${WINDOW_SHORT_NAME:-squad:${RUN_ID:0:15}}"
   RUN_STATUS="running"
   write_state
 
@@ -172,7 +174,7 @@ resume_run() {
     ' "$SQUAD_DIR/manager-prompt.md" > "$SQUAD_DIR/manager-resume-prompt.md"
 
   title="$(cat "$SQUAD_DIR/title.txt")"
-  tmux rename-window -t "$WINDOW_ID" "$CURRENT_WINDOW_NAME | squad: $title"
+  tmux rename-window -t "$WINDOW_ID" "$WINDOW_SHORT_NAME"
   tmux select-pane -t "$MANAGER_PANE" -T "$title"
   tmux select-pane -t "$CODER_PANE" -T "Coder"
   tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
@@ -295,12 +297,13 @@ printf '%s\n' "$SQUAD_TITLE" > "$SQUAD_DIR/title.txt"
 MANAGER_PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
 CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$MANAGER_PANE" '#W')"
 WINDOW_ID="$(tmux display-message -p -t "$MANAGER_PANE" '#{window_id}')"
+WINDOW_SHORT_NAME="squad:${RUN_ID:0:15}"
 CODER_PANE=$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')
 ADVISOR_PANE=$(tmux split-window -v -c "$WORKDIR" -d -t "$CODER_PANE" -P -F '#{pane_id}')
 
 RUN_STATUS="running"
 write_state
-tmux rename-window -t "$WINDOW_ID" "$CURRENT_WINDOW_NAME | squad: $SQUAD_TITLE"
+tmux rename-window -t "$WINDOW_ID" "$WINDOW_SHORT_NAME"
 tmux select-pane -t "$MANAGER_PANE" -T "$SQUAD_TITLE"
 tmux select-pane -t "$CODER_PANE" -T "Coder"
 tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
@@ -316,7 +319,7 @@ cat > "$SQUAD_DIR/update-title" <<'HELPER'
 set -euo pipefail
 TITLE_FILE="$1"
 NEW_TITLE_FILE="$2"
-WINDOW_BASE_NAME="$3"
+WINDOW_SHORT_NAME="$3"
 MANAGER_PANE="$4"
 CODER_PANE="$5"
 ADVISOR_PANE="$6"
@@ -336,7 +339,7 @@ if [[ -z "$NEW_TITLE" ]]; then
 fi
 
 printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
-tmux rename-window -t "$MANAGER_PANE" "$WINDOW_BASE_NAME | squad: $NEW_TITLE"
+tmux rename-window -t "$MANAGER_PANE" "$WINDOW_SHORT_NAME"
 tmux select-pane -t "$MANAGER_PANE" -T "$NEW_TITLE"
 tmux select-pane -t "$CODER_PANE" -T "Coder"
 tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
@@ -792,7 +795,7 @@ on similar features by naming the business object and concrete change. Then run:
   cat > '$SQUAD_DIR/new-title.txt' <<'EOF'
   (specific title, for example: EAR-123 | 車両マスタCSVインポートの重複検証追加)
   EOF
-  '$SQUAD_DIR/update-title' '$SQUAD_DIR/title.txt' '$SQUAD_DIR/new-title.txt' '$CURRENT_WINDOW_NAME' '$MANAGER_PANE' '$CODER_PANE' '$ADVISOR_PANE'
+  '$SQUAD_DIR/update-title' '$SQUAD_DIR/title.txt' '$SQUAD_DIR/new-title.txt' '$WINDOW_SHORT_NAME' '$MANAGER_PANE' '$CODER_PANE' '$ADVISOR_PANE'
 
 ### Ask Advisor for an implementation plan
 
