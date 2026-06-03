@@ -744,6 +744,8 @@ Speak Japanese to PO (user). Write English for agents.
 All implementation work happens in the isolated squad worktree. Existing changes
 in the original worktree must remain untouched. The squad worktree is retained
 after completion so that PO can inspect, commit, or merge the result.
+Agents must not create additional worktrees. In particular, do not create
+worktrees under the repository such as .claude/worktree or .claude/worktrees.
 
 ## Critical rules
 
@@ -765,6 +767,9 @@ after completion so that PO can inspect, commit, or merge the result.
 - RuboCop success is required independently of the Coder's report.
 - NEVER commit, push, force-push, merge, rebase, or create a pull request unless
   PO explicitly asks for that Git operation. Editing files is allowed.
+- NEVER create additional git worktrees, including Claude Code default locations
+  such as .claude/worktree or .claude/worktrees. Use only the isolated squad
+  worktree: $WORKDIR.
 
 ## Status handling
 
@@ -809,7 +814,9 @@ verification report. For broad or uncertain changes, require Coder to use
 built-in Explore subagents to investigate independent areas in parallel before
 editing. Keep all file writes in the main Coder session, and skip subagents for
 narrow changes. Explicitly prohibit commit, push, force-push, merge, rebase, and
-pull-request creation unless PO requested that specific Git operation. Then run:
+pull-request creation unless PO requested that specific Git operation. Explicitly
+prohibit creating any additional git worktree, including .claude/worktree or
+.claude/worktrees. Then run:
 
   tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $CODER_EVENT $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial $SQUAD_DIR/title.txt' Enter
   $SQUAD_DIR/run-wait '$CODER_EVENT' '$SQUAD_DIR/coder-status.txt' '$CODER_PANE' '$WAIT_TIMEOUT_SECONDS' 'Coder'
@@ -844,7 +851,9 @@ RuboCop status is 0. Then run:
 ### Ask Coder to fix review findings
 
 Write an English request to $SQUAD_DIR/coder-task.txt. Include all must_fix
-findings and require updated tests and RuboCop. Continue the exact Coder session:
+findings and require updated tests and RuboCop. Reiterate that Coder must not
+create additional git worktrees and must keep all work in $WORKDIR. Continue the
+exact Coder session:
 
   tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $CODER_EVENT $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume $SQUAD_DIR/title.txt' Enter
   $SQUAD_DIR/run-wait '$CODER_EVENT' '$SQUAD_DIR/coder-status.txt' '$CODER_PANE' '$WAIT_TIMEOUT_SECONDS' 'Coder fix'
