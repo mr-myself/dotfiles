@@ -265,6 +265,12 @@ REPO_ROOT="$(git -C "$ORIGINAL_WORKDIR" rev-parse --show-toplevel 2>/dev/null)" 
 RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
 STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
 REPO_NAME="$(basename "$REPO_ROOT")"
+COMPOSE_PROJECT_NAME_SAFE="$(
+  printf '%s' "$REPO_NAME" |
+    tr '[:upper:]' '[:lower:]' |
+    sed -E 's/[^a-z0-9_-]+/-/g; s/^-+//; s/-+$//'
+)"
+COMPOSE_PROJECT_NAME_SAFE="${COMPOSE_PROJECT_NAME_SAFE:-squad}"
 SQUAD_DIR="$SQUAD_RUN_ROOT/$RUN_ID"
 WORKDIR="$SQUAD_WORKTREE_ROOT/$REPO_NAME-$RUN_ID"
 if [[ -n "$TICKET_ID" ]]; then
@@ -288,10 +294,10 @@ fi
 
 if [[ -n "${SQUAD_RUBOCOP_COMMAND:-}" ]]; then
   RUBOCOP_COMMAND="$SQUAD_RUBOCOP_COMMAND"
-elif [[ -f "$REPO_ROOT/compose.ci.yml" ]] && command -v docker >/dev/null 2>&1; then
-  RUBOCOP_COMMAND="docker compose -f compose.ci.yml run --rm app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 elif [[ -f "$REPO_ROOT/compose.yml" ]] && command -v docker >/dev/null 2>&1; then
-  RUBOCOP_COMMAND="docker compose run --rm app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
+  RUBOCOP_COMMAND="COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME_SAFE docker compose run --no-deps --rm --entrypoint '' app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
+elif [[ -f "$REPO_ROOT/compose.ci.yml" ]] && command -v docker >/dev/null 2>&1; then
+  RUBOCOP_COMMAND="COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME_SAFE docker compose -f compose.ci.yml run --no-deps --rm --entrypoint '' app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 elif command -v bundle >/dev/null 2>&1; then
   RUBOCOP_COMMAND="bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 else
