@@ -694,8 +694,12 @@ trap finish EXIT
 
 set_title "reviewing since $(date '+%H:%M:%S')"
 log ">>> Advisor review prompt sent."
+# NOTE: codex `exec review` treats the scope flags (--uncommitted/--base/--commit)
+# as mutually exclusive with a custom [PROMPT]. We drive the review entirely from
+# the prompt (which instructs inspecting the uncommitted changes), so do NOT pass
+# --uncommitted here, or codex 0.137+ aborts with:
+#   error: the argument '--uncommitted' cannot be used with '[PROMPT]'
 codex -a never -s read-only exec review \
-  --uncommitted \
   --json \
   --output-schema "$SCHEMA_FILE" \
   -o "$RESULT_FILE" \
