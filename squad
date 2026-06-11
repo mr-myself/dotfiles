@@ -12,6 +12,8 @@ Usage: squad <task>
        squad list
        squad close [run-id]
        squad resume [run-id]
+       squad rm <run-id>...
+       squad clean
 
 Create an isolated git worktree and split the current tmux pane into 3 AI agents:
   Manager (Claude Code) - left, talks to you
@@ -27,6 +29,8 @@ Lifecycle:
   squad close <run-id>   Close a squad from another tmux window.
   squad resume           Resume the most recent retained squad.
   squad resume <run-id>  Resume a specific retained squad.
+  squad rm <run-id>...   Delete closed squads: worktree, branch, and artifacts.
+  squad clean            Delete ALL squads that are not running (asks first).
 EOF
   exit "$status"
 }
@@ -56,7 +60,7 @@ load_run() {
   fi
 
   [[ -n "$state_file" && -f "$state_file" ]] || {
-    echo "Error: no resumable squad run found" >&2
+    echo "Error: no matching squad run found (see: squad list)" >&2
     exit 1
   }
 
@@ -86,6 +90,11 @@ write_state() {
     printf 'MANAGER_PANE=%q\n' "${MANAGER_PANE:-}"
     printf 'CODER_PANE=%q\n' "${CODER_PANE:-}"
     printf 'ADVISOR_PANE=%q\n' "${ADVISOR_PANE:-}"
+    # The pane IDs embedded in manager-prompt.md at launch. Resume rewrites the
+    # prompt by mapping FROM these, so they must survive any number of resumes.
+    printf 'ORIG_MANAGER_PANE=%q\n' "${ORIG_MANAGER_PANE:-${MANAGER_PANE:-}}"
+    printf 'ORIG_CODER_PANE=%q\n' "${ORIG_CODER_PANE:-${CODER_PANE:-}}"
+    printf 'ORIG_ADVISOR_PANE=%q\n' "${ORIG_ADVISOR_PANE:-${ADVISOR_PANE:-}}"
     printf 'RUN_STATUS=%q\n' "${RUN_STATUS:-running}"
   } > "$SQUAD_DIR/state.env"
   STATE_FILE="$SQUAD_DIR/state.env"
@@ -134,8 +143,65 @@ close_run() {
   printf 'Resume with: squad resume %s\n' "$RUN_ID"
 }
 
+# Delete one retained run: its worktree, its squad branch, and its artifact
+# directory. Refuses while the squad window is still open. The branch and
+# worktree are only deleted when squad created them (isolated-worktree mode);
+# in the no-commit fallback WORKDIR is the original repository and BRANCH the
+# user's own branch, so both must survive.
+remove_run() {
+  local state_file="$1"
+  unset RUN_ID RUN_STATUS SQUAD_DIR WINDOW_ID WORKDIR BRANCH REPO_ROOT
+  source "$state_file"
+  if window_exists "${WINDOW_ID:-}"; then
+    echo "Skip $RUN_ID: still running. Close it first: squad close $RUN_ID" >&2
+    return 1
+  fi
+  if [[ -n "${WORKDIR:-}" && "$WORKDIR" != "${REPO_ROOT:-}" && -d "$WORKDIR" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" 2>/dev/null ||
+      rm -rf "$WORKDIR"
+    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+    if [[ -n "${BRANCH:-}" && -d "${REPO_ROOT:-}" ]]; then
+      git -C "$REPO_ROOT" branch -D "$BRANCH" 2>/dev/null || true
+    fi
+  fi
+  rm -rf "$SQUAD_DIR"
+  printf 'Squad removed: %s\n' "$RUN_ID"
+}
+
+clean_runs() {
+  local state_file answer title removable=()
+  while IFS= read -r state_file; do
+    unset RUN_ID RUN_STATUS WINDOW_ID
+    source "$state_file"
+    window_exists "${WINDOW_ID:-}" || removable+=("$state_file")
+  done < <(
+    find "$SQUAD_RUN_ROOT" -mindepth 2 -maxdepth 2 -name state.env -type f 2>/dev/null | sort
+  )
+
+  if [[ ${#removable[@]} -eq 0 ]]; then
+    echo "No closed squads to remove."
+    return 0
+  fi
+
+  echo "The following ${#removable[@]} squad run(s) will be DELETED (worktree, branch, artifacts):"
+  for state_file in "${removable[@]}"; do
+    unset RUN_ID SQUAD_DIR
+    source "$state_file"
+    title="$(cat "$SQUAD_DIR/title.txt" 2>/dev/null || printf 'unknown')"
+    printf '  %s  %s\n' "$RUN_ID" "$title"
+  done
+  printf 'Proceed? [y/N] '
+  read -r answer
+  [[ "$answer" == "y" || "$answer" == "Y" ]] || {
+    echo "Aborted."
+    return 1
+  }
+  for state_file in "${removable[@]}"; do
+    remove_run "$state_file"
+  done
+}
+
 resume_run() {
-  local old_manager_pane old_coder_pane old_advisor_pane old_window_name
   local new_window
   local target_session="${2:-}"
 
@@ -158,10 +224,13 @@ resume_run() {
     exit 1
   fi
 
-  old_manager_pane="${MANAGER_PANE:-}"
-  old_coder_pane="${CODER_PANE:-}"
-  old_advisor_pane="${ADVISOR_PANE:-}"
-  old_window_name="${CURRENT_WINDOW_NAME:-squad}"
+  # manager-prompt.md embeds the pane IDs from the ORIGINAL launch, so the
+  # rewrite below must always map from those — not from the previous resume's
+  # panes. Older state files lack ORIG_*; their last-known panes are the best
+  # available approximation (exact for runs that were never resumed).
+  ORIG_MANAGER_PANE="${ORIG_MANAGER_PANE:-${MANAGER_PANE:-}}"
+  ORIG_CODER_PANE="${ORIG_CODER_PANE:-${CODER_PANE:-}}"
+  ORIG_ADVISOR_PANE="${ORIG_ADVISOR_PANE:-${ADVISOR_PANE:-}}"
 
   if [[ -n "$target_session" ]]; then
     new_window="$(tmux new-window -d -t "${target_session}:" -c "$WORKDIR" -P -F '#{window_id} #{pane_id}')"
@@ -176,15 +245,15 @@ resume_run() {
   RUN_STATUS="running"
   write_state
 
-  OLD_MANAGER_PANE="$old_manager_pane" NEW_MANAGER_PANE="$MANAGER_PANE" \
-  OLD_CODER_PANE="$old_coder_pane" NEW_CODER_PANE="$CODER_PANE" \
-  OLD_ADVISOR_PANE="$old_advisor_pane" NEW_ADVISOR_PANE="$ADVISOR_PANE" \
-  OLD_WINDOW_NAME="$old_window_name" NEW_WINDOW_NAME="$CURRENT_WINDOW_NAME" \
+  # (?!\d) keeps a shorter pane ID (%31) from matching the prefix of a longer
+  # one (%319).
+  OLD_MANAGER_PANE="$ORIG_MANAGER_PANE" NEW_MANAGER_PANE="$MANAGER_PANE" \
+  OLD_CODER_PANE="$ORIG_CODER_PANE" NEW_CODER_PANE="$CODER_PANE" \
+  OLD_ADVISOR_PANE="$ORIG_ADVISOR_PANE" NEW_ADVISOR_PANE="$ADVISOR_PANE" \
     perl -0pe '
-      s/\Q$ENV{OLD_MANAGER_PANE}\E/$ENV{NEW_MANAGER_PANE}/g if length $ENV{OLD_MANAGER_PANE};
-      s/\Q$ENV{OLD_CODER_PANE}\E/$ENV{NEW_CODER_PANE}/g if length $ENV{OLD_CODER_PANE};
-      s/\Q$ENV{OLD_ADVISOR_PANE}\E/$ENV{NEW_ADVISOR_PANE}/g if length $ENV{OLD_ADVISOR_PANE};
-      s/\Q$ENV{OLD_WINDOW_NAME}\E/$ENV{NEW_WINDOW_NAME}/g if length $ENV{OLD_WINDOW_NAME};
+      s/\Q$ENV{OLD_MANAGER_PANE}\E(?!\d)/$ENV{NEW_MANAGER_PANE}/g if length $ENV{OLD_MANAGER_PANE};
+      s/\Q$ENV{OLD_CODER_PANE}\E(?!\d)/$ENV{NEW_CODER_PANE}/g if length $ENV{OLD_CODER_PANE};
+      s/\Q$ENV{OLD_ADVISOR_PANE}\E(?!\d)/$ENV{NEW_ADVISOR_PANE}/g if length $ENV{OLD_ADVISOR_PANE};
     ' "$SQUAD_DIR/manager-prompt.md" > "$SQUAD_DIR/manager-resume-prompt.md"
 
   title="$(cat "$SQUAD_DIR/title.txt")"
@@ -192,6 +261,8 @@ resume_run() {
   tmux select-pane -t "$MANAGER_PANE" -T "$title"
   tmux select-pane -t "$CODER_PANE" -T "Coder"
   tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
+  tmux set-option -w -t "$WINDOW_ID" pane-border-status top
+  tmux set-option -w -t "$WINDOW_ID" pane-border-format " #{pane_title} "
   tmux set-option -w -t "$WINDOW_ID" @squad_run_id "$RUN_ID"
   tmux set-option -w -t "$WINDOW_ID" @squad_state_file "$STATE_FILE"
   tmux send-keys -t "$MANAGER_PANE" "$SQUAD_DIR/run-manager-resume '$WORKDIR' '$SQUAD_DIR/manager-resume-prompt.md' '$MANAGER_SESSION_ID'" Enter
@@ -210,6 +281,28 @@ case "$1" in
     ;;
   close)
     close_run "${2:-}"
+    exit 0
+    ;;
+  rm)
+    shift
+    [[ $# -gt 0 ]] || {
+      echo "Error: squad rm requires at least one run-id (see: squad list)" >&2
+      exit 1
+    }
+    rm_status=0
+    for run_id in "$@"; do
+      rm_state_file="$SQUAD_RUN_ROOT/$run_id/state.env"
+      if [[ ! -f "$rm_state_file" ]]; then
+        echo "Error: unknown squad run: $run_id" >&2
+        rm_status=1
+        continue
+      fi
+      remove_run "$rm_state_file" || rm_status=1
+    done
+    exit "$rm_status"
+    ;;
+  clean)
+    clean_runs
     exit 0
     ;;
   resume)
@@ -260,6 +353,12 @@ REPO_ROOT="$(git -C "$ORIGINAL_WORKDIR" rev-parse --show-toplevel 2>/dev/null)" 
   exit 1
 }
 
+# git worktree add creates the worktree from HEAD, so a repository without any
+# commits (unborn HEAD) cannot get an isolated worktree. In that case fall back
+# to running the squad directly in the original repository.
+HAS_COMMITS=true
+git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD >/dev/null || HAS_COMMITS=false
+
 # --- Setup isolated worktree and artifact directory ---------------------------
 
 RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
@@ -272,21 +371,42 @@ COMPOSE_PROJECT_NAME_SAFE="$(
 )"
 COMPOSE_PROJECT_NAME_SAFE="${COMPOSE_PROJECT_NAME_SAFE:-squad}"
 SQUAD_DIR="$SQUAD_RUN_ROOT/$RUN_ID"
-WORKDIR="$SQUAD_WORKTREE_ROOT/$REPO_NAME-$RUN_ID"
-if [[ -n "$TICKET_ID" ]]; then
-  BRANCH="feat/$TICKET_ID"
-  if branch_exists "$BRANCH"; then
-    BRANCH="feat/$TICKET_ID-$RUN_ID"
+if [[ "$HAS_COMMITS" == "true" ]]; then
+  WORKDIR="$SQUAD_WORKTREE_ROOT/$REPO_NAME-$RUN_ID"
+  if [[ -n "$TICKET_ID" ]]; then
+    BRANCH="feat/$TICKET_ID"
+    if branch_exists "$BRANCH"; then
+      BRANCH="feat/$TICKET_ID-$RUN_ID"
+    fi
+  else
+    BRANCH="feat/squad-$RUN_ID"
   fi
 else
-  BRANCH="feat/squad-$RUN_ID"
+  # No commits yet: work directly in the original repository on its current
+  # (unborn) branch.
+  WORKDIR="$REPO_ROOT"
+  BRANCH="$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || echo main)"
 fi
 MANAGER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 CODER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
+# If the launch dies before state.env exists (set -e), leave nothing behind:
+# no empty run directory and no orphaned worktree/branch. Once state.env is
+# written the run is resumable and must be kept.
+cleanup_failed_launch() {
+  [[ -f "$SQUAD_DIR/state.env" ]] && return 0
+  rm -rf "$SQUAD_DIR"
+  if [[ "$WORKDIR" != "$REPO_ROOT" && -d "$WORKDIR" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1 || true
+    git -C "$REPO_ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+trap cleanup_failed_launch EXIT
+
 mkdir -p "$SQUAD_RUN_ROOT" "$SQUAD_WORKTREE_ROOT" "$SQUAD_DIR"
 
-if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+if [[ "$HAS_COMMITS" == "true" && -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
   echo "Note: existing changes remain untouched in the original worktree:"
   git -C "$REPO_ROOT" status --short
   echo ""
@@ -294,6 +414,10 @@ fi
 
 if [[ -n "${SQUAD_RUBOCOP_COMMAND:-}" ]]; then
   RUBOCOP_COMMAND="$SQUAD_RUBOCOP_COMMAND"
+elif [[ ! -f "$REPO_ROOT/Gemfile" ]]; then
+  # Not a Ruby project: run-rubocop sees the empty command and reports the
+  # step as skipped instead of failing the squad.
+  RUBOCOP_COMMAND=""
 elif [[ -f "$REPO_ROOT/compose.yml" ]] && command -v docker >/dev/null 2>&1; then
   RUBOCOP_COMMAND="COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME_SAFE docker compose run --no-deps --rm --entrypoint '' app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 elif [[ -f "$REPO_ROOT/compose.ci.yml" ]] && command -v docker >/dev/null 2>&1; then
@@ -301,14 +425,32 @@ elif [[ -f "$REPO_ROOT/compose.ci.yml" ]] && command -v docker >/dev/null 2>&1; 
 elif command -v bundle >/dev/null 2>&1; then
   RUBOCOP_COMMAND="bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
 else
-  echo "Error: no RuboCop command could be detected." >&2
+  echo "Error: no RuboCop command could be detected for this Ruby project." >&2
   echo "Set SQUAD_RUBOCOP_COMMAND to the project-specific command." >&2
   exit 1
 fi
 
-git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WORKDIR" HEAD
-if [[ -f "$REPO_ROOT/.env" ]]; then
-  cp "$REPO_ROOT/.env" "$WORKDIR/.env"
+if [[ "$HAS_COMMITS" == "true" ]]; then
+  git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WORKDIR" HEAD
+  if [[ -f "$REPO_ROOT/.env" ]]; then
+    cp "$REPO_ROOT/.env" "$WORKDIR/.env"
+  fi
+else
+  echo "Note: this repository has no commits yet, so no isolated worktree is created."
+  echo "The squad works directly in: $WORKDIR"
+  echo ""
+fi
+
+if [[ "$HAS_COMMITS" == "true" ]]; then
+  WORKTREE_MODE="isolated worktree"
+  WORKTREE_NOTE="All implementation work happens in the isolated squad worktree. Existing changes
+in the original worktree must remain untouched. The squad worktree is retained
+after completion so that PO can inspect, commit, or merge the result."
+else
+  WORKTREE_MODE="original repository (no commits yet, no isolated worktree)"
+  WORKTREE_NOTE="This repository has no commits yet, so git could not create an isolated
+worktree. All work happens DIRECTLY in the original repository: $REPO_ROOT.
+There is no isolation from existing files; be careful not to destroy them."
 fi
 
 cat > "$SQUAD_DIR/run-info.txt" << INFO
@@ -317,11 +459,12 @@ Ticket ID:         ${TICKET_ID:-not detected}
 Started at:        $STARTED_AT
 Original worktree: $REPO_ROOT
 Squad worktree:    $WORKDIR
+Worktree mode:     $WORKTREE_MODE
 Squad branch:      $BRANCH
 Artifacts:         $SQUAD_DIR
 Manager session:   $MANAGER_SESSION_ID
 Coder session:     $CODER_SESSION_ID
-RuboCop command:   $RUBOCOP_COMMAND
+RuboCop command:   ${RUBOCOP_COMMAND:-(none: not a Ruby project, RuboCop step is skipped)}
 Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
 INFO
 
@@ -533,7 +676,7 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Coder"
+  tmux select-pane -T "Coder: $1"
 }
 
 finish() {
@@ -552,48 +695,31 @@ trap finish EXIT
 
 set_title "running since $(date '+%H:%M:%S')"
 if [[ "$MODE" == "initial" ]]; then
+  SESSION_ARGS=(--session-id "$SESSION_ID")
   log ">>> Coder prompt sent (initial session)."
-  claude -p \
-    --dangerously-skip-permissions \
-    --session-id "$SESSION_ID" \
-    --output-format stream-json \
-    --include-partial-messages \
-    --verbose \
-    --json-schema "$(cat "$SCHEMA_FILE")" \
-    "$(cat "$TASK_FILE")" 2> "$STDERR_FILE" |
-    tee "$STREAM_FILE" |
-    jq --unbuffered -r '
-      if .type == "assistant" then
-        .message.content[]? |
-        if .type == "tool_use" then "[tool] \(.name)"
-        elif .type == "text" then .text
-        else empty end
-      elif .type == "result" then "[result] \(.subtype // "done")"
-      else empty end
-    ' |
-    while IFS= read -r line; do log "$line"; done
 else
+  SESSION_ARGS=(--resume "$SESSION_ID")
   log ">>> Coder prompt sent (resuming fixed session $SESSION_ID)."
-  claude -p \
-    --dangerously-skip-permissions \
-    --resume "$SESSION_ID" \
-    --output-format stream-json \
-    --include-partial-messages \
-    --verbose \
-    --json-schema "$(cat "$SCHEMA_FILE")" \
-    "$(cat "$TASK_FILE")" 2> "$STDERR_FILE" |
-    tee "$STREAM_FILE" |
-    jq --unbuffered -r '
-      if .type == "assistant" then
-        .message.content[]? |
-        if .type == "tool_use" then "[tool] \(.name)"
-        elif .type == "text" then .text
-        else empty end
-      elif .type == "result" then "[result] \(.subtype // "done")"
-      else empty end
-    ' |
-    while IFS= read -r line; do log "$line"; done
 fi
+claude -p \
+  --dangerously-skip-permissions \
+  "${SESSION_ARGS[@]}" \
+  --output-format stream-json \
+  --include-partial-messages \
+  --verbose \
+  --json-schema "$(cat "$SCHEMA_FILE")" \
+  "$(cat "$TASK_FILE")" 2> "$STDERR_FILE" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      .message.content[]? |
+      if .type == "tool_use" then "[tool] \(.name)"
+      elif .type == "text" then .text
+      else empty end
+    elif .type == "result" then "[result] \(.subtype // "done")"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
 
 if [[ -s "$STDERR_FILE" ]]; then
   while IFS= read -r line; do log "[stderr] $line" >&2; done < "$STDERR_FILE"
@@ -620,7 +746,7 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Advisor"
+  tmux select-pane -T "Advisor: $1"
 }
 
 finish() {
@@ -675,7 +801,7 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Advisor"
+  tmux select-pane -T "Advisor: $1"
 }
 
 finish() {
@@ -733,7 +859,7 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Coder"
+  tmux select-pane -T "Coder: $1"
 }
 
 finish() {
@@ -752,6 +878,16 @@ trap finish EXIT
 
 set_title "RuboCop since $(date '+%H:%M:%S')"
 log ">>> RuboCop starting..."
+
+BASE_COMMAND="$(cat "$COMMAND_FILE")"
+if [[ -z "$BASE_COMMAND" ]]; then
+  {
+    log ">>> RuboCop skipped: not a Ruby project (no RuboCop command configured)."
+    printf 'RuboCop skipped: not a Ruby project.\n'
+  } | tee "$RESULT_FILE"
+  exit 0
+fi
+
 RUBOCOP_FILES=()
 while IFS= read -r file; do
   case "$file" in
@@ -761,7 +897,11 @@ while IFS= read -r file; do
   esac
 done < <(
   {
-    git diff --name-only --diff-filter=ACMRT HEAD --
+    # HEAD does not exist in a repository without commits; everything is
+    # untracked there and covered by ls-files below.
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+      git diff --name-only --diff-filter=ACMRT HEAD --
+    fi
     git ls-files --others --exclude-standard
   } | sort -u
 )
@@ -783,7 +923,6 @@ printf '%s\n' "${RUBOCOP_FILES[@]}" |
   while IFS= read -r line; do log "  $line"; done
 
 printf '%q\n' "${RUBOCOP_FILES[@]}" > "${RESULT_FILE%.txt}.files"
-BASE_COMMAND="$(cat "$COMMAND_FILE")"
 AUTOCORRECT_LOG="${RESULT_FILE%.txt}.autocorrect.log"
 
 log ">>> RuboCop autocorrect starting..."
@@ -823,7 +962,8 @@ Speak Japanese to PO (user). Write English for agents.
 ## Environment
 
 - Original worktree: $REPO_ROOT
-- Isolated squad worktree: $WORKDIR
+- Squad worktree: $WORKDIR
+- Worktree mode: $WORKTREE_MODE
 - Squad branch: $BRANCH
 - Initial squad title: $SQUAD_TITLE
 - Detected ticket ID: ${TICKET_ID:-not detected}
@@ -832,9 +972,7 @@ Speak Japanese to PO (user). Write English for agents.
 - Coder session ID: $CODER_SESSION_ID
 - Wait timeout: $WAIT_TIMEOUT_SECONDS seconds
 
-All implementation work happens in the isolated squad worktree. Existing changes
-in the original worktree must remain untouched. The squad worktree is retained
-after completion so that PO can inspect, commit, or merge the result.
+$WORKTREE_NOTE
 Agents must not create additional worktrees. In particular, do not create
 worktrees under the repository such as .claude/worktree or .claude/worktrees.
 
@@ -927,8 +1065,9 @@ Always run this after Coder implementation and after each fix:
 
 RuboCop status must be 0. The helper first runs rubocop -a --cache true on the
 changed Rails/Ruby files, then runs verification on the same files. If there are
-no changed Rails/Ruby files, the helper records that and returns 0. The
-configured command uses --fail-level W, so warnings also fail verification.
+no changed Rails/Ruby files, or the project is not a Ruby project (no RuboCop
+command configured), the helper records that and returns 0. The configured
+command uses --fail-level W, so warnings also fail verification.
 
 ### Ask Advisor to review
 
