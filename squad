@@ -79,6 +79,12 @@ write_state() {
     printf 'REPO_ROOT=%q\n' "$REPO_ROOT"
     printf 'WORKDIR=%q\n' "$WORKDIR"
     printf 'BRANCH=%q\n' "$BRANCH"
+    # The EXACT fork point of this run's worktree, captured at creation time.
+    # Squad Cockpit diffs against this commit directly instead of guessing a
+    # base branch. Resume re-emits whatever load_run sourced, so the recorded
+    # fork point survives; it is never recomputed from a later HEAD.
+    printf 'SQUAD_BASE_COMMIT=%q\n' "${SQUAD_BASE_COMMIT:-}"
+    printf 'SQUAD_BASE_REF=%q\n' "${SQUAD_BASE_REF:-}"
     printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
     printf 'WINDOW_SHORT_NAME=%q\n' "${WINDOW_SHORT_NAME:-squad}"
     printf 'MANAGER_SESSION_ID=%q\n' "$MANAGER_SESSION_ID"
@@ -1586,11 +1592,30 @@ else
 fi
 
 if [[ "$HAS_COMMITS" == "true" ]]; then
+  # Record the fork point BEFORE creating the worktree. `worktree add ... HEAD`
+  # branches from exactly this commit, so it IS the base of every diff for this
+  # run — no base-branch heuristic can be more accurate. Captured immediately
+  # before the add so no later command can observe a moved HEAD.
+  SQUAD_BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify "HEAD^{commit}")"
+  # Display only. A detached HEAD still has a perfectly good commit above; only
+  # the human-readable label falls back (branch -> exact tag -> short sha).
+  SQUAD_BASE_REF="$(
+    git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null ||
+      git -C "$REPO_ROOT" describe --tags --exact-match HEAD 2>/dev/null ||
+      git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null ||
+      printf ''
+  )"
   git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WORKDIR" HEAD
   if [[ -f "$REPO_ROOT/.env" ]]; then
     cp "$REPO_ROOT/.env" "$WORKDIR/.env"
   fi
 else
+  # Unborn HEAD: the squad runs directly in the original repository and no
+  # branch is created, so there is no fork point that could exist yet. Both keys
+  # stay EMPTY rather than recording a fiction; cockpit reads empty as "not
+  # recorded" and falls back to its own detection.
+  SQUAD_BASE_COMMIT=""
+  SQUAD_BASE_REF=""
   echo "Note: this repository has no commits yet, so no isolated worktree is created."
   echo "The squad works directly in: $WORKDIR"
   echo ""
