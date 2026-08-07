@@ -87,11 +87,15 @@ write_state() {
     printf 'WAIT_TIMEOUT_SECONDS=%q\n' "$WAIT_TIMEOUT_SECONDS"
     printf 'WINDOW_ID=%q\n' "${WINDOW_ID:-}"
     printf 'CURRENT_WINDOW_NAME=%q\n' "${CURRENT_WINDOW_NAME:-}"
+    # NON-AUTHORITATIVE. tmux assigns new pane IDs on every resume, so these are
+    # only a diagnostic record of the last known layout (and are read by older
+    # Squad Cockpit builds). Never address a pane through them: resolve
+    # (RUN_ID, role) with $SQUAD_DIR/squad-pane instead.
     printf 'MANAGER_PANE=%q\n' "${MANAGER_PANE:-}"
     printf 'CODER_PANE=%q\n' "${CODER_PANE:-}"
     printf 'ADVISOR_PANE=%q\n' "${ADVISOR_PANE:-}"
-    # The pane IDs embedded in manager-prompt.md at launch. Resume rewrites the
-    # prompt by mapping FROM these, so they must survive any number of resumes.
+    # NON-AUTHORITATIVE. The pane IDs of the original launch, kept only for
+    # diagnostics; no prompt is rewritten from them any more.
     printf 'ORIG_MANAGER_PANE=%q\n' "${ORIG_MANAGER_PANE:-${MANAGER_PANE:-}}"
     printf 'ORIG_CODER_PANE=%q\n' "${ORIG_CODER_PANE:-${CODER_PANE:-}}"
     printf 'ORIG_ADVISOR_PANE=%q\n' "${ORIG_ADVISOR_PANE:-${ADVISOR_PANE:-}}"
@@ -132,12 +136,79 @@ list_runs() {
     done
 }
 
+# True when a tmux on PATH is one of squad's own kill-guard shims rather than the
+# real binary. The marker is the wrapper's own message, written a few functions
+# below, so the two stay in sync.
+is_tmux_guard_shim() {
+  grep -q 'blocked dangerous tmux command' "$1" 2>/dev/null
+}
+
+# The REAL tmux binary, skipping squad's kill-guard shims.
+#
+# Agents run with a PATH shim that refuses kill-server/kill-session/kill-window/
+# kill-pane. `squad close` is an explicit, PO-requested close — exactly the
+# carve-out that guard allows — so squad's own close path resolves the real
+# binary and calls it directly. The shim is NOT weakened: an agent that runs
+# `tmux kill-window` itself is still refused.
+#
+# The guard exports SQUAD_REAL_TMUX, but a nested guard (run-coder starts inside
+# the already-guarded Manager pane, so its `command -v tmux` finds the outer
+# shim) can capture a shim in it. Every candidate is therefore checked, and the
+# first non-shim wins.
+squad_real_tmux() {
+  local candidate
+  local -a candidates=()
+  if [[ -n "${SQUAD_REAL_TMUX:-}" ]]; then
+    candidates+=("$SQUAD_REAL_TMUX")
+  fi
+  while IFS= read -r candidate; do
+    if [[ -n "$candidate" ]]; then
+      candidates+=("$candidate")
+    fi
+  done < <(type -aP tmux 2>/dev/null || true)
+
+  for candidate in ${candidates[@]+"${candidates[@]}"}; do
+    [[ -x "$candidate" ]] || continue
+    if is_tmux_guard_shim "$candidate"; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  # Nothing but shims (or no tmux at all): fall back to PATH and let the caller
+  # report the failure rather than guessing.
+  printf 'tmux\n'
+}
+
+# Kill a squad window through the real tmux and confirm it is really gone.
+close_window() {
+  local window_id="$1"
+  local tmux_bin
+  tmux_bin="$(squad_real_tmux)"
+  "$tmux_bin" kill-window -t "$window_id" || return 1
+  ! window_exists "$window_id"
+}
+
 close_run() {
+  local previous_status
   load_run "${1:-}" false
+  previous_status="${RUN_STATUS:-running}"
   RUN_STATUS="closed"
+  # Persisted BEFORE the kill on purpose: `squad close` is normally run from
+  # inside the squad's own window, where kill-window destroys this very process
+  # and nothing after it would ever run. The rollback below covers the opposite
+  # case, so the state file is never left disagreeing with reality.
   write_state
   if window_exists "${WINDOW_ID:-}"; then
-    tmux kill-window -t "$WINDOW_ID"
+    if ! close_window "$WINDOW_ID"; then
+      RUN_STATUS="$previous_status"
+      write_state
+      echo "Error: could not close the tmux window $WINDOW_ID of squad $RUN_ID." >&2
+      echo "The squad is still running; its state was left unchanged." >&2
+      echo "If you are inside an agent pane, squad's tmux guard blocks kill-window." >&2
+      echo "Run this from your own shell instead: squad close $RUN_ID" >&2
+      exit 1
+    fi
   fi
   printf 'Squad closed: %s\n' "$RUN_ID"
   printf 'Resume with: squad resume %s\n' "$RUN_ID"
@@ -201,6 +272,863 @@ clean_runs() {
   done
 }
 
+# --- Role-addressed panes -----------------------------------------------------
+# tmux assigns brand-new pane IDs to every pane of a resumed squad, so a pane ID
+# is never a stable address. Each pane is instead tagged with the run it belongs
+# to and the role it plays, and every generated helper resolves
+# (RUN_ID, role) -> live pane ID at the moment it needs it.
+tag_pane() {
+  local pane_id="$1"
+  local role="$2"
+  tmux set-option -p -t "$pane_id" @squad_run_id "$RUN_ID"
+  tmux set-option -p -t "$pane_id" @squad_role "$role"
+}
+
+tag_all_panes() {
+  tag_pane "$MANAGER_PANE" manager
+  tag_pane "$CODER_PANE" coder
+  tag_pane "$ADVISOR_PANE" advisor
+}
+
+# Worktree mode is derivable from state.env alone: squad only creates an
+# isolated worktree when the repository has commits, and otherwise works
+# directly in REPO_ROOT. Deriving it lets resume regenerate the Manager prompt
+# without any new state field.
+set_worktree_mode() {
+  if [[ "$WORKDIR" != "$REPO_ROOT" ]]; then
+    WORKTREE_MODE="isolated worktree"
+    WORKTREE_NOTE="All implementation work happens in the isolated squad worktree. Existing changes
+in the original worktree must remain untouched. The squad worktree is retained
+after completion so that PO can inspect, commit, or merge the result."
+  else
+    WORKTREE_MODE="original repository (no commits yet, no isolated worktree)"
+    WORKTREE_NOTE="This repository has no commits yet, so git could not create an isolated
+worktree. All work happens DIRECTLY in the original repository: $REPO_ROOT.
+There is no isolation from existing files; be careful not to destroy them."
+  fi
+}
+
+# --- Generated helper scripts -------------------------------------------------
+# Regenerated on every launch AND on every resume, so a squad created by an
+# older version of this script gets the role-addressed helpers as soon as it is
+# resumed.
+generate_helper_scripts() {
+  mkdir -p "$SQUAD_DIR"
+
+  # squad-pane is the single source of truth for agent addressing.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_RUN_ID=%q\n' "$RUN_ID"
+    cat <<'HELPER'
+# Resolve one squad role to the live tmux pane ID that currently plays it.
+# Matches the pane-level @squad_run_id and @squad_role options exactly, so two
+# squads in the same tmux server can never target each other's panes.
+
+if [[ $# -ne 1 ]]; then
+  printf 'Usage: squad-pane <manager|coder|advisor>\n' >&2
+  exit 2
+fi
+
+ROLE="$1"
+case "$ROLE" in
+  manager|coder|advisor) ;;
+  *)
+    printf 'Error: unknown squad role: %s (expected manager, coder, or advisor)\n' "$ROLE" >&2
+    exit 2
+    ;;
+esac
+
+TAB=$'\t'
+MATCHES=()
+while IFS="$TAB" read -r pane_id pane_run_id pane_role; do
+  [[ "$pane_run_id" == "$SQUAD_RUN_ID" && "$pane_role" == "$ROLE" ]] || continue
+  MATCHES+=("$pane_id")
+done < <(
+  tmux list-panes -a -F "#{pane_id}${TAB}#{@squad_run_id}${TAB}#{@squad_role}" 2>/dev/null || true
+)
+
+case "${#MATCHES[@]}" in
+  1)
+    printf '%s\n' "${MATCHES[0]}"
+    ;;
+  0)
+    printf 'Error: no live tmux pane has role %s for squad run %s.\n' "$ROLE" "$SQUAD_RUN_ID" >&2
+    printf 'The pane is gone. Report this to PO; resume the squad with: squad resume %s\n' "$SQUAD_RUN_ID" >&2
+    exit 1
+    ;;
+  *)
+    printf 'Error: %s tmux panes claim role %s for squad run %s: %s\n' \
+      "${#MATCHES[@]}" "$ROLE" "$SQUAD_RUN_ID" "${MATCHES[*]}" >&2
+    printf 'Refusing to guess. Close the stale squad window, then retry.\n' >&2
+    exit 1
+    ;;
+esac
+HELPER
+  } > "$SQUAD_DIR/squad-pane"
+  chmod +x "$SQUAD_DIR/squad-pane"
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+# Run one shell command in the pane that currently plays the given role.
+# Never falls back to a guessed pane: if the role cannot be resolved, nothing
+# is sent and the exit status is non-zero.
+
+if [[ $# -ne 2 ]]; then
+  printf 'Usage: send-to <manager|coder|advisor> <shell-command>\n' >&2
+  printf 'The command must be a single argument; quote it.\n' >&2
+  exit 2
+fi
+
+ROLE="$1"
+COMMAND="$2"
+
+if ! PANE="$("$SQUAD_DIR/squad-pane" "$ROLE")"; then
+  printf 'Error: send-to %s aborted, nothing was sent.\n' "$ROLE" >&2
+  exit 1
+fi
+
+tmux send-keys -t "$PANE" "$COMMAND" Enter
+printf '[%s] sent to %s (pane %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$ROLE" "$PANE"
+HELPER
+  } > "$SQUAD_DIR/send-to"
+  chmod +x "$SQUAD_DIR/send-to"
+
+  # --- Dynamic title update ---------------------------------------------------
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+TITLE_FILE="$1"
+NEW_TITLE_FILE="$2"
+WINDOW_SHORT_NAME="$3"
+
+NEW_TITLE="$(
+  tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
+    sed -E \
+      -e 's/^[[:space:]]+//' \
+      -e 's/[[:space:]]+$//' \
+      -e 's/[[:space:]]+/ /g' |
+    cut -c 1-90
+)"
+
+if [[ -z "$NEW_TITLE" ]]; then
+  echo "Error: squad title must not be empty" >&2
+  exit 1
+fi
+
+printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
+
+retitle_agent() {
+  local role="$1"
+  local label="$2"
+  local pane
+  if pane="$("$SQUAD_DIR/squad-pane" "$role" 2>/dev/null)"; then
+    tmux select-pane -t "$pane" -T "$label"
+  else
+    printf 'Warning: the %s pane could not be resolved; its pane title was left unchanged.\n' \
+      "$role" >&2
+  fi
+}
+
+if ! MANAGER_PANE="$("$SQUAD_DIR/squad-pane" manager)"; then
+  printf 'Error: the Manager pane could not be resolved, so the window was not renamed.\n' >&2
+  printf 'The new title was still written to %s.\n' "$TITLE_FILE" >&2
+  exit 1
+fi
+
+tmux rename-window -t "$MANAGER_PANE" "$WINDOW_SHORT_NAME"
+tmux select-pane -t "$MANAGER_PANE" -T "$NEW_TITLE"
+retitle_agent coder Coder
+retitle_agent advisor Advisor
+printf '[%s] Squad title updated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE"
+HELPER
+  } > "$SQUAD_DIR/update-title"
+  chmod +x "$SQUAD_DIR/update-title"
+
+  # --- Manager resume helper --------------------------------------------------
+
+  cat > "$SQUAD_DIR/run-manager-resume" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+WORKDIR="$1"
+PROMPT_FILE="$2"
+SESSION_ID="$3"
+GUARD_BIN="$(dirname "$PROMPT_FILE")/manager-guard-bin"
+
+cd "$WORKDIR"
+mkdir -p "$GUARD_BIN"
+SQUAD_REAL_TMUX="$(command -v tmux)"
+export SQUAD_REAL_TMUX
+cat > "$GUARD_BIN/tmux" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    kill-server|kill-session|kill-window|kill-pane)
+      printf 'squad: blocked dangerous tmux command: %s\n' "$arg" >&2
+      exit 126
+      ;;
+  esac
+done
+exec "$SQUAD_REAL_TMUX" "$@"
+WRAPPER
+chmod +x "$GUARD_BIN/tmux"
+export PATH="$GUARD_BIN:$PATH"
+
+printf '[%s] Manager session resuming: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SESSION_ID"
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 exec claude \
+  --dangerously-skip-permissions \
+  --allowedTools "Bash Read Glob Grep WebFetch WebSearch" \
+  --append-system-prompt "$(cat "$PROMPT_FILE")" \
+  --resume "$SESSION_ID"
+HELPER
+  chmod +x "$SQUAD_DIR/run-manager-resume"
+
+  # --- Helper scripts (run in agent panes) ------------------------------------
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+EVENT="$1"
+STATUS_FILE="$2"
+ROLE="$3"
+TIMEOUT_SECONDS="$4"
+LABEL="$5"
+
+# Upper bound on how long we let our OWN `tmux wait-for` client take to notice
+# the signal we send it on a failure path. It exits at once in practice; the
+# bound exists only so this script can never block forever.
+WAITER_GRACE_SECONDS=5
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+# Fail closed on a bad role: waiting for an event that nothing will ever signal
+# would hang the Manager forever.
+#
+# Deliberately NO `wait-for -S` here: no waiter has been started yet, and
+# signalling an unwaited channel leaves tmux's "woken" flag set on it. Event
+# names are reused by later rounds (the same coder event is waited on again), so
+# a leftover flag would make a LATER run-wait return immediately and hand the
+# Manager a stale status file.
+case "$ROLE" in
+  manager|coder|advisor) ;;
+  *)
+    printf '125\n' > "$STATUS_FILE"
+    log "$LABEL: invalid role $ROLE (expected manager, coder, or advisor). Pass a role, never a pane ID."
+    exit 2
+    ;;
+esac
+
+tmux wait-for "$EVENT" &
+WAIT_PID=$!
+
+# Wait for our own waiter to exit, bounded so we can never block forever.
+#
+# Killing it is the LAST resort, never the normal mechanism: on tmux 3.4 a killed
+# `tmux wait-for` client stays in the channel's waiter list and SWALLOWS the next
+# signal sent to that name, which would silently break the next round that reuses
+# the event. Signalling and letting the client consume it is the only sequence
+# that leaves the channel with neither a stale flag nor a dead waiter.
+reap_waiter() {
+  local waited=0
+  while kill -0 "$WAIT_PID" 2>/dev/null; do
+    if (( waited >= WAITER_GRACE_SECONDS )); then
+      log "$LABEL: the tmux wait-for client ignored our own signal; terminating it. Event $EVENT may now swallow one signal - use a fresh round rather than reusing it."
+      kill "$WAIT_PID" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$WAIT_PID" 2>/dev/null || true
+}
+
+failure_status=""
+failure_message=""
+elapsed=0
+while kill -0 "$WAIT_PID" 2>/dev/null; do
+  # Resolved every iteration: the pane ID behind a role is not stable.
+  if ! "$SQUAD_DIR/squad-pane" "$ROLE" >/dev/null 2>&1; then
+    failure_status=125
+    failure_message="$LABEL: role $ROLE could not be resolved (pane gone)."
+    break
+  fi
+
+  if (( elapsed >= TIMEOUT_SECONDS )); then
+    failure_status=124
+    failure_message="$LABEL timed out after $TIMEOUT_SECONDS seconds."
+    break
+  fi
+
+  sleep 1
+  ((elapsed += 1))
+done
+
+# The agent helper may have signalled completion while we were checking. Our
+# waiter having exited is the NORMAL path and always wins: the agent finished and
+# wrote its own status, so we must neither overwrite that status nor send a
+# second signal (a signal with nobody waiting is what leaves the channel
+# flagged).
+if [[ -n "$failure_status" ]] && kill -0 "$WAIT_PID" 2>/dev/null; then
+  printf '%s\n' "$failure_status" > "$STATUS_FILE"
+  log "$failure_message"
+  tmux wait-for -S "$EVENT"
+  reap_waiter
+  exit 0
+fi
+
+wait "$WAIT_PID"
+HELPER
+  } > "$SQUAD_DIR/run-wait"
+  chmod +x "$SQUAD_DIR/run-wait"
+
+  cat > "$SQUAD_DIR/run-coder" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+EVENT="$4"
+SESSION_ID="$5"
+SCHEMA_FILE="$6"
+MODE="$7"
+TITLE_FILE="$8"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+STDERR_FILE="${RESULT_FILE%.json}.stderr.log"
+GUARD_BIN="${RESULT_FILE%.json}.guard-bin"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+set_title() {
+  tmux select-pane -T "Coder: $1"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  if [[ "$rc" -eq 0 ]]; then
+    set_title "done $(date '+%H:%M:%S')"
+  else
+    set_title "failed($rc) $(date '+%H:%M:%S')"
+  fi
+  tmux wait-for -S "$EVENT"
+  exit "$rc"
+}
+trap finish EXIT
+
+set_title "running since $(date '+%H:%M:%S')"
+mkdir -p "$GUARD_BIN"
+SQUAD_REAL_TMUX="$(command -v tmux)"
+export SQUAD_REAL_TMUX
+cat > "$GUARD_BIN/tmux" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    kill-server|kill-session|kill-window|kill-pane)
+      printf 'squad: blocked dangerous tmux command: %s\n' "$arg" >&2
+      exit 126
+      ;;
+  esac
+done
+exec "$SQUAD_REAL_TMUX" "$@"
+WRAPPER
+chmod +x "$GUARD_BIN/tmux"
+export PATH="$GUARD_BIN:$PATH"
+
+if [[ "$MODE" == "initial" ]]; then
+  SESSION_ARGS=(--session-id "$SESSION_ID")
+  log ">>> Coder prompt sent (initial session)."
+else
+  SESSION_ARGS=(--resume "$SESSION_ID")
+  log ">>> Coder prompt sent (resuming fixed session $SESSION_ID)."
+fi
+claude -p \
+  --dangerously-skip-permissions \
+  --append-system-prompt "Never run 'tmux kill-server' under any circumstances, with or without -L or TMUX_TMPDIR. Never run tmux commands that kill sessions, windows, panes, or servers unless the PO explicitly requests that exact tmux operation. If temporary tmux test servers are created, leave them running and report the cleanup command instead of executing it." \
+  "${SESSION_ARGS[@]}" \
+  --output-format stream-json \
+  --include-partial-messages \
+  --verbose \
+  --json-schema "$(cat "$SCHEMA_FILE")" \
+  "$(cat "$TASK_FILE")" 2> "$STDERR_FILE" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      .message.content[]? |
+      if .type == "tool_use" then "[tool] \(.name)"
+      elif .type == "text" then .text
+      else empty end
+    elif .type == "result" then "[result] \(.subtype // "done")"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+
+if [[ -s "$STDERR_FILE" ]]; then
+  while IFS= read -r line; do log "[stderr] $line" >&2; done < "$STDERR_FILE"
+fi
+jq -c 'select(.type == "result") | (.structured_output // .result)' "$STREAM_FILE" |
+  tail -n 1 > "$RESULT_FILE"
+log ">>> Coder finished."
+HELPER
+  chmod +x "$SQUAD_DIR/run-coder"
+
+  cat > "$SQUAD_DIR/run-advisor" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+EVENT="$4"
+SCHEMA_FILE="$5"
+TITLE_FILE="$6"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+set_title() {
+  tmux select-pane -T "Advisor: $1"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  if [[ "$rc" -eq 0 ]]; then
+    set_title "done $(date '+%H:%M:%S')"
+  else
+    set_title "failed($rc) $(date '+%H:%M:%S')"
+  fi
+  tmux wait-for -S "$EVENT"
+  exit "$rc"
+}
+trap finish EXIT
+
+set_title "planning since $(date '+%H:%M:%S')"
+log ">>> Advisor planning prompt sent."
+codex -a never -s read-only exec \
+  --json \
+  --output-schema "$SCHEMA_FILE" \
+  -o "$RESULT_FILE" \
+  "$(cat "$TASK_FILE")" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "item.started" then "[started] \(.item.type // "item")"
+    elif .type == "item.completed" and .item.type == "command_execution" then
+      "[command] \(.item.command // "")\n[exit] \(.item.exit_code // "unknown")"
+    elif .type == "item.completed" and .item.type == "agent_message" then .item.text
+    elif .type == "turn.completed" then "[turn] completed"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+cat "$RESULT_FILE" 2>/dev/null || true
+log ">>> Advisor finished."
+HELPER
+  chmod +x "$SQUAD_DIR/run-advisor"
+
+  cat > "$SQUAD_DIR/run-review" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+EVENT="$4"
+SCHEMA_FILE="$5"
+TITLE_FILE="$6"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+set_title() {
+  tmux select-pane -T "Advisor: $1"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  if [[ "$rc" -eq 0 ]]; then
+    set_title "done $(date '+%H:%M:%S')"
+  else
+    set_title "failed($rc) $(date '+%H:%M:%S')"
+  fi
+  tmux wait-for -S "$EVENT"
+  exit "$rc"
+}
+trap finish EXIT
+
+set_title "reviewing since $(date '+%H:%M:%S')"
+log ">>> Advisor review prompt sent."
+# NOTE: codex `exec review` treats the scope flags (--uncommitted/--base/--commit)
+# as mutually exclusive with a custom [PROMPT]. We drive the review entirely from
+# the prompt (which instructs inspecting the uncommitted changes), so do NOT pass
+# --uncommitted here, or codex 0.137+ aborts with:
+#   error: the argument '--uncommitted' cannot be used with '[PROMPT]'
+codex -a never -s read-only exec review \
+  --json \
+  --output-schema "$SCHEMA_FILE" \
+  -o "$RESULT_FILE" \
+  "$(cat "$TASK_FILE")" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "item.started" then "[started] \(.item.type // "item")"
+    elif .type == "item.completed" and .item.type == "command_execution" then
+      "[command] \(.item.command // "")\n[exit] \(.item.exit_code // "unknown")"
+    elif .type == "item.completed" and .item.type == "agent_message" then .item.text
+    elif .type == "turn.completed" then "[turn] completed"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+cat "$RESULT_FILE" 2>/dev/null || true
+log ">>> Advisor review finished."
+HELPER
+  chmod +x "$SQUAD_DIR/run-review"
+
+  cat > "$SQUAD_DIR/run-rubocop" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+COMMAND_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+EVENT="$4"
+TITLE_FILE="$5"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+set_title() {
+  tmux select-pane -T "Coder: $1"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  if [[ "$rc" -eq 0 ]]; then
+    set_title "RuboCop passed $(date '+%H:%M:%S')"
+  else
+    set_title "RuboCop failed($rc) $(date '+%H:%M:%S')"
+  fi
+  tmux wait-for -S "$EVENT"
+  exit "$rc"
+}
+trap finish EXIT
+
+set_title "RuboCop since $(date '+%H:%M:%S')"
+log ">>> RuboCop starting..."
+
+BASE_COMMAND="$(cat "$COMMAND_FILE")"
+if [[ -z "$BASE_COMMAND" ]]; then
+  {
+    log ">>> RuboCop skipped: not a Ruby project (no RuboCop command configured)."
+    printf 'RuboCop skipped: not a Ruby project.\n'
+  } | tee "$RESULT_FILE"
+  exit 0
+fi
+
+RUBOCOP_FILES=()
+while IFS= read -r file; do
+  case "$file" in
+    app/*|config/*|db/*|lib/*|spec/*|test/*|Gemfile|Rakefile|config.ru|*.rb|*.rake|*.gemspec|*.jbuilder|*.builder)
+      [[ -f "$file" ]] && RUBOCOP_FILES+=("$file")
+      ;;
+  esac
+done < <(
+  {
+    # HEAD does not exist in a repository without commits; everything is
+    # untracked there and covered by ls-files below.
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+      git diff --name-only --diff-filter=ACMRT HEAD --
+    fi
+    git ls-files --others --exclude-standard
+  } | sort -u
+)
+
+if [[ "${#RUBOCOP_FILES[@]}" -eq 0 ]]; then
+  {
+    log ">>> RuboCop skipped: no changed Rails/Ruby files."
+    printf 'No changed Rails/Ruby files for RuboCop.\n'
+  } | tee "$RESULT_FILE"
+  exit 0
+fi
+
+{
+  printf 'RuboCop target files:\n'
+  printf '%s\n' "${RUBOCOP_FILES[@]}"
+} > "$RESULT_FILE"
+log ">>> RuboCop target files:"
+printf '%s\n' "${RUBOCOP_FILES[@]}" |
+  while IFS= read -r line; do log "  $line"; done
+
+printf '%q\n' "${RUBOCOP_FILES[@]}" > "${RESULT_FILE%.txt}.files"
+AUTOCORRECT_LOG="${RESULT_FILE%.txt}.autocorrect.log"
+
+log ">>> RuboCop autocorrect starting..."
+{
+  printf '\nRuboCop autocorrect (-a):\n'
+  set +e
+  bash -lc "$BASE_COMMAND -a --cache true \"\$@\"" bash "${RUBOCOP_FILES[@]}"
+  autocorrect_status=$?
+  set -e
+  printf 'RuboCop autocorrect exit status: %s\n' "$autocorrect_status"
+} > "$AUTOCORRECT_LOG" 2>&1
+cat "$AUTOCORRECT_LOG" >> "$RESULT_FILE"
+while IFS= read -r line; do log "$line"; done < "$AUTOCORRECT_LOG"
+
+log ">>> RuboCop verification starting..."
+bash -lc "$BASE_COMMAND --cache true \"\$@\"" bash "${RUBOCOP_FILES[@]}" 2>&1 |
+  tee -a "$RESULT_FILE" |
+  while IFS= read -r line; do log "$line"; done
+log ">>> RuboCop autocorrect and verification finished for changed Rails/Ruby files."
+HELPER
+  chmod +x "$SQUAD_DIR/run-rubocop"
+}
+
+# --- Manager system prompt ----------------------------------------------------
+# Contains NO tmux pane ID: every agent is addressed by role, so the prompt stays
+# valid across any number of resumes. Regenerated on resume for the same reason.
+generate_manager_prompt() {
+  local plan_event="squad-$RUN_ID-plan"
+  local coder_event="squad-$RUN_ID-coder"
+  local rubocop_event="squad-$RUN_ID-rubocop"
+  local review_event="squad-$RUN_ID-review"
+
+  set_worktree_mode
+
+  cat > "$SQUAD_DIR/manager-prompt.md" << PROMPT
+# You are a Development Manager
+
+You coordinate a Coder and an Advisor in separate tmux panes.
+You do NOT write code yourself.
+Speak Japanese to PO (user). Write English for agents.
+
+## Environment
+
+- Original worktree: $REPO_ROOT
+- Squad worktree: $WORKDIR
+- Worktree mode: $WORKTREE_MODE
+- Squad branch: $BRANCH
+- Squad title: $SQUAD_TITLE
+- Detected ticket ID: ${TICKET_ID:-not detected}
+- Artifacts: $SQUAD_DIR
+- Manager session ID: $MANAGER_SESSION_ID
+- Coder session ID: $CODER_SESSION_ID
+- Wait timeout: $WAIT_TIMEOUT_SECONDS seconds
+
+$WORKTREE_NOTE
+Agents must not create additional worktrees. In particular, do not create
+worktrees under the repository such as .claude/worktree or .claude/worktrees.
+
+## Agent addressing (roles, never pane IDs)
+
+tmux assigns new pane IDs to every pane whenever this squad is resumed, so a
+pane ID is NEVER a stable address. Address agents by role only. The roles are
+exactly: manager, coder, advisor.
+
+  '$SQUAD_DIR/squad-pane' <role>              # prints the live pane ID for a role
+  '$SQUAD_DIR/send-to' <role> '<command>'     # runs one command in that role's pane
+
+Both resolve the pane from the tmux options tagged on it, require exactly one
+match for this run, and exit non-zero (sending nothing) otherwise. run-wait
+likewise takes a role, not a pane ID.
+
+- NEVER run 'tmux send-keys' yourself, and never write a literal tmux pane ID
+  (a %-prefixed number such as the ones tmux prints) in any command.
+- If a helper reports that a role cannot be resolved, report that to PO and stop.
+  Do not guess a pane ID.
+
+## Critical rules
+
+- BEFORE asking Advisor to plan, inspect the ticket URL or task context and
+  replace the provisional squad title with a specific title.
+- A squad title MUST include the ticket ID when one exists, the business object
+  or feature area, and the concrete change. Avoid vague titles such as
+  "CSV import", "API fix", or "bug fix". For example:
+  "EAR-123 | 車両マスタCSVインポートの重複検証追加".
+- NEVER run codex or claude commands directly. ALL work MUST go through the
+  send-to helper so that it lands in the agent panes.
+- NEVER skip the Advisor planning step.
+- ALWAYS follow the full workflow in order.
+- The PO must be able to see agent work in the tmux panes.
+- Use the run-wait helper to wait for completion. NEVER poll with capture-pane.
+- NEVER run tmux kill-server, with or without -L or TMUX_TMPDIR. Do not ask
+  Coder or Advisor to run it either. If a temporary tmux server is created for
+  testing, leave it running and report the cleanup command to PO instead of
+  executing it.
+- NEVER run tmux kill-session, kill-window, or kill-pane unless PO explicitly
+  requests that exact tmux operation. This includes test cleanup commands.
+- After each Coder run, ALWAYS run the RuboCop helper and require exit status 0.
+  The helper runs RuboCop autocorrect and verification only on changed
+  Rails/Ruby files, never the full repo.
+- The Coder MUST run relevant automated tests for the task. If tests cannot run,
+  report the exact blocker to PO and do not claim completion.
+- RuboCop success is required independently of the Coder's report.
+- NEVER commit, push, force-push, merge, rebase, or create a pull request unless
+  PO explicitly asks for that Git operation. Editing files is allowed.
+- NEVER create additional git worktrees, including Claude Code default locations
+  such as .claude/worktree or .claude/worktrees. Use only the isolated squad
+  worktree: $WORKDIR.
+
+## Status handling
+
+Each helper writes an exit code to its status file before signaling completion.
+After every run-wait command, read the status file. If it is not 0, read
+the corresponding result file if present, report the failure to PO, and decide
+whether the Coder can fix it. Never wait indefinitely after a helper failure.
+run-wait writes status 125 when the role no longer resolves to a live pane, and
+applies a $WAIT_TIMEOUT_SECONDS second timeout as a final fallback.
+
+## Commands
+
+### Update the squad title after reading the ticket
+
+Read the ticket URL or task context first. Write a concise, specific Japanese
+title to $SQUAD_DIR/new-title.txt. Include the detected ticket ID
+(${TICKET_ID:-none}) when available. Distinguish this squad from parallel work
+on similar features by naming the business object and concrete change. Then run:
+
+  cat > '$SQUAD_DIR/new-title.txt' <<'EOF'
+  (specific title, for example: EAR-123 | 車両マスタCSVインポートの重複検証追加)
+  EOF
+  '$SQUAD_DIR/update-title' '$SQUAD_DIR/title.txt' '$SQUAD_DIR/new-title.txt' '$WINDOW_SHORT_NAME'
+
+### Ask Advisor for an implementation plan
+
+Write an English request to $SQUAD_DIR/advisor-task.txt. Ask Advisor to inspect
+the repository, produce a scoped implementation plan, define acceptance
+criteria, identify relevant tests, and call out risks. Then run:
+
+  '$SQUAD_DIR/send-to' advisor '$SQUAD_DIR/run-advisor $SQUAD_DIR/advisor-task.txt $SQUAD_DIR/advisor-result.txt $SQUAD_DIR/advisor-status.txt $plan_event $SQUAD_DIR/plan-schema.json $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/run-wait' '$plan_event' '$SQUAD_DIR/advisor-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor planning'
+  cat '$SQUAD_DIR/advisor-status.txt'
+  cat '$SQUAD_DIR/advisor-result.txt'
+
+### Ask Coder to implement
+
+Write an English request to $SQUAD_DIR/coder-task.txt. Include the approved plan
+and acceptance criteria. Require Coder to inspect project rules, implement the
+change, run relevant automated tests, run RuboCop, and return the structured
+verification report. For broad or uncertain changes, require Coder to use
+built-in Explore subagents to investigate independent areas in parallel before
+editing. Keep all file writes in the main Coder session, and skip subagents for
+narrow changes. Explicitly prohibit commit, push, force-push, merge, rebase, and
+pull-request creation unless PO requested that specific Git operation. Explicitly
+prohibit creating any additional git worktree, including .claude/worktree or
+.claude/worktrees. Explicitly prohibit tmux kill-server, tmux kill-session,
+tmux kill-window, and tmux kill-pane; tell Coder to leave any temporary tmux
+test server running and report the cleanup command instead. Then run:
+
+  '$SQUAD_DIR/send-to' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/run-wait' '$coder_event' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder'
+  cat '$SQUAD_DIR/coder-status.txt'
+  cat '$SQUAD_DIR/coder-result.txt'
+
+### Run mandatory RuboCop verification
+
+Always run this after Coder implementation and after each fix:
+
+  '$SQUAD_DIR/send-to' coder '$SQUAD_DIR/run-rubocop $SQUAD_DIR/rubocop-command.txt $SQUAD_DIR/rubocop-result.txt $SQUAD_DIR/rubocop-status.txt $rubocop_event $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/run-wait' '$rubocop_event' '$SQUAD_DIR/rubocop-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'RuboCop'
+  cat '$SQUAD_DIR/rubocop-status.txt'
+  cat '$SQUAD_DIR/rubocop-result.txt'
+
+RuboCop status must be 0. The helper first runs rubocop -a --cache true on the
+changed Rails/Ruby files, then runs verification on the same files. If there are
+no changed Rails/Ruby files, or the project is not a Ruby project (no RuboCop
+command configured), the helper records that and returns 0. The configured
+command uses --fail-level W, so warnings also fail verification.
+
+### Ask Advisor to review
+
+Write an English request to $SQUAD_DIR/review-task.txt. Tell Advisor to inspect
+all uncommitted changes, verify behavior against the approved acceptance
+criteria, check the Coder's test report and mandatory RuboCop result, and return
+must_fix findings. A pass verdict is allowed only when relevant tests ran and
+RuboCop status is 0. Then run:
+
+  '$SQUAD_DIR/send-to' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-task.txt $SQUAD_DIR/review-result.txt $SQUAD_DIR/review-status.txt $review_event $SQUAD_DIR/review-schema.json $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/run-wait' '$review_event' '$SQUAD_DIR/review-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor review'
+  cat '$SQUAD_DIR/review-status.txt'
+  cat '$SQUAD_DIR/review-result.txt'
+
+### Ask Coder to fix review findings
+
+Write an English request to $SQUAD_DIR/coder-task.txt. Include all must_fix
+findings and require updated tests and RuboCop. Reiterate that Coder must not
+create additional git worktrees and must keep all work in $WORKDIR. Reiterate
+that Coder must not run tmux kill-server, tmux kill-session, tmux kill-window,
+or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
+
+  '$SQUAD_DIR/send-to' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/run-wait' '$coder_event' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder fix'
+  cat '$SQUAD_DIR/coder-status.txt'
+  cat '$SQUAD_DIR/coder-result.txt'
+
+## Workflow
+
+1. Inspect the linked ticket or task context and update the provisional title.
+2. Ask Advisor for a structured implementation plan.
+3. Show the plan to PO in Japanese and ask for approval.
+4. Ask Coder to implement the approved plan.
+5. Read Coder status and structured verification report.
+6. Run the mandatory RuboCop helper and require status 0.
+7. Ask Advisor to review the uncommitted changes and verification evidence.
+8. If review verdict is must_fix or RuboCop failed, ask Coder to fix the issues.
+9. After every fix, repeat from step 5.
+10. Report completion to PO in Japanese. Include the squad worktree path, branch,
+   test commands and results, and mandatory RuboCop result.
+PROMPT
+}
+
+# The resumed Manager keeps its previous Claude session, so its transcript still
+# contains the pane IDs it used before the resume. Those IDs are dead: say so
+# explicitly, or the model will keep reusing them from its own history.
+generate_resume_prompt() {
+  cat "$SQUAD_DIR/manager-prompt.md" > "$SQUAD_DIR/manager-resume-prompt.md"
+  cat >> "$SQUAD_DIR/manager-resume-prompt.md" << PROMPT
+
+## MIGRATION: this squad was resumed (read this before any command)
+
+This squad has been resumed in a NEW tmux window, so every tmux pane ID changed.
+Any literal tmux pane ID (a %-prefixed number) that appears in earlier turns of
+this conversation is now STALE, and tmux may already have reassigned it to an
+unrelated pane.
+
+- Those earlier commands are OBSOLETE. NEVER copy or reuse a command containing
+  a literal pane ID, and never run 'tmux send-keys' yourself.
+- NEVER pass a pane ID to run-wait. It takes a role: manager, coder, or advisor.
+- ALWAYS address agents by role through the helpers, exactly as shown in the
+  Commands section above:
+
+    '$SQUAD_DIR/send-to' coder '<command>'
+    '$SQUAD_DIR/run-wait' '<event>' '<status file>' coder '$WAIT_TIMEOUT_SECONDS' '<label>'
+
+- The helpers resolve the live pane for this run themselves. If one reports that
+  a role cannot be resolved, report that to PO and stop; do not guess.
+- The Coder and Advisor panes of this resumed window are fresh shells: no agent
+  is mid-task, and the Coder resumes its own session only when you send
+  run-coder with the resume mode.
+PROMPT
+}
+
 resume_run() {
   local new_window
   local target_session="${2:-}"
@@ -224,10 +1152,7 @@ resume_run() {
     exit 1
   fi
 
-  # manager-prompt.md embeds the pane IDs from the ORIGINAL launch, so the
-  # rewrite below must always map from those — not from the previous resume's
-  # panes. Older state files lack ORIG_*; their last-known panes are the best
-  # available approximation (exact for runs that were never resumed).
+  # Diagnostics only: kept so state.env still records the original layout.
   ORIG_MANAGER_PANE="${ORIG_MANAGER_PANE:-${MANAGER_PANE:-}}"
   ORIG_CODER_PANE="${ORIG_CODER_PANE:-${CODER_PANE:-}}"
   ORIG_ADVISOR_PANE="${ORIG_ADVISOR_PANE:-${ADVISOR_PANE:-}}"
@@ -244,21 +1169,18 @@ resume_run() {
   WINDOW_SHORT_NAME="${WINDOW_SHORT_NAME:-squad:${RUN_ID:0:15}}"
   RUN_STATUS="running"
   write_state
+  tag_all_panes
 
-  # (?!\d) keeps a shorter pane ID (%31) from matching the prefix of a longer
-  # one (%319).
-  OLD_MANAGER_PANE="$ORIG_MANAGER_PANE" NEW_MANAGER_PANE="$MANAGER_PANE" \
-  OLD_CODER_PANE="$ORIG_CODER_PANE" NEW_CODER_PANE="$CODER_PANE" \
-  OLD_ADVISOR_PANE="$ORIG_ADVISOR_PANE" NEW_ADVISOR_PANE="$ADVISOR_PANE" \
-    perl -0pe '
-      s/\Q$ENV{OLD_MANAGER_PANE}\E(?!\d)/$ENV{NEW_MANAGER_PANE}/g if length $ENV{OLD_MANAGER_PANE};
-      s/\Q$ENV{OLD_CODER_PANE}\E(?!\d)/$ENV{NEW_CODER_PANE}/g if length $ENV{OLD_CODER_PANE};
-      s/\Q$ENV{OLD_ADVISOR_PANE}\E(?!\d)/$ENV{NEW_ADVISOR_PANE}/g if length $ENV{OLD_ADVISOR_PANE};
-    ' "$SQUAD_DIR/manager-prompt.md" > "$SQUAD_DIR/manager-resume-prompt.md"
+  # Regenerate the helper scripts and prompts from this version of squad, so a
+  # run created by an older version is migrated to role addressing the moment it
+  # is resumed. The prompts contain no pane ID, so no rewrite is needed.
+  SQUAD_TITLE="$(cat "$SQUAD_DIR/title.txt" 2>/dev/null || printf 'squad')"
+  generate_helper_scripts
+  generate_manager_prompt
+  generate_resume_prompt
 
-  title="$(cat "$SQUAD_DIR/title.txt")"
   tmux rename-window -t "$WINDOW_ID" "$WINDOW_SHORT_NAME"
-  tmux select-pane -t "$MANAGER_PANE" -T "$title"
+  tmux select-pane -t "$MANAGER_PANE" -T "$SQUAD_TITLE"
   tmux select-pane -t "$CODER_PANE" -T "Coder"
   tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
   tmux set-option -w -t "$WINDOW_ID" pane-border-status top
@@ -341,7 +1263,7 @@ if [[ -z "${TMUX:-}" ]]; then
   exit 1
 fi
 
-for cmd in claude codex git jq perl tmux uuidgen; do
+for cmd in claude codex git jq tmux uuidgen; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "Error: $cmd is not installed or not in PATH" >&2
     exit 1
@@ -441,17 +1363,7 @@ else
   echo ""
 fi
 
-if [[ "$HAS_COMMITS" == "true" ]]; then
-  WORKTREE_MODE="isolated worktree"
-  WORKTREE_NOTE="All implementation work happens in the isolated squad worktree. Existing changes
-in the original worktree must remain untouched. The squad worktree is retained
-after completion so that PO can inspect, commit, or merge the result."
-else
-  WORKTREE_MODE="original repository (no commits yet, no isolated worktree)"
-  WORKTREE_NOTE="This repository has no commits yet, so git could not create an isolated
-worktree. All work happens DIRECTLY in the original repository: $REPO_ROOT.
-There is no isolation from existing files; be careful not to destroy them."
-fi
+set_worktree_mode
 
 cat > "$SQUAD_DIR/run-info.txt" << INFO
 Squad title:       $SQUAD_TITLE
@@ -483,6 +1395,7 @@ ADVISOR_PANE=$(tmux split-window -v -c "$WORKDIR" -d -t "$CODER_PANE" -P -F '#{p
 
 RUN_STATUS="running"
 write_state
+tag_all_panes
 tmux rename-window -t "$WINDOW_ID" "$WINDOW_SHORT_NAME"
 tmux select-pane -t "$MANAGER_PANE" -T "$SQUAD_TITLE"
 tmux select-pane -t "$CODER_PANE" -T "Coder"
@@ -491,80 +1404,6 @@ tmux set-option -w -t "$WINDOW_ID" pane-border-status top
 tmux set-option -w -t "$WINDOW_ID" pane-border-format " #{pane_title} "
 tmux set-option -w -t "$WINDOW_ID" @squad_run_id "$RUN_ID"
 tmux set-option -w -t "$WINDOW_ID" @squad_state_file "$STATE_FILE"
-
-# --- Dynamic title update -----------------------------------------------------
-
-cat > "$SQUAD_DIR/update-title" <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-TITLE_FILE="$1"
-NEW_TITLE_FILE="$2"
-WINDOW_SHORT_NAME="$3"
-MANAGER_PANE="$4"
-CODER_PANE="$5"
-ADVISOR_PANE="$6"
-
-NEW_TITLE="$(
-  tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
-    sed -E \
-      -e 's/^[[:space:]]+//' \
-      -e 's/[[:space:]]+$//' \
-      -e 's/[[:space:]]+/ /g' |
-    cut -c 1-90
-)"
-
-if [[ -z "$NEW_TITLE" ]]; then
-  echo "Error: squad title must not be empty" >&2
-  exit 1
-fi
-
-printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
-tmux rename-window -t "$MANAGER_PANE" "$WINDOW_SHORT_NAME"
-tmux select-pane -t "$MANAGER_PANE" -T "$NEW_TITLE"
-tmux select-pane -t "$CODER_PANE" -T "Coder"
-tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
-printf '[%s] Squad title updated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE"
-HELPER
-chmod +x "$SQUAD_DIR/update-title"
-
-# --- Manager resume helper ----------------------------------------------------
-
-cat > "$SQUAD_DIR/run-manager-resume" <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-WORKDIR="$1"
-PROMPT_FILE="$2"
-SESSION_ID="$3"
-GUARD_BIN="$(dirname "$PROMPT_FILE")/manager-guard-bin"
-
-cd "$WORKDIR"
-mkdir -p "$GUARD_BIN"
-SQUAD_REAL_TMUX="$(command -v tmux)"
-export SQUAD_REAL_TMUX
-cat > "$GUARD_BIN/tmux" <<'WRAPPER'
-#!/usr/bin/env bash
-set -euo pipefail
-for arg in "$@"; do
-  case "$arg" in
-    kill-server|kill-session|kill-window|kill-pane)
-      printf 'squad: blocked dangerous tmux command: %s\n' "$arg" >&2
-      exit 126
-      ;;
-  esac
-done
-exec "$SQUAD_REAL_TMUX" "$@"
-WRAPPER
-chmod +x "$GUARD_BIN/tmux"
-export PATH="$GUARD_BIN:$PATH"
-
-printf '[%s] Manager session resuming: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SESSION_ID"
-CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 exec claude \
-  --dangerously-skip-permissions \
-  --allowedTools "Bash Read Glob Grep WebFetch WebSearch" \
-  --append-system-prompt "$(cat "$PROMPT_FILE")" \
-  --resume "$SESSION_ID"
-HELPER
-chmod +x "$SQUAD_DIR/run-manager-resume"
 
 # --- Structured output schemas ------------------------------------------------
 
@@ -635,529 +1474,12 @@ SCHEMA
 
 printf '%s\n' "$RUBOCOP_COMMAND" > "$SQUAD_DIR/rubocop-command.txt"
 
-# --- Helper scripts (run in agent panes) --------------------------------------
-
-cat > "$SQUAD_DIR/run-wait" <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-EVENT="$1"
-STATUS_FILE="$2"
-PANE="$3"
-TIMEOUT_SECONDS="$4"
-LABEL="$5"
-
-log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
-}
-
-tmux wait-for "$EVENT" &
-WAIT_PID=$!
-
-elapsed=0
-while kill -0 "$WAIT_PID" 2>/dev/null; do
-  if ! tmux display-message -p -t "$PANE" '#{pane_id}' >/dev/null 2>&1; then
-    printf '125\n' > "$STATUS_FILE"
-    log "$LABEL pane disappeared before completion."
-    tmux wait-for -S "$EVENT"
-    break
-  fi
-
-  if (( elapsed >= TIMEOUT_SECONDS )); then
-    printf '124\n' > "$STATUS_FILE"
-    log "$LABEL timed out after $TIMEOUT_SECONDS seconds."
-    tmux wait-for -S "$EVENT"
-    break
-  fi
-
-  sleep 1
-  ((elapsed += 1))
-done
-
-wait "$WAIT_PID"
-HELPER
-chmod +x "$SQUAD_DIR/run-wait"
-
-cat > "$SQUAD_DIR/run-coder" <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-TASK_FILE="$1"
-RESULT_FILE="$2"
-STATUS_FILE="$3"
-EVENT="$4"
-SESSION_ID="$5"
-SCHEMA_FILE="$6"
-MODE="$7"
-TITLE_FILE="$8"
-STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
-STDERR_FILE="${RESULT_FILE%.json}.stderr.log"
-GUARD_BIN="${RESULT_FILE%.json}.guard-bin"
-
-log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
-}
-
-set_title() {
-  tmux select-pane -T "Coder: $1"
-}
-
-finish() {
-  rc=$?
-  trap - EXIT
-  printf '%s\n' "$rc" > "$STATUS_FILE"
-  if [[ "$rc" -eq 0 ]]; then
-    set_title "done $(date '+%H:%M:%S')"
-  else
-    set_title "failed($rc) $(date '+%H:%M:%S')"
-  fi
-  tmux wait-for -S "$EVENT"
-  exit "$rc"
-}
-trap finish EXIT
-
-set_title "running since $(date '+%H:%M:%S')"
-mkdir -p "$GUARD_BIN"
-SQUAD_REAL_TMUX="$(command -v tmux)"
-export SQUAD_REAL_TMUX
-cat > "$GUARD_BIN/tmux" <<'WRAPPER'
-#!/usr/bin/env bash
-set -euo pipefail
-for arg in "$@"; do
-  case "$arg" in
-    kill-server|kill-session|kill-window|kill-pane)
-      printf 'squad: blocked dangerous tmux command: %s\n' "$arg" >&2
-      exit 126
-      ;;
-  esac
-done
-exec "$SQUAD_REAL_TMUX" "$@"
-WRAPPER
-chmod +x "$GUARD_BIN/tmux"
-export PATH="$GUARD_BIN:$PATH"
-
-if [[ "$MODE" == "initial" ]]; then
-  SESSION_ARGS=(--session-id "$SESSION_ID")
-  log ">>> Coder prompt sent (initial session)."
-else
-  SESSION_ARGS=(--resume "$SESSION_ID")
-  log ">>> Coder prompt sent (resuming fixed session $SESSION_ID)."
-fi
-claude -p \
-  --dangerously-skip-permissions \
-  --append-system-prompt "Never run 'tmux kill-server' under any circumstances, with or without -L or TMUX_TMPDIR. Never run tmux commands that kill sessions, windows, panes, or servers unless the PO explicitly requests that exact tmux operation. If temporary tmux test servers are created, leave them running and report the cleanup command instead of executing it." \
-  "${SESSION_ARGS[@]}" \
-  --output-format stream-json \
-  --include-partial-messages \
-  --verbose \
-  --json-schema "$(cat "$SCHEMA_FILE")" \
-  "$(cat "$TASK_FILE")" 2> "$STDERR_FILE" |
-  tee "$STREAM_FILE" |
-  jq --unbuffered -r '
-    if .type == "assistant" then
-      .message.content[]? |
-      if .type == "tool_use" then "[tool] \(.name)"
-      elif .type == "text" then .text
-      else empty end
-    elif .type == "result" then "[result] \(.subtype // "done")"
-    else empty end
-  ' |
-  while IFS= read -r line; do log "$line"; done
-
-if [[ -s "$STDERR_FILE" ]]; then
-  while IFS= read -r line; do log "[stderr] $line" >&2; done < "$STDERR_FILE"
-fi
-jq -c 'select(.type == "result") | (.structured_output // .result)' "$STREAM_FILE" |
-  tail -n 1 > "$RESULT_FILE"
-log ">>> Coder finished."
-HELPER
-chmod +x "$SQUAD_DIR/run-coder"
-
-cat > "$SQUAD_DIR/run-advisor" <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-TASK_FILE="$1"
-RESULT_FILE="$2"
-STATUS_FILE="$3"
-EVENT="$4"
-SCHEMA_FILE="$5"
-TITLE_FILE="$6"
-STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
-
-log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
-}
-
-set_title() {
-  tmux select-pane -T "Advisor: $1"
-}
-
-finish() {
-  rc=$?
-  trap - EXIT
-  printf '%s\n' "$rc" > "$STATUS_FILE"
-  if [[ "$rc" -eq 0 ]]; then
-    set_title "done $(date '+%H:%M:%S')"
-  else
-    set_title "failed($rc) $(date '+%H:%M:%S')"
-  fi
-  tmux wait-for -S "$EVENT"
-  exit "$rc"
-}
-trap finish EXIT
-
-set_title "planning since $(date '+%H:%M:%S')"
-log ">>> Advisor planning prompt sent."
-codex -a never -s read-only exec \
-  --json \
-  --output-schema "$SCHEMA_FILE" \
-  -o "$RESULT_FILE" \
-  "$(cat "$TASK_FILE")" |
-  tee "$STREAM_FILE" |
-  jq --unbuffered -r '
-    if .type == "item.started" then "[started] \(.item.type // "item")"
-    elif .type == "item.completed" and .item.type == "command_execution" then
-      "[command] \(.item.command // "")\n[exit] \(.item.exit_code // "unknown")"
-    elif .type == "item.completed" and .item.type == "agent_message" then .item.text
-    elif .type == "turn.completed" then "[turn] completed"
-    else empty end
-  ' |
-  while IFS= read -r line; do log "$line"; done
-cat "$RESULT_FILE" 2>/dev/null || true
-log ">>> Advisor finished."
-HELPER
-chmod +x "$SQUAD_DIR/run-advisor"
-
-cat > "$SQUAD_DIR/run-review" <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-TASK_FILE="$1"
-RESULT_FILE="$2"
-STATUS_FILE="$3"
-EVENT="$4"
-SCHEMA_FILE="$5"
-TITLE_FILE="$6"
-STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
-
-log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
-}
-
-set_title() {
-  tmux select-pane -T "Advisor: $1"
-}
-
-finish() {
-  rc=$?
-  trap - EXIT
-  printf '%s\n' "$rc" > "$STATUS_FILE"
-  if [[ "$rc" -eq 0 ]]; then
-    set_title "done $(date '+%H:%M:%S')"
-  else
-    set_title "failed($rc) $(date '+%H:%M:%S')"
-  fi
-  tmux wait-for -S "$EVENT"
-  exit "$rc"
-}
-trap finish EXIT
-
-set_title "reviewing since $(date '+%H:%M:%S')"
-log ">>> Advisor review prompt sent."
-# NOTE: codex `exec review` treats the scope flags (--uncommitted/--base/--commit)
-# as mutually exclusive with a custom [PROMPT]. We drive the review entirely from
-# the prompt (which instructs inspecting the uncommitted changes), so do NOT pass
-# --uncommitted here, or codex 0.137+ aborts with:
-#   error: the argument '--uncommitted' cannot be used with '[PROMPT]'
-codex -a never -s read-only exec review \
-  --json \
-  --output-schema "$SCHEMA_FILE" \
-  -o "$RESULT_FILE" \
-  "$(cat "$TASK_FILE")" |
-  tee "$STREAM_FILE" |
-  jq --unbuffered -r '
-    if .type == "item.started" then "[started] \(.item.type // "item")"
-    elif .type == "item.completed" and .item.type == "command_execution" then
-      "[command] \(.item.command // "")\n[exit] \(.item.exit_code // "unknown")"
-    elif .type == "item.completed" and .item.type == "agent_message" then .item.text
-    elif .type == "turn.completed" then "[turn] completed"
-    else empty end
-  ' |
-  while IFS= read -r line; do log "$line"; done
-cat "$RESULT_FILE" 2>/dev/null || true
-log ">>> Advisor review finished."
-HELPER
-chmod +x "$SQUAD_DIR/run-review"
-
-cat > "$SQUAD_DIR/run-rubocop" <<'HELPER'
-#!/usr/bin/env bash
-set -euo pipefail
-COMMAND_FILE="$1"
-RESULT_FILE="$2"
-STATUS_FILE="$3"
-EVENT="$4"
-TITLE_FILE="$5"
-
-log() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
-}
-
-set_title() {
-  tmux select-pane -T "Coder: $1"
-}
-
-finish() {
-  rc=$?
-  trap - EXIT
-  printf '%s\n' "$rc" > "$STATUS_FILE"
-  if [[ "$rc" -eq 0 ]]; then
-    set_title "RuboCop passed $(date '+%H:%M:%S')"
-  else
-    set_title "RuboCop failed($rc) $(date '+%H:%M:%S')"
-  fi
-  tmux wait-for -S "$EVENT"
-  exit "$rc"
-}
-trap finish EXIT
-
-set_title "RuboCop since $(date '+%H:%M:%S')"
-log ">>> RuboCop starting..."
-
-BASE_COMMAND="$(cat "$COMMAND_FILE")"
-if [[ -z "$BASE_COMMAND" ]]; then
-  {
-    log ">>> RuboCop skipped: not a Ruby project (no RuboCop command configured)."
-    printf 'RuboCop skipped: not a Ruby project.\n'
-  } | tee "$RESULT_FILE"
-  exit 0
-fi
-
-RUBOCOP_FILES=()
-while IFS= read -r file; do
-  case "$file" in
-    app/*|config/*|db/*|lib/*|spec/*|test/*|Gemfile|Rakefile|config.ru|*.rb|*.rake|*.gemspec|*.jbuilder|*.builder)
-      [[ -f "$file" ]] && RUBOCOP_FILES+=("$file")
-      ;;
-  esac
-done < <(
-  {
-    # HEAD does not exist in a repository without commits; everything is
-    # untracked there and covered by ls-files below.
-    if git rev-parse --verify --quiet HEAD >/dev/null; then
-      git diff --name-only --diff-filter=ACMRT HEAD --
-    fi
-    git ls-files --others --exclude-standard
-  } | sort -u
-)
-
-if [[ "${#RUBOCOP_FILES[@]}" -eq 0 ]]; then
-  {
-    log ">>> RuboCop skipped: no changed Rails/Ruby files."
-    printf 'No changed Rails/Ruby files for RuboCop.\n'
-  } | tee "$RESULT_FILE"
-  exit 0
-fi
-
-{
-  printf 'RuboCop target files:\n'
-  printf '%s\n' "${RUBOCOP_FILES[@]}"
-} > "$RESULT_FILE"
-log ">>> RuboCop target files:"
-printf '%s\n' "${RUBOCOP_FILES[@]}" |
-  while IFS= read -r line; do log "  $line"; done
-
-printf '%q\n' "${RUBOCOP_FILES[@]}" > "${RESULT_FILE%.txt}.files"
-AUTOCORRECT_LOG="${RESULT_FILE%.txt}.autocorrect.log"
-
-log ">>> RuboCop autocorrect starting..."
-{
-  printf '\nRuboCop autocorrect (-a):\n'
-  set +e
-  bash -lc "$BASE_COMMAND -a --cache true \"\$@\"" bash "${RUBOCOP_FILES[@]}"
-  autocorrect_status=$?
-  set -e
-  printf 'RuboCop autocorrect exit status: %s\n' "$autocorrect_status"
-} > "$AUTOCORRECT_LOG" 2>&1
-cat "$AUTOCORRECT_LOG" >> "$RESULT_FILE"
-while IFS= read -r line; do log "$line"; done < "$AUTOCORRECT_LOG"
-
-log ">>> RuboCop verification starting..."
-bash -lc "$BASE_COMMAND --cache true \"\$@\"" bash "${RUBOCOP_FILES[@]}" 2>&1 |
-  tee -a "$RESULT_FILE" |
-  while IFS= read -r line; do log "$line"; done
-log ">>> RuboCop autocorrect and verification finished for changed Rails/Ruby files."
-HELPER
-chmod +x "$SQUAD_DIR/run-rubocop"
-
-# --- Manager system prompt ----------------------------------------------------
-
-PLAN_EVENT="squad-$RUN_ID-plan"
-CODER_EVENT="squad-$RUN_ID-coder"
-RUBOCOP_EVENT="squad-$RUN_ID-rubocop"
-REVIEW_EVENT="squad-$RUN_ID-review"
-
-cat > "$SQUAD_DIR/manager-prompt.md" << PROMPT
-# You are a Development Manager
-
-You coordinate a Coder and an Advisor in separate tmux panes.
-You do NOT write code yourself.
-Speak Japanese to PO (user). Write English for agents.
-
-## Environment
-
-- Original worktree: $REPO_ROOT
-- Squad worktree: $WORKDIR
-- Worktree mode: $WORKTREE_MODE
-- Squad branch: $BRANCH
-- Initial squad title: $SQUAD_TITLE
-- Detected ticket ID: ${TICKET_ID:-not detected}
-- Artifacts: $SQUAD_DIR
-- Manager session ID: $MANAGER_SESSION_ID
-- Coder session ID: $CODER_SESSION_ID
-- Wait timeout: $WAIT_TIMEOUT_SECONDS seconds
-
-$WORKTREE_NOTE
-Agents must not create additional worktrees. In particular, do not create
-worktrees under the repository such as .claude/worktree or .claude/worktrees.
-
-## Critical rules
-
-- BEFORE asking Advisor to plan, inspect the ticket URL or task context and
-  replace the provisional squad title with a specific title.
-- A squad title MUST include the ticket ID when one exists, the business object
-  or feature area, and the concrete change. Avoid vague titles such as
-  "CSV import", "API fix", or "bug fix". For example:
-  "EAR-123 | 車両マスタCSVインポートの重複検証追加".
-- NEVER run codex or claude commands directly. ALL work MUST go through tmux
-  send-keys to the agent panes.
-- NEVER skip the Advisor planning step.
-- ALWAYS follow the full workflow in order.
-- The PO must be able to see agent work in the tmux panes.
-- Use the run-wait helper to wait for completion. NEVER poll with capture-pane.
-- NEVER run tmux kill-server, with or without -L or TMUX_TMPDIR. Do not ask
-  Coder or Advisor to run it either. If a temporary tmux server is created for
-  testing, leave it running and report the cleanup command to PO instead of
-  executing it.
-- NEVER run tmux kill-session, kill-window, or kill-pane unless PO explicitly
-  requests that exact tmux operation. This includes test cleanup commands.
-- After each Coder run, ALWAYS run the RuboCop helper and require exit status 0.
-  The helper runs RuboCop autocorrect and verification only on changed
-  Rails/Ruby files, never the full repo.
-- The Coder MUST run relevant automated tests for the task. If tests cannot run,
-  report the exact blocker to PO and do not claim completion.
-- RuboCop success is required independently of the Coder's report.
-- NEVER commit, push, force-push, merge, rebase, or create a pull request unless
-  PO explicitly asks for that Git operation. Editing files is allowed.
-- NEVER create additional git worktrees, including Claude Code default locations
-  such as .claude/worktree or .claude/worktrees. Use only the isolated squad
-  worktree: $WORKDIR.
-
-## Status handling
-
-Each helper writes an exit code to its status file before signaling completion.
-After every run-wait command, read the status file. If it is not 0, read
-the corresponding result file if present, report the failure to PO, and decide
-whether the Coder can fix it. Never wait indefinitely after a helper failure.
-run-wait detects a disappeared pane and applies a $WAIT_TIMEOUT_SECONDS second
-timeout as a final fallback.
-
-## Commands
-
-### Update the squad title after reading the ticket
-
-Read the ticket URL or task context first. Write a concise, specific Japanese
-title to $SQUAD_DIR/new-title.txt. Include the detected ticket ID
-(${TICKET_ID:-none}) when available. Distinguish this squad from parallel work
-on similar features by naming the business object and concrete change. Then run:
-
-  cat > '$SQUAD_DIR/new-title.txt' <<'EOF'
-  (specific title, for example: EAR-123 | 車両マスタCSVインポートの重複検証追加)
-  EOF
-  '$SQUAD_DIR/update-title' '$SQUAD_DIR/title.txt' '$SQUAD_DIR/new-title.txt' '$WINDOW_SHORT_NAME' '$MANAGER_PANE' '$CODER_PANE' '$ADVISOR_PANE'
-
-### Ask Advisor for an implementation plan
-
-Write an English request to $SQUAD_DIR/advisor-task.txt. Ask Advisor to inspect
-the repository, produce a scoped implementation plan, define acceptance
-criteria, identify relevant tests, and call out risks. Then run:
-
-  tmux send-keys -t $ADVISOR_PANE '$SQUAD_DIR/run-advisor $SQUAD_DIR/advisor-task.txt $SQUAD_DIR/advisor-result.txt $SQUAD_DIR/advisor-status.txt $PLAN_EVENT $SQUAD_DIR/plan-schema.json $SQUAD_DIR/title.txt' Enter
-  $SQUAD_DIR/run-wait '$PLAN_EVENT' '$SQUAD_DIR/advisor-status.txt' '$ADVISOR_PANE' '$WAIT_TIMEOUT_SECONDS' 'Advisor planning'
-  cat '$SQUAD_DIR/advisor-status.txt'
-  cat '$SQUAD_DIR/advisor-result.txt'
-
-### Ask Coder to implement
-
-Write an English request to $SQUAD_DIR/coder-task.txt. Include the approved plan
-and acceptance criteria. Require Coder to inspect project rules, implement the
-change, run relevant automated tests, run RuboCop, and return the structured
-verification report. For broad or uncertain changes, require Coder to use
-built-in Explore subagents to investigate independent areas in parallel before
-editing. Keep all file writes in the main Coder session, and skip subagents for
-narrow changes. Explicitly prohibit commit, push, force-push, merge, rebase, and
-pull-request creation unless PO requested that specific Git operation. Explicitly
-prohibit creating any additional git worktree, including .claude/worktree or
-.claude/worktrees. Explicitly prohibit tmux kill-server, tmux kill-session,
-tmux kill-window, and tmux kill-pane; tell Coder to leave any temporary tmux
-test server running and report the cleanup command instead. Then run:
-
-  tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $CODER_EVENT $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial $SQUAD_DIR/title.txt' Enter
-  $SQUAD_DIR/run-wait '$CODER_EVENT' '$SQUAD_DIR/coder-status.txt' '$CODER_PANE' '$WAIT_TIMEOUT_SECONDS' 'Coder'
-  cat '$SQUAD_DIR/coder-status.txt'
-  cat '$SQUAD_DIR/coder-result.txt'
-
-### Run mandatory RuboCop verification
-
-Always run this after Coder implementation and after each fix:
-
-  tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-rubocop $SQUAD_DIR/rubocop-command.txt $SQUAD_DIR/rubocop-result.txt $SQUAD_DIR/rubocop-status.txt $RUBOCOP_EVENT $SQUAD_DIR/title.txt' Enter
-  $SQUAD_DIR/run-wait '$RUBOCOP_EVENT' '$SQUAD_DIR/rubocop-status.txt' '$CODER_PANE' '$WAIT_TIMEOUT_SECONDS' 'RuboCop'
-  cat '$SQUAD_DIR/rubocop-status.txt'
-  cat '$SQUAD_DIR/rubocop-result.txt'
-
-RuboCop status must be 0. The helper first runs rubocop -a --cache true on the
-changed Rails/Ruby files, then runs verification on the same files. If there are
-no changed Rails/Ruby files, or the project is not a Ruby project (no RuboCop
-command configured), the helper records that and returns 0. The configured
-command uses --fail-level W, so warnings also fail verification.
-
-### Ask Advisor to review
-
-Write an English request to $SQUAD_DIR/review-task.txt. Tell Advisor to inspect
-all uncommitted changes, verify behavior against the approved acceptance
-criteria, check the Coder's test report and mandatory RuboCop result, and return
-must_fix findings. A pass verdict is allowed only when relevant tests ran and
-RuboCop status is 0. Then run:
-
-  tmux send-keys -t $ADVISOR_PANE '$SQUAD_DIR/run-review $SQUAD_DIR/review-task.txt $SQUAD_DIR/review-result.txt $SQUAD_DIR/review-status.txt $REVIEW_EVENT $SQUAD_DIR/review-schema.json $SQUAD_DIR/title.txt' Enter
-  $SQUAD_DIR/run-wait '$REVIEW_EVENT' '$SQUAD_DIR/review-status.txt' '$ADVISOR_PANE' '$WAIT_TIMEOUT_SECONDS' 'Advisor review'
-  cat '$SQUAD_DIR/review-status.txt'
-  cat '$SQUAD_DIR/review-result.txt'
-
-### Ask Coder to fix review findings
-
-Write an English request to $SQUAD_DIR/coder-task.txt. Include all must_fix
-findings and require updated tests and RuboCop. Reiterate that Coder must not
-create additional git worktrees and must keep all work in $WORKDIR. Reiterate
-that Coder must not run tmux kill-server, tmux kill-session, tmux kill-window,
-or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
-
-  tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $CODER_EVENT $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume $SQUAD_DIR/title.txt' Enter
-  $SQUAD_DIR/run-wait '$CODER_EVENT' '$SQUAD_DIR/coder-status.txt' '$CODER_PANE' '$WAIT_TIMEOUT_SECONDS' 'Coder fix'
-  cat '$SQUAD_DIR/coder-status.txt'
-  cat '$SQUAD_DIR/coder-result.txt'
-
-## Workflow
-
-1. Inspect the linked ticket or task context and update the provisional title.
-2. Ask Advisor for a structured implementation plan.
-3. Show the plan to PO in Japanese and ask for approval.
-4. Ask Coder to implement the approved plan.
-5. Read Coder status and structured verification report.
-6. Run the mandatory RuboCop helper and require status 0.
-7. Ask Advisor to review the uncommitted changes and verification evidence.
-8. If review verdict is must_fix or RuboCop failed, ask Coder to fix the issues.
-9. After every fix, repeat from step 5.
-10. Report completion to PO in Japanese. Include the squad worktree path, branch,
-   test commands and results, and mandatory RuboCop result.
-PROMPT
+# --- Generated helper scripts and Manager prompt ------------------------------
+# Both are regenerated verbatim by resume_run, so they must never contain a
+# tmux pane ID.
+
+generate_helper_scripts
+generate_manager_prompt
 
 # --- Launch Manager -----------------------------------------------------------
 
