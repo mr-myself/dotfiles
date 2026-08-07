@@ -646,18 +646,55 @@ REPORT_PATH="$VET_DIR/report.md"
 MANAGER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 REVIEWER_A_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
-# If the launch dies before state.env exists (set -e), leave nothing behind: no
-# empty run directory and no orphaned worktree. Once state.env is written the
-# run is resumable and must be kept.
+# If the launch dies anywhere between creating the run directory and actually
+# starting the Manager, leave nothing behind: no orphaned run directory and no
+# orphaned git worktree.
+#
+# The guard is this flag, NOT "does state.env exist". The old version tested for
+# state.env on the theory that a run with state is resumable and must be kept -
+# but write_state runs well BEFORE the Manager launch, so every abort in that
+# window found state.env already present and returned without cleaning anything.
+# That is exactly what happened on the first real run: the trap fired, saw
+# state.env, and left both the run directory and a registered worktree behind.
+# Such a run is not resumable in any useful sense either - `vet resume` execs
+# `claude --resume "$MANAGER_SESSION_ID"`, and that session is only created by
+# the Manager launch that never happened. Everything in the run directory is
+# regenerated deterministically from the PR, so removing it loses nothing.
+VET_LAUNCH_COMMITTED=false
+
 # shellcheck disable=SC2329  # invoked by the EXIT trap below
 cleanup_failed_launch() {
-  [[ -f "$VET_DIR/state.env" ]] && return 0
-  rm -rf "$VET_DIR"
-  if [[ -d "$WORKDIR" ]]; then
-    git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1 || rm -rf "$WORKDIR"
+  # Preserve the real exit status. The old handler ended in `return 0`, which
+  # replaced the failing status, so a failed launch reported success.
+  rc=$?
+  trap - EXIT
+  if [[ "$VET_LAUNCH_COMMITTED" == "true" ]]; then
+    exit "$rc"
+  fi
+  # $? alone is not trustworthy here. Measured on bash 3.2: after a `set -u`
+  # unbound-variable abort, $? is 0 inside the EXIT trap even though the shell
+  # is dying - while `false` gives 1 and `exit 3` gives 3 as expected. That is
+  # precisely the abort that killed the first real run, so keying the exit
+  # status off $? would still have reported success. Reaching this branch means
+  # the Manager was never launched, which is itself proof of failure, so force a
+  # non-zero status when $? did not supply one.
+  [[ "$rc" -ne 0 ]] || rc=1
+  echo "" >&2
+  echo "vet: launch failed before the Manager started (exit $rc); cleaning up." >&2
+  if [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
+    if git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1; then
+      echo "vet: removed worktree $WORKDIR" >&2
+    else
+      rm -rf "$WORKDIR"
+      echo "vet: removed worktree directory $WORKDIR (forced)" >&2
+    fi
     git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
   fi
-  return 0
+  if [[ -n "${VET_DIR:-}" && -d "$VET_DIR" ]]; then
+    rm -rf "$VET_DIR"
+    echo "vet: removed run directory $VET_DIR" >&2
+  fi
+  exit "$rc"
 }
 trap cleanup_failed_launch EXIT
 
@@ -2167,7 +2204,7 @@ After either, wait again with the matching run-step wait-a / wait-b.
 ### Update the pane title
 
 Write the new title to $VET_DIR/new-title.txt with the Write tool (a short
-Japanese title, for example: #$PR_NUMBER 認可チェック漏れ2件), then run:
+Japanese title, for example: #${PR_NUMBER} 認可チェック漏れ2件), then run:
 
   $VET_DIR/run-step title
 
@@ -2292,6 +2329,9 @@ if [[ "$DRY_RUN" == "true" ]]; then
   printf "  cat '%s'\n" "$VET_DIR/manager-prompt.md"
   echo ""
   printf "Remove this dry run with: vet rm %s\n" "$RUN_ID"
+  # A dry run's artifacts ARE the deliverable - the PO inspects them and removes
+  # them with `vet rm`. Commit before exiting so the cleanup trap keeps them.
+  VET_LAUNCH_COMMITTED=true
   exit 0
 fi
 
@@ -2306,16 +2346,40 @@ tmux set-option -w -t "$WINDOW_ID" pane-border-format " #{pane_title} "
 tmux set-option -w -t "$WINDOW_ID" @vet_run_id "$RUN_ID"
 tmux set-option -w -t "$WINDOW_ID" @vet_state_file "$STATE_FILE"
 
-MANAGER_TASK="PR #$PR_NUMBER ($REPO_SPEC) のレビューを開始してください: $PR_TITLE
-$PR_URL
+# ALWAYS BRACE VARIABLES IN JAPANESE PROSE - ${VAR}, never $VAR.
+#
+# bash 3.2 (/bin/bash on macOS, GNU bash 3.2.57) scans an identifier byte by
+# byte and treats the FIRST BYTE of a following multibyte character as part of
+# the name. `。` is U+3002 = E3 80 82, so "$HEAD_OID。" is parsed as the variable
+# HEAD_OID\xE3, which is unset, and under `set -u` the script aborts:
+#
+#   $ /bin/bash -c 'set -u; HEAD_OID=abc; echo "コミット $HEAD_OID。"'
+#   /bin/bash: HEAD_OID?: unbound variable        (exit 127)
+#   $ /bin/bash -c 'set -u; HEAD_OID=abc; echo "コミット ${HEAD_OID}。"'
+#   コミット abc。                                 (exit 0)
+#
+# This aborted the first real run of vet, at the very end of a launch that had
+# already fetched the PR and built the worktree. A bare $VAR only bites when a
+# multibyte character follows IMMEDIATELY, so most of the names below are safe
+# today - they are braced anyway, because the next person to reword this
+# sentence will not know the rule and a space is all that separates working
+# from broken. Measured as safe regardless of what follows: ${VAR}, positional
+# $1/$@/$#/$?, ${VAR:-default} with a Japanese default, $((arith)) and
+# ${array[@]}. Only a bare $NAME is exposed.
+MANAGER_TASK="PR #${PR_NUMBER} (${REPO_SPEC}) のレビューを開始してください: ${PR_TITLE}
+${PR_URL}
 
-チェックリスト $CHECKLIST_COUNT 項目、レビュー対象コミット $HEAD_OID。
+チェックリスト ${CHECKLIST_COUNT} 項目、レビュー対象コミット ${HEAD_OID}。
 Reviewer A と Reviewer B を並行で起動し、両方の結果を突き合わせて
-$REPORT_PATH に統合レポートを書いてください。GitHub には何も投稿しないでください。"
+${REPORT_PATH} に統合レポートを書いてください。GitHub には何も投稿しないでください。"
 
 require_claude_enforcement_flags "Manager" || exit 1
 
 cd "$WORKDIR"
+# Everything the launch needed has succeeded; from here the run is the PO's to
+# keep. The Manager may still fail or be interrupted, but the worktree and
+# artifacts must survive that so the PO can inspect or `vet resume`.
+VET_LAUNCH_COMMITTED=true
 set +e
 printf '[%s] Manager prompt sent for PR #%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$PR_NUMBER"
 CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude \
