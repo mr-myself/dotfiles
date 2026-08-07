@@ -376,9 +376,35 @@ HELPER
 # Run one shell command in the pane that currently plays the given role.
 # Never falls back to a guessed pane: if the role cannot be resolved, nothing
 # is sent and the exit status is non-zero.
+#
+#   send-to [--status-file <path>] <manager|coder|advisor> <shell-command>
+#
+# --status-file exists to close a launch race, and it must be an explicit option
+# rather than a path parsed out of the command string, which would be fragile.
+#
+# tmux send-keys only QUEUES keystrokes. The helper has NOT started when send-to
+# returns, so its own `rm -f "$STATUS_FILE"` has not run either. The Manager
+# runs a launch and then the matching run-wait synchronously in its own pane, so
+# without clearing here run-wait's fast path would find the PREVIOUS round's
+# status file and report that old result before the new command had even begun.
+# Clearing here is guaranteed to precede the wait because it happens in the
+# Manager's pane, before the keystrokes are queued.
+#
+# Only a LAUNCH passes --status-file. A run-wait must never clear, or a repeated
+# wait would discard a real result and then block.
+
+STATUS_FILE=""
+if [[ "${1:-}" == "--status-file" ]]; then
+  if [[ $# -lt 2 || -z "${2:-}" ]]; then
+    printf 'Error: --status-file requires a path.\n' >&2
+    exit 2
+  fi
+  STATUS_FILE="$2"
+  shift 2
+fi
 
 if [[ $# -ne 2 ]]; then
-  printf 'Usage: send-to <manager|coder|advisor> <shell-command>\n' >&2
+  printf 'Usage: send-to [--status-file <path>] <manager|coder|advisor> <shell-command>\n' >&2
   printf 'The command must be a single argument; quote it.\n' >&2
   exit 2
 fi
@@ -389,6 +415,11 @@ COMMAND="$2"
 if ! PANE="$("$SQUAD_DIR/squad-pane" "$ROLE")"; then
   printf 'Error: send-to %s aborted, nothing was sent.\n' "$ROLE" >&2
   exit 1
+fi
+
+# Before the keystrokes are queued, and only for a launch.
+if [[ -n "$STATUS_FILE" ]]; then
+  rm -f "$STATUS_FILE"
 fi
 
 tmux send-keys -t "$PANE" "$COMMAND" Enter
@@ -512,6 +543,23 @@ log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
+# COMPLETION IS THE STATUS FILE, NOT THE TMUX EVENT.
+#
+# Each agent helper deletes this file when it starts and writes it exactly once,
+# BEFORE signalling, when it finishes. So a non-empty status file means "this
+# round finished" and nothing else can mean that. -s rather than -f is
+# deliberate: it skips the instant during which the redirect has truncated the
+# file but not yet written to it.
+#
+# The event is only a low-latency hint. One event name is reused for every round
+# of a step, and the Manager re-runs the Coder via resume and re-runs RuboCop
+# after every fix, so a flag left on the channel by an earlier round used to make
+# the next wait return at once and hand back the PREVIOUS round's status - which
+# looks exactly like success. Trusting the file instead makes that impossible.
+status_ready() {
+  [[ -s "$STATUS_FILE" ]]
+}
+
 # Fail closed on a bad role: waiting for an event that nothing will ever signal
 # would hang the Manager forever.
 #
@@ -529,8 +577,10 @@ case "$ROLE" in
     ;;
 esac
 
-tmux wait-for "$EVENT" &
-WAIT_PID=$!
+# NOTHING IS ARMED YET, DELIBERATELY. The waiter is armed once, below, and only
+# after the fast path has had its chance to return. Arming before that leaked one
+# `tmux wait-for` client on every fast-path return, and a leaked client stays
+# registered and swallows the next signal on this event name.
 
 # Wait for our own waiter to exit, bounded so we can never block forever.
 #
@@ -553,41 +603,101 @@ reap_waiter() {
   wait "$WAIT_PID" 2>/dev/null || true
 }
 
-failure_status=""
-failure_message=""
+# Stop OUR OWN waiter. We only signal while our own waiter is alive to consume
+# it, so this send never arms the channel by itself.
+#
+# KNOWN AND DELIBERATELY TOLERATED RACE. The agent writes its status file and
+# only then signals, with a `tmux select-pane` between the two. If we notice the
+# status file inside that gap we release our waiter, and the agent's own signal
+# then lands on a channel with nobody waiting and arms the flag. Measured: this
+# reproduces, and the flag really is left set.
+#
+# It is tolerated because it is SELF-CORRECTING and the alternatives are not:
+#   * The next round on this event hits the discard branch below - event fired,
+#     no status file - logs it, discards it and re-arms. Measured end to end on a
+#     reused event: round 2 waited the full duration and returned the real
+#     status, with no waiter left over.
+#   * NOT releasing at all, and leaving our waiter for the agent's signal to
+#     consume, removes the flag but leaks a registered client whenever the agent
+#     never signals (it crashed, or we are on the 124/125 path). A leaked client
+#     silently swallows the NEXT round's real signal and nothing ever cleans it
+#     up - measured: leaked clients from an earlier test run were still
+#     registered hours later. That failure is invisible and permanent; this one
+#     costs one extra loop iteration and a log line.
+#   * Killing the client is worse still - see reap_waiter.
+#
+# So: prefer a self-correcting flag over a permanent dead waiter. Do not
+# "fix" this by removing the signal without solving the leak it would create.
+release_waiter() {
+  if kill -0 "$WAIT_PID" 2>/dev/null; then
+    tmux wait-for -S "$EVENT"
+    reap_waiter
+  else
+    wait "$WAIT_PID" 2>/dev/null || true
+  fi
+}
+
+report_done() {
+  log "$LABEL finished (status $(cat "$STATUS_FILE"))."
+  exit 0
+}
+
+# Fast path: the agent may have finished before this wait was ever called. No
+# waiter has been armed yet, so there is nothing to release.
+if status_ready; then
+  report_done
+fi
+
+tmux wait-for "$EVENT" &
+WAIT_PID=$!
+
 elapsed=0
-while kill -0 "$WAIT_PID" 2>/dev/null; do
+while :; do
+  # Authoritative check, always first.
+  if status_ready; then
+    release_waiter
+    report_done
+  fi
+
+  # Our waiter exited but no status file exists. The agent always writes its
+  # status BEFORE signalling, so this cannot be this round's completion: it is a
+  # leftover flag from an earlier round that reused this event name. Discard it
+  # and keep waiting for the real thing.
+  if ! kill -0 "$WAIT_PID" 2>/dev/null; then
+    wait "$WAIT_PID" 2>/dev/null || true
+    log "$LABEL: discarded a stale tmux signal on $EVENT (no status file was written)."
+    tmux wait-for "$EVENT" &
+    WAIT_PID=$!
+  fi
+
   # Resolved every iteration: the pane ID behind a role is not stable.
   if ! "$SQUAD_DIR/squad-pane" "$ROLE" >/dev/null 2>&1; then
-    failure_status=125
-    failure_message="$LABEL: role $ROLE could not be resolved (pane gone)."
-    break
+    release_waiter
+    # The pane may have vanished only after the agent finished.
+    if status_ready; then
+      report_done
+    fi
+    printf '125\n' > "$STATUS_FILE"
+    log "$LABEL: role $ROLE could not be resolved (pane gone)."
+    exit 0
   fi
 
   if (( elapsed >= TIMEOUT_SECONDS )); then
-    failure_status=124
-    failure_message="$LABEL timed out after $TIMEOUT_SECONDS seconds."
-    break
+    release_waiter
+    # Re-read before giving up: the agent may have finished during the last
+    # sleep. Recording 124 over a real status would report a completed step as a
+    # timeout.
+    if status_ready; then
+      report_done
+    fi
+    printf '124\n' > "$STATUS_FILE"
+    log "$LABEL timed out after $TIMEOUT_SECONDS seconds."
+    exit 0
   fi
 
   sleep 1
   ((elapsed += 1))
 done
-
-# The agent helper may have signalled completion while we were checking. Our
-# waiter having exited is the NORMAL path and always wins: the agent finished and
-# wrote its own status, so we must neither overwrite that status nor send a
-# second signal (a signal with nobody waiting is what leaves the channel
-# flagged).
-if [[ -n "$failure_status" ]] && kill -0 "$WAIT_PID" 2>/dev/null; then
-  printf '%s\n' "$failure_status" > "$STATUS_FILE"
-  log "$failure_message"
-  tmux wait-for -S "$EVENT"
-  reap_waiter
-  exit 0
-fi
-
-wait "$WAIT_PID"
 HELPER
   } > "$SQUAD_DIR/run-wait"
   chmod +x "$SQUAD_DIR/run-wait"
@@ -612,7 +722,15 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Coder: $1"
+  # -t "$TMUX_PANE" is required. Without a target tmux retitles the window's
+  # ACTIVE pane, which during a real squad is the Manager pane - so the Manager
+  # pane would show this agent's status and lose the squad title, while this pane
+  # kept a stale label. TMUX_PANE is always set inside a pane.
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux select-pane -t "$TMUX_PANE" -T "Coder: $1"
+  else
+    tmux select-pane -T "Coder: $1"
+  fi
 }
 
 finish() {
@@ -628,6 +746,14 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
+
+# Clear the previous round's status so its presence unambiguously means "THIS
+# round finished". run-wait treats the status file as the single source of
+# truth, and the Manager re-runs the Coder via resume and re-runs RuboCop after
+# every fix, so a status left over from an earlier round would otherwise let the
+# next wait report a stale result as if it were fresh. Done AFTER the trap is
+# installed, so a failure from here on still records a status.
+rm -f "$STATUS_FILE"
 
 set_title "running since $(date '+%H:%M:%S')"
 mkdir -p "$GUARD_BIN"
@@ -702,7 +828,13 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Advisor: $1"
+  # See the note in run-coder: without -t this retitles the active (Manager)
+  # pane instead of this one.
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux select-pane -t "$TMUX_PANE" -T "Advisor: $1"
+  else
+    tmux select-pane -T "Advisor: $1"
+  fi
 }
 
 finish() {
@@ -718,6 +850,14 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
+
+# Clear the previous round's status so its presence unambiguously means "THIS
+# round finished". run-wait treats the status file as the single source of
+# truth, and the Manager re-runs the Coder via resume and re-runs RuboCop after
+# every fix, so a status left over from an earlier round would otherwise let the
+# next wait report a stale result as if it were fresh. Done AFTER the trap is
+# installed, so a failure from here on still records a status.
+rm -f "$STATUS_FILE"
 
 set_title "planning since $(date '+%H:%M:%S')"
 log ">>> Advisor planning prompt sent."
@@ -757,7 +897,13 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Advisor: $1"
+  # See the note in run-coder: without -t this retitles the active (Manager)
+  # pane instead of this one.
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux select-pane -t "$TMUX_PANE" -T "Advisor: $1"
+  else
+    tmux select-pane -T "Advisor: $1"
+  fi
 }
 
 finish() {
@@ -773,6 +919,14 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
+
+# Clear the previous round's status so its presence unambiguously means "THIS
+# round finished". run-wait treats the status file as the single source of
+# truth, and the Manager re-runs the Coder via resume and re-runs RuboCop after
+# every fix, so a status left over from an earlier round would otherwise let the
+# next wait report a stale result as if it were fresh. Done AFTER the trap is
+# installed, so a failure from here on still records a status.
+rm -f "$STATUS_FILE"
 
 set_title "reviewing since $(date '+%H:%M:%S')"
 log ">>> Advisor review prompt sent."
@@ -815,7 +969,15 @@ log() {
 }
 
 set_title() {
-  tmux select-pane -T "Coder: $1"
+  # -t "$TMUX_PANE" is required. Without a target tmux retitles the window's
+  # ACTIVE pane, which during a real squad is the Manager pane - so the Manager
+  # pane would show this agent's status and lose the squad title, while this pane
+  # kept a stale label. TMUX_PANE is always set inside a pane.
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux select-pane -t "$TMUX_PANE" -T "Coder: $1"
+  else
+    tmux select-pane -T "Coder: $1"
+  fi
 }
 
 finish() {
@@ -831,6 +993,14 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
+
+# Clear the previous round's status so its presence unambiguously means "THIS
+# round finished". run-wait treats the status file as the single source of
+# truth, and the Manager re-runs the Coder via resume and re-runs RuboCop after
+# every fix, so a status left over from an earlier round would otherwise let the
+# next wait report a stale result as if it were fresh. Done AFTER the trap is
+# installed, so a failure from here on still records a status.
+rm -f "$STATUS_FILE"
 
 set_title "RuboCop since $(date '+%H:%M:%S')"
 log ">>> RuboCop starting..."
@@ -1016,7 +1186,7 @@ Write an English request to $SQUAD_DIR/advisor-task.txt. Ask Advisor to inspect
 the repository, produce a scoped implementation plan, define acceptance
 criteria, identify relevant tests, and call out risks. Then run:
 
-  '$SQUAD_DIR/send-to' advisor '$SQUAD_DIR/run-advisor $SQUAD_DIR/advisor-task.txt $SQUAD_DIR/advisor-result.txt $SQUAD_DIR/advisor-status.txt $plan_event $SQUAD_DIR/plan-schema.json $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/advisor-status.txt' advisor '$SQUAD_DIR/run-advisor $SQUAD_DIR/advisor-task.txt $SQUAD_DIR/advisor-result.txt $SQUAD_DIR/advisor-status.txt $plan_event $SQUAD_DIR/plan-schema.json $SQUAD_DIR/title.txt'
   '$SQUAD_DIR/run-wait' '$plan_event' '$SQUAD_DIR/advisor-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor planning'
   cat '$SQUAD_DIR/advisor-status.txt'
   cat '$SQUAD_DIR/advisor-result.txt'
@@ -1036,7 +1206,7 @@ prohibit creating any additional git worktree, including .claude/worktree or
 tmux kill-window, and tmux kill-pane; tell Coder to leave any temporary tmux
 test server running and report the cleanup command instead. Then run:
 
-  '$SQUAD_DIR/send-to' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/coder-status.txt' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial $SQUAD_DIR/title.txt'
   '$SQUAD_DIR/run-wait' '$coder_event' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder'
   cat '$SQUAD_DIR/coder-status.txt'
   cat '$SQUAD_DIR/coder-result.txt'
@@ -1045,7 +1215,7 @@ test server running and report the cleanup command instead. Then run:
 
 Always run this after Coder implementation and after each fix:
 
-  '$SQUAD_DIR/send-to' coder '$SQUAD_DIR/run-rubocop $SQUAD_DIR/rubocop-command.txt $SQUAD_DIR/rubocop-result.txt $SQUAD_DIR/rubocop-status.txt $rubocop_event $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/rubocop-status.txt' coder '$SQUAD_DIR/run-rubocop $SQUAD_DIR/rubocop-command.txt $SQUAD_DIR/rubocop-result.txt $SQUAD_DIR/rubocop-status.txt $rubocop_event $SQUAD_DIR/title.txt'
   '$SQUAD_DIR/run-wait' '$rubocop_event' '$SQUAD_DIR/rubocop-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'RuboCop'
   cat '$SQUAD_DIR/rubocop-status.txt'
   cat '$SQUAD_DIR/rubocop-result.txt'
@@ -1064,7 +1234,7 @@ criteria, check the Coder's test report and mandatory RuboCop result, and return
 must_fix findings. A pass verdict is allowed only when relevant tests ran and
 RuboCop status is 0. Then run:
 
-  '$SQUAD_DIR/send-to' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-task.txt $SQUAD_DIR/review-result.txt $SQUAD_DIR/review-status.txt $review_event $SQUAD_DIR/review-schema.json $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-task.txt $SQUAD_DIR/review-result.txt $SQUAD_DIR/review-status.txt $review_event $SQUAD_DIR/review-schema.json $SQUAD_DIR/title.txt'
   '$SQUAD_DIR/run-wait' '$review_event' '$SQUAD_DIR/review-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor review'
   cat '$SQUAD_DIR/review-status.txt'
   cat '$SQUAD_DIR/review-result.txt'
@@ -1077,7 +1247,7 @@ create additional git worktrees and must keep all work in $WORKDIR. Reiterate
 that Coder must not run tmux kill-server, tmux kill-session, tmux kill-window,
 or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
 
-  '$SQUAD_DIR/send-to' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/coder-status.txt' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume $SQUAD_DIR/title.txt'
   '$SQUAD_DIR/run-wait' '$coder_event' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder fix'
   cat '$SQUAD_DIR/coder-status.txt'
   cat '$SQUAD_DIR/coder-result.txt'
@@ -1118,8 +1288,14 @@ unrelated pane.
 - ALWAYS address agents by role through the helpers, exactly as shown in the
   Commands section above:
 
-    '$SQUAD_DIR/send-to' coder '<command>'
+    '$SQUAD_DIR/send-to' --status-file '<status file>' coder '<command>'
     '$SQUAD_DIR/run-wait' '<event>' '<status file>' coder '$WAIT_TIMEOUT_SECONDS' '<label>'
+
+- When you START an agent step, always pass --status-file, naming the SAME
+  status file the following run-wait reads. It clears that file in your pane
+  before the keystrokes are queued, which is what stops run-wait from handing
+  you the PREVIOUS round's result. Never pass it to run-wait. Use the
+  no-option form only for a one-off command that writes no status file.
 
 - The helpers resolve the live pane for this run themselves. If one reports that
   a role cannot be resolved, report that to PO and stop; do not guess.
@@ -1312,17 +1488,74 @@ fi
 MANAGER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 CODER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
-# If the launch dies before state.env exists (set -e), leave nothing behind:
-# no empty run directory and no orphaned worktree/branch. Once state.env is
-# written the run is resumable and must be kept.
+# If the launch dies anywhere between creating the run directory and actually
+# starting the Manager, leave nothing behind: no orphaned run directory and no
+# orphaned worktree/branch.
+#
+# The guard is this flag, NOT "does state.env exist". state.env is written well
+# BEFORE the Manager launch, so every abort in that window found it already
+# present and returned without cleaning anything - the run directory and a
+# still-registered worktree were both left behind. Such a run is not usefully
+# resumable either: `squad resume` re-execs `claude --resume
+# "$MANAGER_SESSION_ID"`, and that session is only created by the launch that
+# never happened.
+#
+# squad is deliberately MORE conservative than vet here. squad retains its
+# worktree by design and creates a branch, and deleting something the PO wants
+# is far worse than leaving an orphan. So this only ever removes resources squad
+# itself just created, only before the launch is committed, and never touches
+# the original repository.
+SQUAD_LAUNCH_COMMITTED=false
+
 cleanup_failed_launch() {
-  [[ -f "$SQUAD_DIR/state.env" ]] && return 0
-  rm -rf "$SQUAD_DIR"
-  if [[ "$WORKDIR" != "$REPO_ROOT" && -d "$WORKDIR" ]]; then
-    git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1 || true
-    git -C "$REPO_ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true
+  # Preserve the real exit status. The old handler ended in `return 0`, which
+  # replaced the failing status, so a failed launch reported success.
+  rc=$?
+  trap - EXIT
+  if [[ "$SQUAD_LAUNCH_COMMITTED" == "true" ]]; then
+    exit "$rc"
   fi
-  return 0
+  # $? alone is not trustworthy. Measured on bash 3.2: after a `set -u`
+  # unbound-variable abort, $? is 0 inside the EXIT trap even though the shell is
+  # dying, while `false` gives 1 and `exit 3` gives 3 as expected. Reaching this
+  # branch means the Manager was never launched, which is itself proof of
+  # failure, so force a non-zero status when $? did not supply one.
+  [[ "$rc" -ne 0 ]] || rc=1
+
+  echo "" >&2
+  echo "squad: launch failed before the Manager started (exit $rc); cleaning up." >&2
+
+  # ORIGINAL-REPOSITORY MODE: squad created no worktree and no branch, and
+  # WORKDIR is the PO's own repository. Never delete repository files, the
+  # worktree, or the user's branch here - there is nothing of squad's to remove
+  # beyond its own artifact directory.
+  if [[ "${WORKDIR:-}" == "${REPO_ROOT:-}" ]]; then
+    echo "squad: original-repository mode - your repository, worktree and branch were left untouched." >&2
+  elif [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
+    if git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1; then
+      echo "squad: removed worktree $WORKDIR" >&2
+    else
+      # Leave it rather than rm -rf a directory git still tracks: a half-removed
+      # worktree the PO can finish removing beats deleting something unexpected.
+      echo "squad: could NOT remove worktree $WORKDIR" >&2
+      echo "squad: remove it yourself with: git -C '$REPO_ROOT' worktree remove --force '$WORKDIR'" >&2
+    fi
+    git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    # Only ever the branch squad just created for this run.
+    if [[ -n "${BRANCH:-}" ]] && git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+      if git -C "$REPO_ROOT" branch -D "$BRANCH" >/dev/null 2>&1; then
+        echo "squad: removed branch $BRANCH" >&2
+      else
+        echo "squad: left branch $BRANCH in place; delete it with: git -C '$REPO_ROOT' branch -D '$BRANCH'" >&2
+      fi
+    fi
+  fi
+
+  if [[ -n "${SQUAD_DIR:-}" && -d "$SQUAD_DIR" ]]; then
+    rm -rf "$SQUAD_DIR"
+    echo "squad: removed run directory $SQUAD_DIR" >&2
+  fi
+  exit "$rc"
 }
 trap cleanup_failed_launch EXIT
 
@@ -1503,6 +1736,11 @@ exec "$SQUAD_REAL_TMUX" "$@"
 WRAPPER
 chmod +x "$MANAGER_GUARD_BIN/tmux"
 export PATH="$MANAGER_GUARD_BIN:$PATH"
+
+# Everything the launch needed has succeeded; from here the squad is the PO's to
+# keep. The Manager may still fail or be interrupted, but the worktree, branch
+# and artifacts must survive that so the PO can inspect, commit, merge or resume.
+SQUAD_LAUNCH_COMMITTED=true
 
 set +e
 printf '[%s] Manager prompt sent for squad: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SQUAD_TITLE"
