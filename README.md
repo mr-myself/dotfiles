@@ -24,9 +24,15 @@ takt (global)
 takt (per-project)
 - ln -s ~/mr-myself/setup/dotfiles/_takt/projects/track-manager ~/mr-myself/organization/xmile/track-manager/.takt
 
+vet (review checklist)
+- ln -s ~/mr-myself/setup/dotfiles/_vet ~/.vet
+
 squad
 - ln -s ~/mr-myself/setup/dotfiles/squad ~/.local/bin/squad
 - ln -s ~/mr-myself/setup/dotfiles/squad-herdr ~/.local/bin/squad-herdr
+
+vet
+- ln -s ~/mr-myself/setup/dotfiles/vet ~/.local/bin/vet
 
 whatdid
 - ln -s ~/mr-myself/setup/dotfiles/whatdid ~/.local/bin/whatdid

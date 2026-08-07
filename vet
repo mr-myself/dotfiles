@@ -1,0 +1,2354 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# vet - review a GitHub Pull Request with two independent AI reviewers
+# ==============================================================================
+#
+# vet checks the PR head out into a detached, throwaway git worktree, merges a
+# pre-defined review checklist (common + project override), collects the PR
+# context through `gh`, and drives two read-only reviewers in tmux panes:
+#
+#   Manager    (Claude Code, interactive) - left, talks to you, writes the report
+#   Reviewer A (Claude Code, headless)    - right-top
+#   Reviewer B (Codex, headless)          - right-bottom
+#
+# v1 is READ-ONLY. It never edits code and never posts anything to GitHub.
+
+usage() {
+  local status="${1:-1}"
+  cat <<'EOF'
+Usage: vet <pr-number>
+       vet <pr-url>
+       vet list
+       vet close [run-id]
+       vet resume [run-id]
+       vet rm <run-id>...
+       vet clean
+
+Review a GitHub Pull Request with two independent AI reviewers that first read a
+pre-defined review checklist, then produce one consolidated, paste-ready
+Markdown report. vet never edits code and never posts to GitHub on its own.
+
+Examples:
+  vet 1234
+  vet https://github.com/org/repo/pull/1234
+
+Options:
+  --allow-empty-checklist  Proceed even when no checklist item could be found.
+                           The report is marked as having limited coverage.
+  --include-closed         Review a closed or merged PR (refused by default).
+  --open                   Reveal the finished report in Finder (macOS).
+  --dry-run                Wiring check. Build the worktree, checklist merge,
+                           context, prompts, schemas and helpers, but do NOT
+                           launch any agent and do NOT split panes outside tmux.
+                           PR context is read from fixture files instead of gh:
+                           $VET_FIXTURE_DIR/{pr.json,diff.patch,comments.json}
+                           (pr.json required, the rest optional).
+                           Same as VET_DRY_RUN=1.
+
+Lifecycle:
+  vet list               List retained runs and their status.
+  vet close              Close the run for the current tmux window.
+  vet close <run-id>     Close a run from another tmux window.
+  vet resume             Resume the most recent retained run.
+  vet resume <run-id>    Resume a specific run.
+  vet rm <run-id>...     Delete closed runs: worktree and artifacts.
+  vet clean              Delete ALL runs that are not running (asks first).
+
+Checklist resolution (first match wins):
+  common   $VET_CHECKLIST, then ~/.vet/checklist.md,
+           then <dir of the real vet script>/_vet/checklist.md
+  project  <pr worktree>/.vet/checklist.md, then .review/checklist.md
+The project checklist is merged on top: same ID replaces, new ID is appended.
+
+Environment:
+  VET_STATE_ROOT             default ${XDG_STATE_HOME:-$HOME/.local/state}/vet
+  VET_WORKTREE_ROOT          default ${XDG_DATA_HOME:-$HOME/.local/share}/vet/worktrees
+  VET_CHECKLIST              full path to the common checklist
+  VET_WAIT_TIMEOUT_SECONDS   reviewer timeout (default 7200)
+  VET_MAX_FILES              default 80
+  VET_MAX_DIFF_LINES         default 20000
+  VET_MAX_CONTEXT_BYTES      default 1500000
+  VET_MAX_COMMENT_BYTES      default 400000
+EOF
+  exit "$status"
+}
+
+VET_STATE_ROOT="${VET_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/vet}"
+VET_RUN_ROOT="$VET_STATE_ROOT/runs"
+VET_WORKTREE_ROOT="${VET_WORKTREE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/vet/worktrees}"
+mkdir -p "$VET_RUN_ROOT" "$VET_WORKTREE_ROOT"
+
+# The PO runs vet through a ~/.local/bin symlink, so the bundled _vet/checklist.md
+# has to be found relative to the resolved real path, not to $0.
+script_real_path() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="$dir/$src"
+  done
+  printf '%s/%s\n' "$(cd -P "$(dirname "$src")" && pwd)" "$(basename "$src")"
+}
+VET_SCRIPT_PATH="$(script_real_path)"
+VET_SCRIPT_DIR="$(dirname "$VET_SCRIPT_PATH")"
+
+# --- Run state ----------------------------------------------------------------
+
+load_run() {
+  local requested_id="${1:-}"
+  local allow_latest="${2:-true}"
+  local state_file=""
+
+  if [[ -n "$requested_id" ]]; then
+    state_file="$VET_RUN_ROOT/$requested_id/state.env"
+  elif [[ -n "${TMUX:-}" ]]; then
+    state_file="$(tmux show-option -wqv @vet_state_file 2>/dev/null || true)"
+  fi
+
+  if [[ ( -z "$state_file" || ! -f "$state_file" ) && "$allow_latest" == "true" ]]; then
+    state_file="$(
+      find "$VET_RUN_ROOT" -mindepth 2 -maxdepth 2 -name state.env -type f 2>/dev/null |
+        sort |
+        tail -n 1
+    )"
+  fi
+
+  [[ -n "$state_file" && -f "$state_file" ]] || {
+    echo "Error: no matching vet run found (see: vet list)" >&2
+    exit 1
+  }
+
+  # state.env is generated by vet itself and contains shell-escaped values.
+  # shellcheck source=/dev/null
+  source "$state_file"
+  STATE_FILE="$state_file"
+}
+
+write_state() {
+  mkdir -p "$VET_DIR"
+  {
+    printf 'RUN_ID=%q\n' "$RUN_ID"
+    printf 'STARTED_AT=%q\n' "$STARTED_AT"
+    printf 'PR_NUMBER=%q\n' "$PR_NUMBER"
+    printf 'PR_URL=%q\n' "${PR_URL:-}"
+    printf 'PR_TITLE=%q\n' "${PR_TITLE:-}"
+    printf 'PR_STATE=%q\n' "${PR_STATE:-}"
+    printf 'PR_IS_DRAFT=%q\n' "${PR_IS_DRAFT:-false}"
+    printf 'REPO_SPEC=%q\n' "${REPO_SPEC:-}"
+    printf 'BASE_REF=%q\n' "${BASE_REF:-}"
+    printf 'HEAD_REF=%q\n' "${HEAD_REF:-}"
+    printf 'HEAD_OID=%q\n' "${HEAD_OID:-}"
+    printf 'IS_CROSS_REPOSITORY=%q\n' "${IS_CROSS_REPOSITORY:-false}"
+    printf 'GIT_REMOTE=%q\n' "${GIT_REMOTE:-}"
+    printf 'REPO_ROOT=%q\n' "$REPO_ROOT"
+    printf 'WORKDIR=%q\n' "$WORKDIR"
+    printf 'VET_DIR=%q\n' "$VET_DIR"
+    printf 'REPORT_PATH=%q\n' "${REPORT_PATH:-}"
+    printf 'WINDOW_SHORT_NAME=%q\n' "${WINDOW_SHORT_NAME:-vet}"
+    printf 'MANAGER_SESSION_ID=%q\n' "${MANAGER_SESSION_ID:-}"
+    printf 'REVIEWER_A_SESSION_ID=%q\n' "${REVIEWER_A_SESSION_ID:-}"
+    printf 'WAIT_TIMEOUT_SECONDS=%q\n' "${WAIT_TIMEOUT_SECONDS:-7200}"
+    printf 'WINDOW_ID=%q\n' "${WINDOW_ID:-}"
+    printf 'CURRENT_WINDOW_NAME=%q\n' "${CURRENT_WINDOW_NAME:-}"
+    printf 'MANAGER_PANE=%q\n' "${MANAGER_PANE:-}"
+    printf 'REVIEWER_A_PANE=%q\n' "${REVIEWER_A_PANE:-}"
+    printf 'REVIEWER_B_PANE=%q\n' "${REVIEWER_B_PANE:-}"
+    # The pane IDs embedded in manager-prompt.md at launch. Resume rewrites the
+    # prompt by mapping FROM these, so they must survive any number of resumes.
+    printf 'ORIG_MANAGER_PANE=%q\n' "${ORIG_MANAGER_PANE:-${MANAGER_PANE:-}}"
+    printf 'ORIG_REVIEWER_A_PANE=%q\n' "${ORIG_REVIEWER_A_PANE:-${REVIEWER_A_PANE:-}}"
+    printf 'ORIG_REVIEWER_B_PANE=%q\n' "${ORIG_REVIEWER_B_PANE:-${REVIEWER_B_PANE:-}}"
+    printf 'RUN_STATUS=%q\n' "${RUN_STATUS:-running}"
+  } > "$VET_DIR/state.env"
+  STATE_FILE="$VET_DIR/state.env"
+}
+
+# run-step is the ONLY way the Manager drives agents, and the only Bash rule it
+# needs. It exists because claude permission rules are PREFIX-based, which makes
+# every form of `tmux send-keys` rule unsafe. Measured against the installed CLI:
+#
+#   * Bash(tmux send-keys:*) lets the Manager type ARBITRARY text into a reviewer
+#     pane. Verified end to end: it sent `touch .../PWNED.txt && git tag
+#     pwned-via-pane`, both ran, and NO permission prompt appeared - while the
+#     very same session was refused a plain `git tag -l` directly. Reviewer panes
+#     are ordinary interactive shells with no permission layer, so this bypassed
+#     every other restriction.
+#   * Narrowing to an exact command prefix does NOT help. With
+#     Bash(tmux send-keys -t %0 /abs/helper:*) allowlisted, appending extra keys
+#     (`... /abs/helper Enter touch:/tmp/PWNED3.txt Enter`) was PERMITTED and the
+#     appended keystrokes were typed into the pane and executed by its shell.
+#     For send-keys, "extra arguments" ARE extra commands.
+#
+# So the Manager never gets a free-form tmux command. It gets one token from a
+# closed set; run-step builds the real invocation from values baked in here.
+#
+# Values are baked at generation time rather than sourced from state.env,
+# because state.env lives in $VET_DIR and sourcing a file the Manager might be
+# able to write would reintroduce arbitrary code execution. Resume regenerates
+# this file with the new pane IDs.
+write_run_step() {
+  cat > "$VET_DIR/run-step" <<RUNSTEP
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generated by vet. Values below are baked in; nothing here comes from argv.
+RUN_DIR=$(printf '%q' "$VET_DIR")
+MANAGER_PANE=$(printf '%q' "${MANAGER_PANE:-}")
+REVIEWER_A_PANE=$(printf '%q' "${REVIEWER_A_PANE:-}")
+REVIEWER_B_PANE=$(printf '%q' "${REVIEWER_B_PANE:-}")
+REVIEWER_A_SESSION_ID=$(printf '%q' "${REVIEWER_A_SESSION_ID:-}")
+WORKDIR=$(printf '%q' "$WORKDIR")
+WINDOW_SHORT_NAME=$(printf '%q' "${WINDOW_SHORT_NAME:-vet}")
+WAIT_TIMEOUT_SECONDS=$(printf '%q' "${WAIT_TIMEOUT_SECONDS:-7200}")
+EVENT_A=$(printf '%q' "vet-$RUN_ID-reviewer-a")
+EVENT_B=$(printf '%q' "vet-$RUN_ID-reviewer-b")
+
+usage() {
+  cat >&2 <<'USAGE'
+vet run-step: perform ONE review step. Takes exactly one token, from this
+closed set, and nothing else:
+
+  reviewer-a         start Reviewer A (new session)
+  reviewer-a-resume  re-run Reviewer A, continuing its existing session
+  reviewer-b         start or re-run Reviewer B
+  wait-a             block until Reviewer A finishes
+  wait-b             block until Reviewer B finishes
+  title              apply <run dir>/new-title.txt to the pane titles
+
+Any other argument, a missing argument, or ANY extra argument is rejected.
+USAGE
+}
+
+# Extra arguments are REJECTED, never ignored. This dispatcher exists precisely
+# because a trailing argument on a send-keys command becomes extra keystrokes
+# executed in a reviewer pane, so "ignore the rest" would reopen the hole.
+if [[ \$# -ne 1 ]]; then
+  printf 'Error: run-step takes exactly one argument (got %s).\n' "\$#" >&2
+  usage
+  exit 2
+fi
+
+# THE STATUS FILE MUST BE CLEARED HERE, IN THE LAUNCHER, NOT BY THE HELPER.
+#
+# tmux send-keys only QUEUES keystrokes: the helper has not started yet, so its
+# own status-file removal has not run. The Manager runs a launch token and
+# then the matching wait token synchronously in its own pane, so without this
+# clear, run-wait's fast path would find the PREVIOUS cycle's status file and
+# report the old result before the new command had even begun. Clearing here is
+# guaranteed to precede the wait because both run in the Manager's pane.
+#
+# Only the LAUNCH tokens clear. A wait token must never clear, or a double wait
+# would discard a real result and then block.
+clear_status() {
+  rm -f "\$1"
+}
+
+send_reviewer_a() {
+  clear_status "\$RUN_DIR/reviewer-a-status.txt"
+  tmux send-keys -t "\$REVIEWER_A_PANE" \\
+    "\$RUN_DIR/run-reviewer-a \$RUN_DIR/reviewer-a-task.md \$RUN_DIR/reviewer-a-result.json \$RUN_DIR/reviewer-a-status.txt \$EVENT_A \$REVIEWER_A_SESSION_ID \$RUN_DIR/reviewer-schema.json \$1 \$RUN_DIR" Enter
+  printf 'run-step: Reviewer A started (%s session).\n' "\$1"
+}
+
+send_reviewer_b() {
+  clear_status "\$RUN_DIR/reviewer-b-status.txt"
+  tmux send-keys -t "\$REVIEWER_B_PANE" \\
+    "\$RUN_DIR/run-reviewer-b \$RUN_DIR/reviewer-b-task.md \$RUN_DIR/reviewer-b-result.json \$RUN_DIR/reviewer-b-status.txt \$EVENT_B \$RUN_DIR/reviewer-schema.json \$WORKDIR \$RUN_DIR" Enter
+  printf 'run-step: Reviewer B started.\n'
+}
+
+case "\$1" in
+  reviewer-a)        send_reviewer_a initial ;;
+  reviewer-a-resume) send_reviewer_a resume ;;
+  reviewer-b)        send_reviewer_b ;;
+  wait-a)
+    exec "\$RUN_DIR/run-wait" "\$EVENT_A" "\$RUN_DIR/reviewer-a-status.txt" \\
+      "\$REVIEWER_A_PANE" "\$WAIT_TIMEOUT_SECONDS" 'Reviewer A'
+    ;;
+  wait-b)
+    exec "\$RUN_DIR/run-wait" "\$EVENT_B" "\$RUN_DIR/reviewer-b-status.txt" \\
+      "\$REVIEWER_B_PANE" "\$WAIT_TIMEOUT_SECONDS" 'Reviewer B'
+    ;;
+  title)
+    exec "\$RUN_DIR/update-title" "\$RUN_DIR/title.txt" "\$RUN_DIR/new-title.txt" \\
+      "\$WINDOW_SHORT_NAME" "\$MANAGER_PANE" "\$REVIEWER_A_PANE" "\$REVIEWER_B_PANE"
+    ;;
+  *)
+    printf 'Error: unknown step: %s\n' "\$1" >&2
+    usage
+    exit 2
+    ;;
+esac
+RUNSTEP
+  chmod +x "$VET_DIR/run-step"
+}
+
+window_exists() {
+  local target_window_id="${1:-}"
+  [[ -n "$target_window_id" ]] || return 1
+  tmux list-windows -a -F '#{window_id}' 2>/dev/null |
+    awk -v target="$target_window_id" '$0 == target { found = 1 } END { exit !found }'
+}
+
+list_runs() {
+  local state_file title status
+  printf '%-24s  %-9s  %-10s  %s\n' "RUN ID" "STATUS" "PR" "TITLE"
+  find "$VET_RUN_ROOT" -mindepth 2 -maxdepth 2 -name state.env -type f 2>/dev/null |
+    sort -r |
+    while IFS= read -r state_file; do
+      unset RUN_ID RUN_STATUS VET_DIR WINDOW_ID PR_NUMBER PR_TITLE
+      # shellcheck source=/dev/null
+      source "$state_file"
+      title="$(cat "$VET_DIR/title.txt" 2>/dev/null || printf '%s' "${PR_TITLE:-unknown}")"
+      status="${RUN_STATUS:-unknown}"
+      if window_exists "${WINDOW_ID:-}"; then
+        status="running"
+      elif [[ "$status" == "running" ]]; then
+        status="closed"
+      fi
+      printf '%-24s  %-9s  %-10s  %s\n' "$RUN_ID" "$status" "#${PR_NUMBER:-?}" "$title"
+    done
+}
+
+close_run() {
+  load_run "${1:-}" false
+  RUN_STATUS="closed"
+  write_state
+  if window_exists "${WINDOW_ID:-}"; then
+    tmux kill-window -t "$WINDOW_ID"
+  fi
+  printf 'vet run closed: %s\n' "$RUN_ID"
+  printf 'Resume with: vet resume %s\n' "$RUN_ID"
+}
+
+# Delete one retained run: its detached PR worktree and its artifact directory.
+# Refuses while the window is still open. vet never creates a branch, so there
+# is nothing to delete on the branch side. The worktree is only removed when it
+# really lives under VET_WORKTREE_ROOT, so a corrupted state.env can never make
+# this delete the PO's own repository.
+remove_run() {
+  local state_file="$1"
+  unset RUN_ID RUN_STATUS VET_DIR WINDOW_ID WORKDIR REPO_ROOT
+  # shellcheck source=/dev/null
+  source "$state_file"
+  if window_exists "${WINDOW_ID:-}"; then
+    echo "Skip $RUN_ID: still running. Close it first: vet close $RUN_ID" >&2
+    return 1
+  fi
+  if [[ -n "${WORKDIR:-}" && "$WORKDIR" == "$VET_WORKTREE_ROOT"/* && -d "$WORKDIR" ]]; then
+    if [[ -n "${REPO_ROOT:-}" && -d "${REPO_ROOT:-}" ]]; then
+      git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" 2>/dev/null || rm -rf "$WORKDIR"
+      git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+    else
+      rm -rf "$WORKDIR"
+    fi
+  fi
+  rm -rf "$VET_DIR"
+  printf 'vet run removed: %s\n' "$RUN_ID"
+}
+
+clean_runs() {
+  local state_file answer title removable=()
+  while IFS= read -r state_file; do
+    unset RUN_ID RUN_STATUS WINDOW_ID
+    # shellcheck source=/dev/null
+    source "$state_file"
+    window_exists "${WINDOW_ID:-}" || removable+=("$state_file")
+  done < <(
+    find "$VET_RUN_ROOT" -mindepth 2 -maxdepth 2 -name state.env -type f 2>/dev/null | sort
+  )
+
+  if [[ ${#removable[@]} -eq 0 ]]; then
+    echo "No closed vet runs to remove."
+    return 0
+  fi
+
+  echo "The following ${#removable[@]} vet run(s) will be DELETED (worktree, artifacts):"
+  for state_file in "${removable[@]}"; do
+    unset RUN_ID VET_DIR PR_NUMBER
+    # shellcheck source=/dev/null
+    source "$state_file"
+    title="$(cat "$VET_DIR/title.txt" 2>/dev/null || printf 'unknown')"
+    printf '  %s  #%s  %s\n' "$RUN_ID" "${PR_NUMBER:-?}" "$title"
+  done
+  printf 'Proceed? [y/N] '
+  read -r answer
+  [[ "$answer" == "y" || "$answer" == "Y" ]] || {
+    echo "Aborted."
+    return 1
+  }
+  for state_file in "${removable[@]}"; do
+    remove_run "$state_file"
+  done
+}
+
+resume_run() {
+  local new_window title
+  local target_session="${2:-}"
+
+  if [[ -z "$target_session" && -z "${TMUX:-}" ]]; then
+    echo "Error: vet resume must be run inside tmux (or pass --session <name>)" >&2
+    exit 1
+  fi
+
+  load_run "${1:-}"
+  [[ -d "$WORKDIR" ]] || {
+    echo "Error: vet PR worktree no longer exists: $WORKDIR" >&2
+    exit 1
+  }
+
+  if window_exists "${WINDOW_ID:-}"; then
+    echo "Error: vet is already running in window $WINDOW_ID" >&2
+    exit 1
+  fi
+
+  # manager-prompt.md embeds the pane IDs from the ORIGINAL launch, so the
+  # rewrite below must always map from those - not from the previous resume's
+  # panes.
+  ORIG_MANAGER_PANE="${ORIG_MANAGER_PANE:-${MANAGER_PANE:-}}"
+  ORIG_REVIEWER_A_PANE="${ORIG_REVIEWER_A_PANE:-${REVIEWER_A_PANE:-}}"
+  ORIG_REVIEWER_B_PANE="${ORIG_REVIEWER_B_PANE:-${REVIEWER_B_PANE:-}}"
+
+  if [[ -n "$target_session" ]]; then
+    new_window="$(tmux new-window -d -t "${target_session}:" -c "$WORKDIR" -P -F '#{window_id} #{pane_id}')"
+  else
+    new_window="$(tmux new-window -d -c "$WORKDIR" -P -F '#{window_id} #{pane_id}')"
+  fi
+  read -r WINDOW_ID MANAGER_PANE <<< "$new_window"
+  REVIEWER_A_PANE="$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')"
+  REVIEWER_B_PANE="$(tmux split-window -v -c "$WORKDIR" -d -t "$REVIEWER_A_PANE" -P -F '#{pane_id}')"
+  CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$WINDOW_ID" '#W')"
+  WINDOW_SHORT_NAME="${WINDOW_SHORT_NAME:-vet:${RUN_ID:0:15}}"
+  RUN_STATUS="running"
+  write_state
+  # run-step has the pane IDs baked in, so it must be regenerated for the panes
+  # this resume just created.
+  write_run_step
+
+  # (?!\d) keeps a shorter pane ID (%31) from matching the prefix of a longer
+  # one (%319).
+  OLD_MANAGER_PANE="$ORIG_MANAGER_PANE" NEW_MANAGER_PANE="$MANAGER_PANE" \
+  OLD_A_PANE="$ORIG_REVIEWER_A_PANE" NEW_A_PANE="$REVIEWER_A_PANE" \
+  OLD_B_PANE="$ORIG_REVIEWER_B_PANE" NEW_B_PANE="$REVIEWER_B_PANE" \
+    perl -0pe '
+      s/\Q$ENV{OLD_MANAGER_PANE}\E(?!\d)/$ENV{NEW_MANAGER_PANE}/g if length $ENV{OLD_MANAGER_PANE};
+      s/\Q$ENV{OLD_A_PANE}\E(?!\d)/$ENV{NEW_A_PANE}/g if length $ENV{OLD_A_PANE};
+      s/\Q$ENV{OLD_B_PANE}\E(?!\d)/$ENV{NEW_B_PANE}/g if length $ENV{OLD_B_PANE};
+    ' "$VET_DIR/manager-prompt.md" > "$VET_DIR/manager-resume-prompt.md"
+
+  title="$(cat "$VET_DIR/title.txt")"
+  tmux rename-window -t "$WINDOW_ID" "$WINDOW_SHORT_NAME"
+  tmux select-pane -t "$MANAGER_PANE" -T "$title"
+  tmux select-pane -t "$REVIEWER_A_PANE" -T "Reviewer A"
+  tmux select-pane -t "$REVIEWER_B_PANE" -T "Reviewer B"
+  tmux set-option -w -t "$WINDOW_ID" pane-border-status top
+  tmux set-option -w -t "$WINDOW_ID" pane-border-format " #{pane_title} "
+  tmux set-option -w -t "$WINDOW_ID" @vet_run_id "$RUN_ID"
+  tmux set-option -w -t "$WINDOW_ID" @vet_state_file "$STATE_FILE"
+  tmux send-keys -t "$MANAGER_PANE" "$VET_DIR/run-manager-resume '$WORKDIR' '$VET_DIR/manager-resume-prompt.md' '$MANAGER_SESSION_ID'" Enter
+  tmux select-window -t "$WINDOW_ID"
+  printf 'vet run resumed: %s\n' "$RUN_ID"
+}
+
+[[ $# -gt 0 ]] || usage
+case "$1" in
+  -h|--help)
+    usage 0
+    ;;
+  list)
+    list_runs
+    exit 0
+    ;;
+  close)
+    close_run "${2:-}"
+    exit 0
+    ;;
+  rm)
+    shift
+    [[ $# -gt 0 ]] || {
+      echo "Error: vet rm requires at least one run-id (see: vet list)" >&2
+      exit 1
+    }
+    rm_status=0
+    for run_id in "$@"; do
+      rm_state_file="$VET_RUN_ROOT/$run_id/state.env"
+      if [[ ! -f "$rm_state_file" ]]; then
+        echo "Error: unknown vet run: $run_id" >&2
+        rm_status=1
+        continue
+      fi
+      remove_run "$rm_state_file" || rm_status=1
+    done
+    exit "$rm_status"
+    ;;
+  clean)
+    clean_runs
+    exit 0
+    ;;
+  resume)
+    shift
+    resume_session=""
+    if [[ "${1:-}" == "--session" ]]; then
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --session requires a value" >&2
+        exit 1
+      fi
+      resume_session="$2"
+      shift 2
+    fi
+    resume_run "${1:-}" "$resume_session"
+    exit 0
+    ;;
+esac
+
+# --- Argument parsing ---------------------------------------------------------
+
+PR_ARG=""
+ALLOW_EMPTY_CHECKLIST=false
+INCLUDE_CLOSED=false
+OPEN_REPORT=false
+if [[ "${VET_DRY_RUN:-0}" == "1" || "${VET_DRY_RUN:-0}" == "true" ]]; then
+  DRY_RUN=true
+else
+  DRY_RUN=false
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --allow-empty-checklist) ALLOW_EMPTY_CHECKLIST=true; shift ;;
+    --include-closed) INCLUDE_CLOSED=true; shift ;;
+    --open) OPEN_REPORT=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help) usage 0 ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      usage 1
+      ;;
+    *)
+      [[ -z "$PR_ARG" ]] || {
+        echo "Error: unexpected extra argument: $1" >&2
+        usage 1
+      }
+      PR_ARG="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$PR_ARG" ]] || {
+  echo "Error: a PR number or PR URL is required" >&2
+  usage 1
+}
+
+URL_REPO_SPEC=""
+if [[ "$PR_ARG" =~ ^https?://[^/]+/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+  URL_REPO_SPEC="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+  PR_NUMBER="${BASH_REMATCH[3]}"
+elif [[ "$PR_ARG" =~ ^[0-9]+$ ]]; then
+  PR_NUMBER="$PR_ARG"
+else
+  echo "Error: not a PR number or a GitHub PR URL: $PR_ARG" >&2
+  echo "Expected: 1234  or  https://github.com/org/repo/pull/1234" >&2
+  exit 1
+fi
+
+WAIT_TIMEOUT_SECONDS="${VET_WAIT_TIMEOUT_SECONDS:-7200}"
+[[ "$WAIT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "Error: VET_WAIT_TIMEOUT_SECONDS must be a positive integer." >&2
+  exit 1
+}
+
+MAX_FILES="${VET_MAX_FILES:-80}"
+MAX_DIFF_LINES="${VET_MAX_DIFF_LINES:-20000}"
+MAX_CONTEXT_BYTES="${VET_MAX_CONTEXT_BYTES:-1500000}"
+MAX_COMMENT_BYTES="${VET_MAX_COMMENT_BYTES:-400000}"
+
+validate_limit() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: VET_$name must be a positive integer (got: $value)" >&2
+    exit 1
+  }
+}
+validate_limit MAX_FILES "$MAX_FILES"
+validate_limit MAX_DIFF_LINES "$MAX_DIFF_LINES"
+validate_limit MAX_CONTEXT_BYTES "$MAX_CONTEXT_BYTES"
+validate_limit MAX_COMMENT_BYTES "$MAX_COMMENT_BYTES"
+
+ORIGINAL_WORKDIR="$(pwd)"
+
+# --- Preflight ----------------------------------------------------------------
+
+REQUIRED_COMMANDS="git jq perl uuidgen"
+if [[ "$DRY_RUN" == "false" ]]; then
+  REQUIRED_COMMANDS="$REQUIRED_COMMANDS gh tmux claude codex"
+fi
+for cmd in $REQUIRED_COMMANDS; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Error: $cmd is not installed or not in PATH" >&2
+    exit 1
+  }
+done
+
+if [[ "$DRY_RUN" == "false" && -z "${TMUX:-}" ]]; then
+  echo "Error: vet must be run inside tmux" >&2
+  exit 1
+fi
+
+REPO_ROOT="$(git -C "$ORIGINAL_WORKDIR" rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Error: vet must be run inside a git repository" >&2
+  exit 1
+}
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  FIXTURE_DIR="${VET_FIXTURE_DIR:-}"
+  [[ -n "$FIXTURE_DIR" && -d "$FIXTURE_DIR" ]] || {
+    echo "Error: --dry-run needs VET_FIXTURE_DIR pointing at a directory with pr.json" >&2
+    exit 1
+  }
+  [[ -f "$FIXTURE_DIR/pr.json" ]] || {
+    echo "Error: fixture PR context not found: $FIXTURE_DIR/pr.json" >&2
+    exit 1
+  }
+fi
+
+# --- Resolve the repository and the PR ----------------------------------------
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  REPO_SPEC="${URL_REPO_SPEC:-${VET_FIXTURE_REPO_SPEC:-local/fixture}}"
+else
+  REPO_SPEC="$(cd "$REPO_ROOT" && gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)" || {
+    echo "Error: could not determine the GitHub repository for $REPO_ROOT" >&2
+    echo "Check that this repository has a GitHub remote and that gh is authenticated." >&2
+    exit 1
+  }
+  if [[ -n "$URL_REPO_SPEC" ]]; then
+    url_spec_lower="$(printf '%s' "$URL_REPO_SPEC" | tr '[:upper:]' '[:lower:]')"
+    repo_spec_lower="$(printf '%s' "$REPO_SPEC" | tr '[:upper:]' '[:lower:]')"
+    [[ "$url_spec_lower" == "$repo_spec_lower" ]] || {
+      echo "Error: the PR URL points at $URL_REPO_SPEC but the current directory is a" >&2
+      echo "       checkout of $REPO_SPEC. vet needs a local clone of the PR's repository" >&2
+      echo "       because it checks the PR head out into a worktree of it." >&2
+      echo "       cd into a clone of $URL_REPO_SPEC and run: vet $PR_NUMBER" >&2
+      exit 1
+    }
+  fi
+fi
+
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
+STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+REPO_NAME="$(basename "$REPO_ROOT")"
+VET_DIR="$VET_RUN_ROOT/$RUN_ID"
+WORKDIR="$VET_WORKTREE_ROOT/$REPO_NAME-pr$PR_NUMBER-$RUN_ID"
+REPORT_PATH="$VET_DIR/report.md"
+MANAGER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+REVIEWER_A_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+# If the launch dies before state.env exists (set -e), leave nothing behind: no
+# empty run directory and no orphaned worktree. Once state.env is written the
+# run is resumable and must be kept.
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
+cleanup_failed_launch() {
+  [[ -f "$VET_DIR/state.env" ]] && return 0
+  rm -rf "$VET_DIR"
+  if [[ -d "$WORKDIR" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1 || rm -rf "$WORKDIR"
+    git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+trap cleanup_failed_launch EXIT
+
+mkdir -p "$VET_DIR"
+
+# --- Collect PR context -------------------------------------------------------
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  cp "$FIXTURE_DIR/pr.json" "$VET_DIR/pr.json"
+else
+  gh pr view "$PR_NUMBER" -R "$REPO_SPEC" --json \
+    number,title,body,author,state,isDraft,url,baseRefName,headRefName,headRefOid,isCrossRepository,changedFiles,additions,deletions,files,labels,commits \
+    > "$VET_DIR/pr.json" 2> "$VET_DIR/pr-view.stderr.log" || {
+    echo "Error: could not read PR #$PR_NUMBER in $REPO_SPEC" >&2
+    sed 's/^/       /' "$VET_DIR/pr-view.stderr.log" >&2
+    exit 1
+  }
+fi
+
+jq -e 'type == "object" and has("number")' "$VET_DIR/pr.json" >/dev/null 2>&1 || {
+  echo "Error: PR context is not a valid gh pr view JSON object: $VET_DIR/pr.json" >&2
+  exit 1
+}
+
+PR_TITLE="$(jq -r '.title // ""' "$VET_DIR/pr.json")"
+PR_URL="$(jq -r '.url // ""' "$VET_DIR/pr.json")"
+PR_STATE="$(jq -r '.state // "UNKNOWN"' "$VET_DIR/pr.json")"
+PR_IS_DRAFT="$(jq -r '.isDraft // false' "$VET_DIR/pr.json")"
+PR_AUTHOR="$(jq -r '.author.login // "unknown"' "$VET_DIR/pr.json")"
+BASE_REF="$(jq -r '.baseRefName // ""' "$VET_DIR/pr.json")"
+HEAD_REF="$(jq -r '.headRefName // ""' "$VET_DIR/pr.json")"
+HEAD_OID="$(jq -r '.headRefOid // ""' "$VET_DIR/pr.json")"
+IS_CROSS_REPOSITORY="$(jq -r '.isCrossRepository // false' "$VET_DIR/pr.json")"
+PR_CHANGED_FILES="$(jq -r '.changedFiles // 0' "$VET_DIR/pr.json")"
+PR_ADDITIONS="$(jq -r '.additions // 0' "$VET_DIR/pr.json")"
+PR_DELETIONS="$(jq -r '.deletions // 0' "$VET_DIR/pr.json")"
+
+case "$PR_STATE" in
+  OPEN) ;;
+  CLOSED|MERGED)
+    if [[ "$INCLUDE_CLOSED" == "false" ]]; then
+      echo "Error: PR #$PR_NUMBER is $PR_STATE. Pass --include-closed to review it anyway." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Note: PR #$PR_NUMBER has an unrecognized state: $PR_STATE"
+    ;;
+esac
+
+PR_STATE_NOTE=""
+if [[ "$PR_IS_DRAFT" == "true" ]]; then
+  PR_STATE_NOTE="This PR is a DRAFT. The report must say so prominently: the author may not consider the change finished."
+elif [[ "$PR_STATE" == "CLOSED" || "$PR_STATE" == "MERGED" ]]; then
+  PR_STATE_NOTE="This PR is already $PR_STATE (reviewed with --include-closed). The report must say so prominently."
+fi
+
+# --- PR head worktree: detached, never a branch -------------------------------
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  GIT_REMOTE="$(git -C "$REPO_ROOT" remote | head -n 1 || true)"
+  if ! git -C "$REPO_ROOT" cat-file -e "${HEAD_OID}^{commit}" 2>/dev/null; then
+    HEAD_OID="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    echo "Note: dry run - fixture head OID is not in this repository, using HEAD ($HEAD_OID)."
+  fi
+else
+  GIT_REMOTE=""
+  for remote_name in $(git -C "$REPO_ROOT" remote); do
+    if git -C "$REPO_ROOT" remote get-url "$remote_name" 2>/dev/null | grep -qiF -- "$REPO_SPEC"; then
+      GIT_REMOTE="$remote_name"
+      break
+    fi
+  done
+  if [[ -z "$GIT_REMOTE" ]]; then
+    if git -C "$REPO_ROOT" remote | grep -qx origin; then
+      GIT_REMOTE="origin"
+    else
+      GIT_REMOTE="$(git -C "$REPO_ROOT" remote | head -n 1 || true)"
+    fi
+  fi
+  [[ -n "$GIT_REMOTE" ]] || {
+    echo "Error: $REPO_ROOT has no git remote to fetch the PR head from" >&2
+    exit 1
+  }
+
+  # pull/<n>/head resolves for forks too, so a cross-repository PR needs no
+  # extra remote.
+  git -C "$REPO_ROOT" fetch --quiet "$GIT_REMOTE" "pull/$PR_NUMBER/head" || {
+    echo "Error: could not fetch pull/$PR_NUMBER/head from remote '$GIT_REMOTE'" >&2
+    exit 1
+  }
+  if ! git -C "$REPO_ROOT" cat-file -e "${HEAD_OID}^{commit}" 2>/dev/null; then
+    FETCHED_OID="$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD)"
+    echo "Note: PR head $HEAD_OID is not available after fetch; using fetched head $FETCHED_OID."
+    echo "      The PR head may have moved between the API read and the fetch."
+    HEAD_OID="$FETCHED_OID"
+  fi
+fi
+
+# The PO's own worktree is never touched: not checked out, not stashed, not
+# cleaned. A dirty tree is only reported.
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+  echo "Note: existing changes remain untouched in your worktree:"
+  git -C "$REPO_ROOT" status --short
+  echo ""
+fi
+
+# --detach: vet must never create a branch for a PR it only reads.
+git -C "$REPO_ROOT" worktree add --detach --quiet "$WORKDIR" "$HEAD_OID"
+
+# Deliberate divergence from squad: squad copies $REPO_ROOT/.env into its
+# worktree because the squad Coder runs the app and its tests. vet never runs
+# anything - it only reads - and it points two AI reviewers at this directory
+# with "read any file here for context". Copying real secrets in would hand
+# them to both agents for no functional gain, so vet does NOT copy .env.
+
+# --- Checklist ----------------------------------------------------------------
+
+COMMON_CHECKLIST=""
+COMMON_CHECKLIST_SOURCE="none"
+if [[ -n "${VET_CHECKLIST:-}" ]]; then
+  [[ -f "$VET_CHECKLIST" ]] || {
+    echo "Error: VET_CHECKLIST is set but is not a readable file: $VET_CHECKLIST" >&2
+    exit 1
+  }
+  COMMON_CHECKLIST="$VET_CHECKLIST"
+  COMMON_CHECKLIST_SOURCE="VET_CHECKLIST"
+elif [[ -f "$HOME/.vet/checklist.md" ]]; then
+  COMMON_CHECKLIST="$HOME/.vet/checklist.md"
+  COMMON_CHECKLIST_SOURCE="$HOME/.vet/checklist.md"
+elif [[ -f "$VET_SCRIPT_DIR/_vet/checklist.md" ]]; then
+  COMMON_CHECKLIST="$VET_SCRIPT_DIR/_vet/checklist.md"
+  COMMON_CHECKLIST_SOURCE="$VET_SCRIPT_DIR/_vet/checklist.md"
+fi
+
+PROJECT_CHECKLIST=""
+PROJECT_CHECKLIST_SOURCE="none"
+if [[ -f "$WORKDIR/.vet/checklist.md" ]]; then
+  PROJECT_CHECKLIST="$WORKDIR/.vet/checklist.md"
+  PROJECT_CHECKLIST_SOURCE=".vet/checklist.md"
+elif [[ -f "$WORKDIR/.review/checklist.md" ]]; then
+  PROJECT_CHECKLIST="$WORKDIR/.review/checklist.md"
+  PROJECT_CHECKLIST_SOURCE=".review/checklist.md"
+fi
+
+# Parse only `- [ID] text` bullets so the checklist files stay readable prose.
+# Merge rule: common first in its own order, then the project file on top -
+# same ID replaces the text, a new ID is appended.
+perl -e '
+  use strict;
+  use warnings;
+  my ($common_file, $project_file) = @ARGV;
+  my (@order, %text, %source);
+  sub items {
+    my ($file, $kind) = @_;
+    my @found;
+    return @found unless defined $file && length $file && -f $file;
+    open my $fh, "<", $file or die "vet: cannot read $file: $!\n";
+    while (my $line = <$fh>) {
+      chomp $line;
+      # The bullet must start at column 0. That single rule is what keeps an
+      # indented "- [ID] ..." example inside the file own documentation from
+      # being parsed as a real checklist item.
+      next unless $line =~ /^-\s+\[([A-Z][A-Z0-9_-]*)\]\s+(\S.*?)\s*$/;
+      push @found, [$1, $2, $kind];
+    }
+    close $fh;
+    return @found;
+  }
+  for my $item (items($common_file, "common")) {
+    my ($id, $body) = @$item;
+    push @order, $id unless exists $text{$id};
+    $text{$id}   = $body;
+    $source{$id} = "common";
+  }
+  for my $item (items($project_file, "project")) {
+    my ($id, $body) = @$item;
+    if (exists $text{$id}) {
+      $source{$id} = ($source{$id} eq "common") ? "project-override" : $source{$id};
+    } else {
+      push @order, $id;
+      $source{$id} = "project";
+    }
+    $text{$id} = $body;
+  }
+  sub esc {
+    my $value = shift;
+    $value =~ s/\\/\\\\/g;
+    $value =~ s/"/\\"/g;
+    $value =~ s/[\x00-\x1f]/ /g;
+    return $value;
+  }
+  for my $id (@order) {
+    printf qq({"id":"%s","text":"%s","source":"%s"}\n),
+      esc($id), esc($text{$id}), esc($source{$id});
+  }
+' "$COMMON_CHECKLIST" "$PROJECT_CHECKLIST" > "$VET_DIR/checklist.jsonl"
+
+jq -s --arg common "$COMMON_CHECKLIST_SOURCE" --arg project "$PROJECT_CHECKLIST_SOURCE" \
+  '{common_checklist: $common, project_checklist: $project, items: .}' \
+  "$VET_DIR/checklist.jsonl" > "$VET_DIR/checklist.json"
+
+CHECKLIST_COUNT="$(jq -r '.items | length' "$VET_DIR/checklist.json")"
+CHECKLIST_OVERRIDES="$(jq -r '[.items[] | select(.source == "project-override")] | length' "$VET_DIR/checklist.json")"
+CHECKLIST_ADDED="$(jq -r '[.items[] | select(.source == "project")] | length' "$VET_DIR/checklist.json")"
+
+if [[ "$CHECKLIST_COUNT" -eq 0 ]]; then
+  if [[ "$ALLOW_EMPTY_CHECKLIST" == "false" ]]; then
+    cat >&2 <<EOF
+Error: no review checklist item was found, so there is nothing to review against.
+
+vet looks for a common checklist in, first match wins:
+  1. \$VET_CHECKLIST                       (currently: ${VET_CHECKLIST:-unset})
+  2. $HOME/.vet/checklist.md
+  3. $VET_SCRIPT_DIR/_vet/checklist.md
+
+and for a project checklist inside the PR worktree:
+  1. .vet/checklist.md
+  2. .review/checklist.md
+
+Create one with bullets shaped like:
+  - [SEC-001] Are authorization boundaries checked on every new endpoint?
+
+Or pass --allow-empty-checklist to review without one (coverage will be limited,
+and the report will say so).
+EOF
+    exit 1
+  fi
+  EMPTY_CHECKLIST_WARNING="NO REVIEW CHECKLIST WAS FOUND. This review ran with --allow-empty-checklist, so its coverage is LIMITED and unstructured: no checklist item was verified. The report must state this prominently at the top."
+else
+  EMPTY_CHECKLIST_WARNING=""
+fi
+
+{
+  printf '# Merged review checklist\n\n'
+  printf 'Common checklist:  %s\n' "$COMMON_CHECKLIST_SOURCE"
+  printf 'Project checklist: %s\n' "$PROJECT_CHECKLIST_SOURCE"
+  printf 'Items: %s total (%s overridden by the project, %s added by the project)\n\n' \
+    "$CHECKLIST_COUNT" "$CHECKLIST_OVERRIDES" "$CHECKLIST_ADDED"
+  if [[ "$CHECKLIST_COUNT" -eq 0 ]]; then
+    printf '(no checklist items)\n'
+  else
+    jq -r '.items[] | "- [\(.id)] \(.text)  <!-- source: \(.source) -->"' "$VET_DIR/checklist.json"
+  fi
+} > "$VET_DIR/checklist.merged.md"
+
+# --- Diff, files, and comments, with hard context bounds ----------------------
+
+CONTEXT_NOTES="$VET_DIR/context-notes.tmp"
+: > "$CONTEXT_NOTES"
+note_limit() { printf '%s\n' "$*" >> "$CONTEXT_NOTES"; }
+
+# These notes go straight into a report the PO pastes into GitHub, so "1 files"
+# would be visible sloppiness. plural <count> <singular> <plural>
+plural() {
+  if [[ "$1" -eq 1 ]]; then printf '%s' "$2"; else printf '%s' "$3"; fi
+}
+
+jq '[.files // [] | .[] | {path, additions, deletions}]' "$VET_DIR/pr.json" > "$VET_DIR/files.json"
+FILES_TOTAL="$(jq -r 'length' "$VET_DIR/files.json")"
+
+jq -r --argjson n "$MAX_FILES" \
+  '[.[] | . + {churn: ((.additions // 0) + (.deletions // 0))}] | sort_by(-.churn, .path) | .[:$n] | .[] | .path' \
+  "$VET_DIR/files.json" > "$VET_DIR/files.kept.txt"
+jq -r --argjson n "$MAX_FILES" \
+  '[.[] | . + {churn: ((.additions // 0) + (.deletions // 0))}] | sort_by(-.churn, .path) | .[$n:] | .[] | "\(.path) (+\(.additions // 0)/-\(.deletions // 0))"' \
+  "$VET_DIR/files.json" > "$VET_DIR/files.dropped.txt"
+
+FILES_DROPPED="$(wc -l < "$VET_DIR/files.dropped.txt" | tr -d ' ')"
+if [[ "$FILES_DROPPED" -gt 0 ]]; then
+  note_limit "FILE LIMIT: the PR changes $FILES_TOTAL files, the limit is $MAX_FILES (VET_MAX_FILES)."
+  note_limit "The $MAX_FILES $(plural "$MAX_FILES" file files) with the largest churn \
+$(plural "$MAX_FILES" was were) kept. \
+$(plural "$FILES_DROPPED" "This $FILES_DROPPED file was" "These $FILES_DROPPED files were") NOT reviewed:"
+  sed 's/^/  - /' "$VET_DIR/files.dropped.txt" >> "$CONTEXT_NOTES"
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  if [[ -f "$FIXTURE_DIR/diff.patch" ]]; then
+    cp "$FIXTURE_DIR/diff.patch" "$VET_DIR/diff.full.patch"
+  else
+    : > "$VET_DIR/diff.full.patch"
+  fi
+else
+  gh pr diff "$PR_NUMBER" -R "$REPO_SPEC" --patch > "$VET_DIR/diff.full.patch" 2> "$VET_DIR/pr-diff.stderr.log" || {
+    echo "Error: could not read the diff of PR #$PR_NUMBER" >&2
+    sed 's/^/       /' "$VET_DIR/pr-diff.stderr.log" >&2
+    exit 1
+  }
+fi
+
+DIFF_TOTAL_LINES="$(wc -l < "$VET_DIR/diff.full.patch" | tr -d ' ')"
+
+# Section index of the patch: start line, line count, byte count, both paths.
+awk '
+  function flush_section(end_line) {
+    if (path_a != "") printf "%d\t%d\t%d\t%s\t%s\n", start, end_line - start + 1, bytes, path_a, path_b
+  }
+  /^diff --git / {
+    if (path_a != "") flush_section(NR - 1)
+    start = NR
+    bytes = 0
+    rest = substr($0, 12)
+    idx = index(rest, " b/")
+    if (idx > 0) {
+      path_a = substr(rest, 3, idx - 3)
+      path_b = substr(rest, idx + 3)
+    } else {
+      path_a = $3; sub(/^a\//, "", path_a)
+      path_b = $4; sub(/^b\//, "", path_b)
+    }
+  }
+  { bytes += length($0) + 1 }
+  END { if (path_a != "") flush_section(NR) }
+' "$VET_DIR/diff.full.patch" > "$VET_DIR/diff-sections.tsv"
+
+# Reserve the per-reviewer byte budget for everything else we hand a reviewer,
+# so the diff can never push the total over VET_MAX_CONTEXT_BYTES.
+OTHER_CONTEXT_BYTES="$(wc -c < "$VET_DIR/checklist.merged.md" | tr -d ' ')"
+DIFF_BYTE_BUDGET=$(( MAX_CONTEXT_BYTES - OTHER_CONTEXT_BYTES - MAX_COMMENT_BYTES - 65536 ))
+[[ "$DIFF_BYTE_BUDGET" -gt 0 ]] || DIFF_BYTE_BUDGET=65536
+
+# Greedy fill, smallest section first: this maximises the number of changed
+# files a reviewer actually sees instead of letting one huge file eat the whole
+# budget. Everything skipped is named in context-limits.txt.
+remaining_lines="$MAX_DIFF_LINES"
+remaining_bytes="$DIFF_BYTE_BUDGET"
+: > "$VET_DIR/diff-include-starts.txt"
+: > "$VET_DIR/diff.dropped.txt"
+while IFS=$'\t' read -r sec_start sec_lines sec_bytes sec_path_a sec_path_b; do
+  [[ -n "${sec_start:-}" ]] || continue
+  in_scope=false
+  if grep -qxF -- "$sec_path_a" "$VET_DIR/files.kept.txt" 2>/dev/null; then
+    in_scope=true
+  elif grep -qxF -- "$sec_path_b" "$VET_DIR/files.kept.txt" 2>/dev/null; then
+    in_scope=true
+  elif [[ "$FILES_TOTAL" -eq 0 ]]; then
+    # gh reported no per-file data (or a fixture omitted it): fall back to the
+    # patch itself as the source of truth rather than dropping everything.
+    in_scope=true
+  fi
+  if [[ "$in_scope" == "false" ]]; then
+    printf '%s (over the file limit, %s diff lines)\n' "$sec_path_b" "$sec_lines" >> "$VET_DIR/diff.dropped.txt"
+    continue
+  fi
+  if [[ "$sec_lines" -le "$remaining_lines" && "$sec_bytes" -le "$remaining_bytes" ]]; then
+    printf '%s\n' "$sec_start" >> "$VET_DIR/diff-include-starts.txt"
+    remaining_lines=$(( remaining_lines - sec_lines ))
+    remaining_bytes=$(( remaining_bytes - sec_bytes ))
+  else
+    printf '%s (%s diff lines, %s bytes - did not fit the remaining budget)\n' \
+      "$sec_path_b" "$sec_lines" "$sec_bytes" >> "$VET_DIR/diff.dropped.txt"
+  fi
+done < <(sort -t"$(printf '\t')" -k2,2n "$VET_DIR/diff-sections.tsv")
+
+DIFF_DROPPED="$(wc -l < "$VET_DIR/diff.dropped.txt" | tr -d ' ')"
+if [[ "$DIFF_DROPPED" -gt 0 ]]; then
+  awk 'NR == FNR { include[$1] = 1; next }
+       /^diff --git / { emit = (FNR in include) }
+       emit { print }' \
+    "$VET_DIR/diff-include-starts.txt" "$VET_DIR/diff.full.patch" > "$VET_DIR/diff.patch"
+  note_limit "DIFF LIMIT: limits are $MAX_DIFF_LINES diff lines (VET_MAX_DIFF_LINES) and $DIFF_BYTE_BUDGET diff bytes."
+  note_limit "The full diff is $DIFF_TOTAL_LINES lines. The diff of \
+$(plural "$DIFF_DROPPED" "this $DIFF_DROPPED file" "these $DIFF_DROPPED files") was NOT given to the reviewers:"
+  sed 's/^/  - /' "$VET_DIR/diff.dropped.txt" >> "$CONTEXT_NOTES"
+  note_limit "The files themselves are still present in the worktree at the PR head, but no reviewer was shown their changes."
+else
+  cp "$VET_DIR/diff.full.patch" "$VET_DIR/diff.patch"
+fi
+DIFF_LINES="$(wc -l < "$VET_DIR/diff.patch" | tr -d ' ')"
+
+# Existing review + issue comments, so no reviewer re-raises a point that has
+# already been made on the PR.
+if [[ "$DRY_RUN" == "true" ]]; then
+  if [[ -f "$FIXTURE_DIR/comments.json" ]]; then
+    cp "$FIXTURE_DIR/comments.json" "$VET_DIR/comments.raw.json"
+  else
+    printf '{"review_comments":[],"issue_comments":[]}\n' > "$VET_DIR/comments.raw.json"
+  fi
+else
+  gh api "repos/$REPO_SPEC/pulls/$PR_NUMBER/comments" --paginate 2>/dev/null |
+    jq -s 'add // []' > "$VET_DIR/review-comments.json" ||
+    printf '[]\n' > "$VET_DIR/review-comments.json"
+  gh api "repos/$REPO_SPEC/issues/$PR_NUMBER/comments" --paginate 2>/dev/null |
+    jq -s 'add // []' > "$VET_DIR/issue-comments.json" ||
+    printf '[]\n' > "$VET_DIR/issue-comments.json"
+  jq -n \
+    --slurpfile review "$VET_DIR/review-comments.json" \
+    --slurpfile issue "$VET_DIR/issue-comments.json" \
+    '{
+       review_comments: [($review[0] // [])[] | {
+         kind: "review", id, user: (.user.login // "unknown"),
+         path: (.path // null), line: (.line // .original_line // null),
+         created_at, body: (.body // "")
+       }],
+       issue_comments: [($issue[0] // [])[] | {
+         kind: "issue", id, user: (.user.login // "unknown"),
+         path: null, line: null, created_at, body: (.body // "")
+       }]
+     }' > "$VET_DIR/comments.raw.json"
+fi
+
+COMMENTS_TOTAL="$(jq -r '((.review_comments // []) | length) + ((.issue_comments // []) | length)' "$VET_DIR/comments.raw.json")"
+COMMENTS_RAW_BYTES="$(wc -c < "$VET_DIR/comments.raw.json" | tr -d ' ')"
+if [[ "$COMMENTS_RAW_BYTES" -gt "$MAX_COMMENT_BYTES" ]]; then
+  # Keep the newest comments: those are the ones a new review is most likely to
+  # duplicate.
+  jq -c '((.review_comments // []) + (.issue_comments // [])) | sort_by(.created_at) | reverse | .[]' \
+    "$VET_DIR/comments.raw.json" |
+    awk -v budget="$MAX_COMMENT_BYTES" '
+      { size = length($0) + 1 }
+      used + size <= budget { print; used += size; next }
+      { dropped += 1 }
+      END { printf "%d\n", dropped + 0 > "/dev/stderr" }
+    ' 2> "$VET_DIR/comments.dropped.count" |
+    jq -s 'sort_by(.created_at) | {review_comments: [.[] | select(.kind == "review")], issue_comments: [.[] | select(.kind == "issue")]}' \
+      > "$VET_DIR/comments.json"
+  COMMENTS_DROPPED="$(cat "$VET_DIR/comments.dropped.count" 2>/dev/null || printf '0')"
+  note_limit "COMMENT LIMIT: existing PR comments are $COMMENTS_RAW_BYTES bytes, the limit is $MAX_COMMENT_BYTES (VET_MAX_COMMENT_BYTES)."
+  note_limit "The $COMMENTS_DROPPED oldest of $COMMENTS_TOTAL existing comments \
+$(plural "$COMMENTS_DROPPED" was were) NOT shown to the reviewers, so a finding may duplicate one of them."
+else
+  cp "$VET_DIR/comments.raw.json" "$VET_DIR/comments.json"
+  COMMENTS_DROPPED=0
+fi
+COMMENTS_SHOWN="$(jq -r '((.review_comments // []) | length) + ((.issue_comments // []) | length)' "$VET_DIR/comments.json")"
+
+if [[ -n "$EMPTY_CHECKLIST_WARNING" ]]; then
+  note_limit "CHECKLIST: $EMPTY_CHECKLIST_WARNING"
+fi
+
+{
+  printf 'Context limits for vet run %s (PR #%s)\n' "$RUN_ID" "$PR_NUMBER"
+  printf '=========================================================\n\n'
+  if [[ -s "$CONTEXT_NOTES" ]]; then
+    printf 'THIS REVIEW DOES NOT COVER THE WHOLE PULL REQUEST.\n\n'
+    cat "$CONTEXT_NOTES"
+  else
+    printf 'No truncation: every changed file and every diff line of this PR was\n'
+    printf 'given to both reviewers, together with all %s existing PR comments.\n' "$COMMENTS_TOTAL"
+  fi
+  printf '\nMeasured:\n'
+  printf '  changed files:      %s (kept %s, limit %s)\n' "$FILES_TOTAL" "$(( FILES_TOTAL - FILES_DROPPED ))" "$MAX_FILES"
+  printf '  diff lines:         %s (kept %s, limit %s)\n' "$DIFF_TOTAL_LINES" "$DIFF_LINES" "$MAX_DIFF_LINES"
+  printf '  existing comments:  %s (kept %s, byte limit %s)\n' "$COMMENTS_TOTAL" "$COMMENTS_SHOWN" "$MAX_COMMENT_BYTES"
+  printf '  checklist items:    %s\n' "$CHECKLIST_COUNT"
+} > "$VET_DIR/context-limits.txt"
+rm -f "$CONTEXT_NOTES"
+
+CONTEXT_TRUNCATED=false
+if grep -q 'THIS REVIEW DOES NOT COVER THE WHOLE PULL REQUEST' "$VET_DIR/context-limits.txt"; then
+  CONTEXT_TRUNCATED=true
+fi
+
+# --- Readable PR digest -------------------------------------------------------
+
+{
+  printf '# PR context digest\n\n'
+  # A printf format starting with "-" is parsed as an option by the bash
+  # builtin, so these bullets go through a %s format instead.
+  printf '%s\n' "- Repository:   $REPO_SPEC"
+  printf '%s\n' "- PR:           #$PR_NUMBER $PR_TITLE"
+  printf '%s\n' "- URL:          $PR_URL"
+  printf '%s\n' "- Author:       $PR_AUTHOR"
+  printf '%s\n' "- State:        $PR_STATE (draft: $PR_IS_DRAFT, cross-repository: $IS_CROSS_REPOSITORY)"
+  printf '%s\n' "- Base -> head: $BASE_REF -> $HEAD_REF"
+  printf '%s\n' "- Reviewed OID: $HEAD_OID"
+  printf '%s\n' "- Size:         $PR_CHANGED_FILES changed files, +$PR_ADDITIONS / -$PR_DELETIONS"
+  printf '%s\n' "- Labels:       $(jq -r '[.labels // [] | .[].name] | join(", ") | if . == "" then "(none)" else . end' "$VET_DIR/pr.json")"
+  printf '\n## PR description\n\n'
+  jq -r '.body // "" | if . == "" then "(the author left the description empty)" else . end' "$VET_DIR/pr.json"
+  printf '\n\n## Commits\n\n'
+  jq -r '[.commits // []] | .[] | .[] | "- \(.oid[0:8]) \(.messageHeadline // "")"' "$VET_DIR/pr.json" 2>/dev/null ||
+    printf '(commit list unavailable)\n'
+  printf '\n## Changed files given to the reviewers\n\n'
+  if [[ "$FILES_TOTAL" -eq 0 ]]; then
+    printf '(no per-file data; use the patch itself)\n'
+  else
+    jq -r --slurpfile kept <(jq -R -s 'split("\n") | map(select(length > 0))' "$VET_DIR/files.kept.txt") \
+      '.[] | select(.path as $p | $kept[0] | index($p)) | "- \(.path) (+\(.additions // 0)/-\(.deletions // 0))"' \
+      "$VET_DIR/files.json"
+  fi
+  printf '\n## Existing PR comments (do NOT re-raise these)\n\n'
+  if [[ "$COMMENTS_SHOWN" -eq 0 ]]; then
+    printf '(none)\n'
+  else
+    jq -r '((.review_comments // []) + (.issue_comments // []))[] |
+      "### \(.kind) comment by \(.user)\(if .path then " on \(.path):\(.line // "?")" else "" end)\n\n\(.body)\n"' \
+      "$VET_DIR/comments.json"
+  fi
+  printf '\n## Context limits\n\n'
+  cat "$VET_DIR/context-limits.txt"
+} > "$VET_DIR/review-context.md"
+
+printf '%s\n' "$PR_TITLE" > "$VET_DIR/title.txt"
+
+# Sentinel for run-reviewer-b's sandbox probe: it lives in the run dir, outside
+# the -C root codex is given, so reading it proves codex can reach vet context.
+printf 'VET-SANDBOX-OK %s\n' "$RUN_ID" > "$VET_DIR/sandbox-probe.txt"
+
+# --- Structured output schemas ------------------------------------------------
+
+cat > "$VET_DIR/reviewer-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "reviewer": { "type": "string" },
+    "summary": { "type": "string" },
+    "context_warnings": { "type": "array", "items": { "type": "string" } },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "checklist_id": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["checked_ok", "problem_found", "not_applicable", "not_checked"]
+          },
+          "note": { "type": "string" }
+        },
+        "required": ["checklist_id", "status", "note"]
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "checklist_ids": { "type": "array", "items": { "type": "string" } },
+          "severity": {
+            "type": "string",
+            "enum": ["must_fix", "should_fix", "nit", "question"]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "correctness", "security", "data_integrity", "performance",
+              "maintainability", "tests", "ux", "docs", "ops", "other"
+            ]
+          },
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "line_range": { "type": "string" },
+          "evidence": { "type": "string" },
+          "suggestion": { "type": "string" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "already_raised": { "type": "boolean" }
+        },
+        "required": [
+          "id", "checklist_ids", "severity", "category", "title", "body",
+          "file", "line", "line_range", "evidence", "suggestion",
+          "confidence", "already_raised"
+        ]
+      }
+    },
+    "duplicates_to_avoid": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": [
+    "reviewer", "summary", "context_warnings", "coverage", "findings",
+    "duplicates_to_avoid"
+  ]
+}
+SCHEMA
+
+cat > "$VET_DIR/consolidated-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": { "type": "string" },
+    "context_warnings": { "type": "array", "items": { "type": "string" } },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "checklist_id": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["checked_ok", "problem_found", "not_applicable", "not_checked"]
+          },
+          "note": { "type": "string" }
+        },
+        "required": ["checklist_id", "status", "note"]
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "checklist_ids": { "type": "array", "items": { "type": "string" } },
+          "severity": {
+            "type": "string",
+            "enum": ["must_fix", "should_fix", "nit", "question"]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "correctness", "security", "data_integrity", "performance",
+              "maintainability", "tests", "ux", "docs", "ops", "other"
+            ]
+          },
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "line_range": { "type": "string" },
+          "evidence": { "type": "string" },
+          "suggestion": { "type": "string" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "already_raised": { "type": "boolean" },
+          "sources": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": [
+          "id", "checklist_ids", "severity", "category", "title", "body",
+          "file", "line", "line_range", "evidence", "suggestion",
+          "confidence", "already_raised", "sources"
+        ]
+      }
+    },
+    "contradictions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "topic": { "type": "string" },
+          "reviewer_a_position": { "type": "string" },
+          "reviewer_b_position": { "type": "string" },
+          "resolution": { "type": "string" }
+        },
+        "required": ["topic", "reviewer_a_position", "reviewer_b_position", "resolution"]
+      }
+    },
+    "posting_candidates": { "type": "array", "items": { "type": "string" } },
+    "report_path": { "type": "string" }
+  },
+  "required": [
+    "summary", "context_warnings", "coverage", "findings", "contradictions",
+    "posting_candidates", "report_path"
+  ]
+}
+SCHEMA
+
+# --- Manager permissions ------------------------------------------------------
+#
+# The Manager is INTERACTIVE and orchestrates everything, so it must not run
+# with --dangerously-skip-permissions: that would make vet's central promise
+# ("never edits the reviewed code, never posts to GitHub unless the PO asks")
+# depend on prompt text alone. Instead it is constrained at the CLI level, the
+# same way the reviewers are, and anything not allowlisted becomes a permission
+# prompt the PO answers. A prompt is the desired fail-safe here, not a bug.
+#
+# Verified against the installed CLI:
+#   * --setting-sources "" is required. With the PO's own settings.json loaded,
+#     a broad Bash allowlist leaks in and mutations stop failing closed.
+#   * Write/Edit path scoping needs the DOUBLE-SLASH absolute form. Verified:
+#     Write(/abs/**) does NOT match and still prompts, while Write(//abs/**)
+#     matches. With Write(//$VET_DIR/**), writing report.md was auto-approved
+#     and writing into the reviewed repo prompted and never happened.
+#   * Shell redirection out of the artifact dir is blocked independently of the
+#     allowlist ("Output redirection to '...' was blocked").
+#   * Mutating git is NOT auto-permitted: `git commit -am ...` and `git tag ...`
+#     both returned "This command requires approval" and neither took effect.
+#   * Read-only commands (ls, cat, git status) are auto-permitted by the CLI's
+#     own classifier even without a rule, so this allowlist only has to grant
+#     the workflow's specific commands - it never has to enumerate safe reads.
+#
+# Command CHAINING does not bypass a rule - measured, not assumed. With only
+# Bash(git log:*) allowlisted: `git log --oneline; git tag X`, the same with &&,
+# and `git log | tee FILE` all returned "This Bash command contains multiple
+# operations. The following part requires approval: <the mutating part>", and
+# `$(...)` / backticks were refused with "Contains command_substitution". No tag
+# and no file was created. So an allowlisted read command CANNOT be used to
+# smuggle a second command.
+#
+# What DOES bypass everything is handing over a command whose argument is later
+# executed somewhere without a permission layer - see the run-step comment above
+# for the confirmed tmux send-keys exploit. That is why the Bash allowlist below
+# is a single argv-validated dispatcher and nothing else.
+#
+# Deliberately NOT allowlisted, so each always requires the PO to approve:
+#   * ALL tmux - the Manager drives agents only through run-step.
+#   * ALL gh, including read forms. A prefix rule cannot separate `gh api <path>`
+#     from `gh api -X POST <path>`, and vet already collected pr.json,
+#     diff.patch and comments.json, so the Manager needs no network at all.
+#   * ALL git. The Manager settles contradictions by READING the worktree and
+#     diff.patch, which the Read tool covers; a genuine need for git history is
+#     rare enough to be worth one prompt.
+#   * cat / pbcopy / open - the Read tool replaces cat, and vet itself prints the
+#     pbcopy line when the run ends.
+#
+# Write/Edit are scoped to the three things the Manager legitimately produces,
+# NOT to $VET_DIR/** as a whole. That is a deliberate deviation: $VET_DIR also
+# holds run-step (which is allowlisted for EXECUTION) and state.env, so a
+# blanket write rule would let the Manager rewrite the very files that enforce
+# these limits and hand itself arbitrary code execution.
+MANAGER_ALLOWED_TOOLS="Read Glob Grep"
+# $VET_DIR is already absolute, so exactly ONE extra slash is prepended to reach
+# the double-slash form the CLI wants: /<abs path> -> //abs/path
+MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Write(/$VET_DIR/report.md) Edit(/$VET_DIR/report.md)"
+MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Write(/$VET_DIR/new-title.txt) Edit(/$VET_DIR/new-title.txt)"
+MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Write(/$VET_DIR/notes/**) Edit(/$VET_DIR/notes/**)"
+MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Bash($VET_DIR/run-step:*)"
+MANAGER_DISALLOWED_TOOLS="NotebookEdit Task WebFetch WebSearch"
+MANAGER_TOOLS="Read,Glob,Grep,Bash,Write,Edit"
+printf '%s\n' "$MANAGER_ALLOWED_TOOLS" > "$VET_DIR/manager-allowed-tools.txt"
+
+# Fail closed: if a future CLI drops any flag vet relies on to constrain an
+# agent, stop instead of silently launching an unconstrained one.
+require_claude_enforcement_flags() {
+  local who="$1" flag missing=()
+  for flag in --tools --setting-sources --allowedTools --disallowedTools --strict-mcp-config; do
+    claude --help 2>&1 | grep -q -- "$flag" || missing+=("$flag")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Error: the installed claude CLI no longer supports: ${missing[*]}" >&2
+    echo "       vet cannot constrain the $who at the CLI level, and refuses to" >&2
+    echo "       launch it with prompt-only restrictions. Aborting." >&2
+    return 1
+  fi
+  return 0
+}
+
+# --- Helper scripts (run in agent panes) --------------------------------------
+
+cat > "$VET_DIR/run-wait" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+EVENT="$1"
+STATUS_FILE="$2"
+PANE="$3"
+TIMEOUT_SECONDS="$4"
+LABEL="$5"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+# COMPLETION IS THE STATUS FILE, NOT THE TMUX EVENT.
+#
+# The reviewer helpers delete this file when they start and write it exactly
+# once, BEFORE signalling, when they finish. So a non-empty status file means
+# "this cycle finished" and nothing else can mean that. -s (not -f) is
+# deliberate: it skips the instant during which the redirect has truncated the
+# file but not yet written to it.
+#
+# The tmux event is only a low-latency hint, because it cannot be trusted alone.
+# Measured on tmux 3.4: `tmux wait-for -S` on a channel with no waiter LATCHES,
+# and the next wait-for on that channel returns immediately (the latch is
+# single-shot). vet reuses one channel per reviewer for every
+# reviewer-a / reviewer-a-resume / wait-a cycle of a run, so a latch left over
+# from an earlier cycle used to make the next wait return at once - and because
+# the old code then trusted the event, the Manager read a PASSING status from
+# the previous cycle while the new reviewer was still running. A hang would have
+# been safer than that.
+#
+# Two rules keep this correct no matter how the reviewer and the waiter race:
+#   1. Never signal the channel ourselves. The old timeout/pane-gone paths did,
+#      to unblock their own background waiter, and that is exactly what armed
+#      the stale latch. We kill our waiter instead, which arms nothing.
+#   2. Never write a status over one that is already there.
+status_ready() {
+  [[ -s "$STATUS_FILE" ]]
+}
+
+# Test the OUTPUT, not the exit status. `tmux display-message -p -t <pane>` exits
+# 0 and prints NOTHING for a pane that does not exist, so the exit status alone
+# never detects a vanished pane and the 125 path could never fire. tmux keeps no
+# record of dead pane IDs, so a killed pane is indistinguishable from one that
+# never existed - both print nothing.
+pane_alive() {
+  local found
+  found="$(tmux display-message -p -t "$PANE" '#{pane_id}' 2>/dev/null || true)"
+  [[ -n "$found" ]]
+}
+
+report_done() {
+  log "$LABEL finished (status $(cat "$STATUS_FILE"))."
+  exit 0
+}
+
+WAIT_PID=""
+release_waiter() {
+  if [[ -n "$WAIT_PID" ]] && kill -0 "$WAIT_PID" 2>/dev/null; then
+    kill "$WAIT_PID" 2>/dev/null || true
+    wait "$WAIT_PID" 2>/dev/null || true
+  fi
+  WAIT_PID=""
+}
+# shellcheck disable=SC2329  # invoked by the EXIT trap
+cleanup() { release_waiter; }
+trap cleanup EXIT
+
+# Fast path: the reviewer may have finished before this wait was ever called.
+if status_ready; then
+  report_done
+fi
+
+tmux wait-for "$EVENT" &
+WAIT_PID=$!
+
+elapsed=0
+while :; do
+  # Authoritative check, always first.
+  if status_ready; then
+    release_waiter
+    report_done
+  fi
+
+  # The event fired but no status file exists. The reviewer always writes the
+  # status before it signals, so this cannot be this cycle's completion: it is a
+  # stale latch from an earlier cycle. Discard it and keep waiting for the real
+  # thing. The latch is single-shot, so this re-arm happens at most once.
+  if [[ -n "$WAIT_PID" ]] && ! kill -0 "$WAIT_PID" 2>/dev/null; then
+    wait "$WAIT_PID" 2>/dev/null || true
+    log "$LABEL: discarded a stale tmux signal (no status file was written)."
+    tmux wait-for "$EVENT" &
+    WAIT_PID=$!
+  fi
+
+  if ! pane_alive; then
+    release_waiter
+    # The pane may have vanished only after the reviewer finished.
+    if status_ready; then
+      report_done
+    fi
+    printf '125\n' > "$STATUS_FILE"
+    log "$LABEL pane disappeared before completion."
+    exit 0
+  fi
+
+  if (( elapsed >= TIMEOUT_SECONDS )); then
+    release_waiter
+    # Re-read before giving up: the reviewer may have finished during the last
+    # sleep. Recording 124 over a real status would report a completed review as
+    # a timeout.
+    if status_ready; then
+      report_done
+    fi
+    printf '124\n' > "$STATUS_FILE"
+    log "$LABEL timed out after $TIMEOUT_SECONDS seconds."
+    exit 0
+  fi
+
+  sleep 1
+  ((elapsed += 1))
+done
+HELPER
+chmod +x "$VET_DIR/run-wait"
+
+cat > "$VET_DIR/update-title" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TITLE_FILE="$1"
+NEW_TITLE_FILE="$2"
+WINDOW_SHORT_NAME="$3"
+MANAGER_PANE="$4"
+REVIEWER_A_PANE="$5"
+REVIEWER_B_PANE="$6"
+
+NEW_TITLE="$(
+  tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
+    sed -E \
+      -e 's/^[[:space:]]+//' \
+      -e 's/[[:space:]]+$//' \
+      -e 's/[[:space:]]+/ /g' |
+    cut -c 1-90
+)"
+
+if [[ -z "$NEW_TITLE" ]]; then
+  echo "Error: vet title must not be empty" >&2
+  exit 1
+fi
+
+printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
+tmux rename-window -t "$MANAGER_PANE" "$WINDOW_SHORT_NAME"
+tmux select-pane -t "$MANAGER_PANE" -T "$NEW_TITLE"
+tmux select-pane -t "$REVIEWER_A_PANE" -T "Reviewer A"
+tmux select-pane -t "$REVIEWER_B_PANE" -T "Reviewer B"
+printf '[%s] vet title updated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE"
+HELPER
+chmod +x "$VET_DIR/update-title"
+
+# Resume must reconstruct the SAME constrained Manager as the initial launch.
+# The allowlist is read from manager-allowed-tools.txt so the two can never
+# drift apart.
+cat > "$VET_DIR/run-manager-resume" <<HELPER
+#!/usr/bin/env bash
+set -euo pipefail
+WORKDIR="\$1"
+PROMPT_FILE="\$2"
+SESSION_ID="\$3"
+RUN_DIR="$VET_DIR"
+
+for required_flag in --tools --setting-sources --allowedTools --disallowedTools --strict-mcp-config; do
+  if ! claude --help 2>&1 | grep -q -- "\$required_flag"; then
+    echo "Error: the installed claude CLI has no \$required_flag, so vet cannot" >&2
+    echo "       constrain the Manager. Refusing to resume." >&2
+    exit 3
+  fi
+done
+
+cd "\$WORKDIR"
+printf '[%s] Manager session resuming: %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$SESSION_ID"
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 exec claude \\
+  --setting-sources "" \\
+  --strict-mcp-config \\
+  --add-dir "\$RUN_DIR" \\
+  --tools "$MANAGER_TOOLS" \\
+  --allowedTools "\$(cat "\$RUN_DIR/manager-allowed-tools.txt")" \\
+  --disallowedTools "$MANAGER_DISALLOWED_TOOLS" \\
+  --append-system-prompt "\$(cat "\$PROMPT_FILE")" \\
+  --resume "\$SESSION_ID"
+HELPER
+chmod +x "$VET_DIR/run-manager-resume"
+
+# Reviewer A is read-only, and that is enforced by the CLI, not by the prompt:
+#
+#   --tools "Read,Glob,Grep,Bash"  removes Edit / Write / NotebookEdit / Task /
+#       WebFetch / WebSearch from the built-in tool set entirely, so there is no
+#       mutation tool for the model to call. Verified: the session advertises
+#       only Bash, Glob, Grep, Read, StructuredOutput.
+#   --setting-sources ""           ignores the PO's own settings.json. This one
+#       matters: with the PO's settings loaded, `--allowedTools` alone did NOT
+#       fail closed - a `touch` through Bash succeeded. Without them, the same
+#       command is refused ("This command requires approval") and shell output
+#       redirection is blocked.
+#   --allowedTools <read-only git> grants the git history commands explicitly,
+#       and no --dangerously-skip-permissions is passed, so every mutation is
+#       denied. Verified: `sh -c "echo pwned > b.txt"` -> "This command requires
+#       approval" and no file; `printf x >> a.txt` -> redirection blocked and
+#       the file unchanged; allowlisted `git log --oneline` -> ran fine.
+#   --strict-mcp-config            keeps MCP servers (which could carry write
+#       tools) out of the session.
+#
+# On the narrowness of the Bash allowlist: it was worth re-checking whether a
+# git-only list starves the reviewer. It does not. The CLI applies its own
+# read-only classifier first, so harmless inspection commands (ls, cat, wc and
+# friends) run without needing a rule at all - verified: an unlisted `ls -la`
+# executed while the mutations above were still refused. The allowlist therefore
+# only has to name the git-history commands, whose mutability the classifier is
+# rightly conservative about. Widening it further would buy nothing and would
+# add exactly the kind of prefix rule (`git ...`) that could later match a
+# mutating subcommand, so it stays as-is.
+#
+# If a future CLI drops any of these flags, this helper must fail rather than
+# silently widen the reviewer's powers - see the guard below.
+cat > "$VET_DIR/run-reviewer-a" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+EVENT="$4"
+SESSION_ID="$5"
+SCHEMA_FILE="$6"
+MODE="$7"
+RUN_DIR="$8"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+STDERR_FILE="${RESULT_FILE%.json}.stderr.log"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+# -t "$TMUX_PANE" is required. Without it tmux retitles the window's ACTIVE
+# pane, which during a real run is the Manager pane - so the Manager pane would
+# show "Reviewer A: done" and lose the PR title, while this pane kept a stale
+# label. Caught by the end-to-end run; TMUX_PANE is always set inside a pane.
+set_title() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux select-pane -t "$TMUX_PANE" -T "Reviewer A: $1"
+  else
+    tmux select-pane -T "Reviewer A: $1"
+  fi
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  if [[ "$rc" -eq 0 ]]; then
+    set_title "done $(date '+%H:%M:%S')"
+  else
+    set_title "failed($rc) $(date '+%H:%M:%S')"
+  fi
+  tmux wait-for -S "$EVENT"
+  exit "$rc"
+}
+trap finish EXIT
+
+# Clear last cycle's status so its presence unambiguously means "THIS cycle
+# finished". run-wait treats the file as the single source of truth, so a status
+# left over from a previous reviewer-a / reviewer-a-resume cycle would otherwise
+# let the next wait report a stale result as if it were fresh. Done after the
+# trap is installed, so a failure from here on still records a status.
+rm -f "$STATUS_FILE"
+
+# Fail closed: never fall back to a wider-permission invocation.
+for required_flag in --tools --setting-sources --allowedTools --disallowedTools --strict-mcp-config; do
+  if ! claude --help 2>&1 | grep -q -- "$required_flag"; then
+    log "FATAL: the installed claude CLI has no $required_flag, so vet cannot"
+    log "       enforce a read-only reviewer. Refusing to run."
+    exit 3
+  fi
+done
+
+set_title "reviewing since $(date '+%H:%M:%S')"
+if [[ "$MODE" == "initial" ]]; then
+  SESSION_ARGS=(--session-id "$SESSION_ID")
+  log ">>> Reviewer A prompt sent (initial session)."
+else
+  SESSION_ARGS=(--resume "$SESSION_ID")
+  log ">>> Reviewer A prompt sent (resuming fixed session $SESSION_ID)."
+fi
+claude -p \
+  --setting-sources "" \
+  --strict-mcp-config \
+  --add-dir "$RUN_DIR" \
+  --tools "Read,Glob,Grep,Bash" \
+  --allowedTools "Read Glob Grep Bash(git log:*) Bash(git show:*) Bash(git diff:*) Bash(git status:*) Bash(git blame:*)" \
+  --disallowedTools "Edit Write NotebookEdit MultiEdit Task WebFetch WebSearch" \
+  "${SESSION_ARGS[@]}" \
+  --output-format stream-json \
+  --include-partial-messages \
+  --verbose \
+  --json-schema "$(cat "$SCHEMA_FILE")" \
+  "$(cat "$TASK_FILE")" 2> "$STDERR_FILE" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      .message.content[]? |
+      if .type == "tool_use" then "[tool] \(.name)"
+      elif .type == "text" then .text
+      else empty end
+    elif .type == "result" then "[result] \(.subtype // "done")"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+
+if [[ -s "$STDERR_FILE" ]]; then
+  while IFS= read -r line; do log "[stderr] $line" >&2; done < "$STDERR_FILE"
+fi
+jq -c 'select(.type == "result") | (.structured_output // .result)' "$STREAM_FILE" |
+  tail -n 1 > "$RESULT_FILE"
+log ">>> Reviewer A finished."
+HELPER
+chmod +x "$VET_DIR/run-reviewer-a"
+
+# Reviewer B uses plain `codex exec`, not `codex exec review`. Two reasons:
+#   1. `exec review` is built around a scope (--uncommitted / --base / --commit)
+#      and squad already hit `the argument '--uncommitted' cannot be used with
+#      '[PROMPT]'`. vet drives the whole review from a custom prompt, so no scope
+#      flag can be passed - and with none passed there are no uncommitted
+#      changes to review: the PR worktree is a clean detached checkout of the PR
+#      head.
+#   2. `exec review` imposes its own review framing, which would fight the
+#      checklist-driven structured output vet needs.
+# `-a never -s read-only` is the read-only enforcement: the sandbox refuses
+# writes and the agent can never escalate by asking for approval.
+cat > "$VET_DIR/run-reviewer-b" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+EVENT="$4"
+SCHEMA_FILE="$5"
+WORKDIR="$6"
+RUN_DIR="$7"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+# See the note in run-reviewer-a: without -t this retitles the active (Manager)
+# pane instead of this one.
+set_title() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux select-pane -t "$TMUX_PANE" -T "Reviewer B: $1"
+  else
+    tmux select-pane -T "Reviewer B: $1"
+  fi
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  if [[ "$rc" -eq 0 ]]; then
+    set_title "done $(date '+%H:%M:%S')"
+  else
+    set_title "failed($rc) $(date '+%H:%M:%S')"
+  fi
+  tmux wait-for -S "$EVENT"
+  exit "$rc"
+}
+trap finish EXIT
+
+# See run-reviewer-a: clear last cycle's status so run-wait can treat the status
+# file as the single source of truth for THIS cycle.
+rm -f "$STATUS_FILE"
+
+# Reviewer B's task tells it to read vet's context files from $RUN_DIR, which is
+# OUTSIDE the -C root. Verified against codex-cli 0.145.0: the read-only sandbox
+# permits reads anywhere on the filesystem and only blocks writes, so this works
+# - `cat <outside-root>/context.txt` succeeded while `touch` inside AND outside
+# the root both failed with "Operation not permitted".
+#
+# That is a real dependency on codex's sandbox shape, so probe it rather than
+# assume it. If a future codex confines reads to the -C root, this probe fails
+# loudly with an actionable message instead of letting the reviewer produce an
+# empty review from context it could never read.
+log ">>> Probing codex sandbox: can it read vet context outside the -C root?"
+PROBE_OUT="$RUN_DIR/reviewer-b-sandbox-probe.txt"
+if ! codex -a never -s read-only exec \
+      --ignore-user-config \
+      -C "$WORKDIR" \
+      -o "$PROBE_OUT" \
+      "Read the file $RUN_DIR/sandbox-probe.txt and reply with its exact contents and nothing else." \
+      < /dev/null > "$RUN_DIR/reviewer-b-sandbox-probe.log" 2>&1; then
+  log "FATAL: the codex sandbox probe did not complete. See:"
+  log "       $RUN_DIR/reviewer-b-sandbox-probe.log"
+  exit 4
+fi
+if ! grep -q 'VET-SANDBOX-OK' "$PROBE_OUT" 2>/dev/null; then
+  log "FATAL: codex could not read vet's context directory:"
+  log "         $RUN_DIR"
+  log "       This codex version appears to confine reads to the -C root"
+  log "       ($WORKDIR), so Reviewer B would review a PR it cannot see."
+  log "       Do NOT fix this with --add-dir: that grants WRITE access and"
+  log "       breaks the read-only guarantee. vet must instead place the"
+  log "       context and the PR checkout under one shared read-only root."
+  log "       Probe output: $PROBE_OUT"
+  exit 4
+fi
+log ">>> Sandbox probe OK: codex can read vet's context directory."
+
+set_title "reviewing since $(date '+%H:%M:%S')"
+log ">>> Reviewer B prompt sent."
+# --ignore-user-config narrows the reviewer's MCP exposure. It does NOT eliminate
+# it, and an earlier version of this comment wrongly claimed it did.
+#
+# What it DOES remove, measured: without the flag codex loads the PO's
+# ~/.codex/config.toml servers - notion, datadog, and a node_repl server that
+# executes Node. MCP tools are not shell commands, so the -s read-only seatbelt
+# does NOT constrain them; a write-capable MCP tool would be reachable from a
+# nominally read-only reviewer. With the flag, those declared servers are gone
+# (the only remaining MCP server name is `codex_apps`, datadog and node_repl are
+# absent) and the OAuth refresh noise disappears.
+#
+# What it does NOT remove, also measured: codex's BUILT-IN `codex_apps` surface
+# survives, so list_mcp_resources / list_mcp_resource_templates /
+# read_mcp_resource remain in the tool set and remain callable - a
+# list_mcp_resources call succeeds and still returns a Notion plugin resource.
+# So this flag reduces the blast radius rather than closing it. Reads outside -C
+# still work and shell writes are still refused, both re-verified with the flag.
+codex -a never -s read-only exec \
+  --ignore-user-config \
+  -C "$WORKDIR" \
+  --json \
+  --output-schema "$SCHEMA_FILE" \
+  -o "$RESULT_FILE" \
+  "$(cat "$TASK_FILE")" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "item.started" then "[started] \(.item.type // "item")"
+    elif .type == "item.completed" and .item.type == "command_execution" then
+      "[command] \(.item.command // "")\n[exit] \(.item.exit_code // "unknown")"
+    elif .type == "item.completed" and .item.type == "agent_message" then .item.text
+    elif .type == "turn.completed" then "[turn] completed"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+cat "$RESULT_FILE" 2>/dev/null || true
+log ">>> Reviewer B finished."
+HELPER
+chmod +x "$VET_DIR/run-reviewer-b"
+
+# --- Reviewer task files ------------------------------------------------------
+#
+# These stay small on purpose. macOS ARG_MAX is 1 MiB and both helpers pass the
+# task through argv as "$(cat "$TASK_FILE")", so the diff and the comment dump
+# are referenced by absolute path instead of inlined - a large PR would
+# otherwise abort with E2BIG.
+
+REVIEWER_PROHIBITIONS="$(cat <<PROHIBIT
+## Absolute prohibitions (this is a READ-ONLY review)
+
+You are reviewing code. You are NOT changing it. You MUST NOT:
+
+- edit, create, delete, move, or rename ANY file, anywhere;
+- run git commit, git add, git push, git force-push, git merge, git rebase,
+  git cherry-pick, git reset, git checkout, git stash, or git clean;
+- create a pull request, approve one, or request changes on one;
+- post ANY comment, review, or reaction to GitHub, or run any mutating gh
+  command;
+- create a git worktree, including under .claude/worktree or .claude/worktrees;
+- run a formatter, linter, codemod, or test runner that rewrites files;
+- install dependencies or run any build that writes into the working tree.
+
+Your tools are restricted so that these are refused, but do not try. If you
+believe a change is needed, describe it as a finding with a suggestion - that is
+the entire deliverable. Reading files, reading the diff, grep, and read-only git
+history commands (git log, git show, git diff, git blame, git status) are the
+only actions you take.
+PROHIBIT
+)"
+
+build_reviewer_task() {
+  local reviewer_label="$1"
+  local reviewer_name="$2"
+  local out_file="$3"
+  local extra_guidance="$4"
+
+  cat > "$out_file" <<TASK
+You are $reviewer_label, one of two INDEPENDENT reviewers of a GitHub pull
+request. Another reviewer is reviewing the same PR at the same time; you must
+not coordinate with them. A Manager will reconcile both reports afterwards.
+
+Report yourself as "$reviewer_name" in the "reviewer" field of your output.
+
+## What you are reviewing
+
+- Repository:      $REPO_SPEC
+- Pull request:    #$PR_NUMBER - $PR_TITLE
+- URL:             $PR_URL
+- Author:          $PR_AUTHOR
+- State:           $PR_STATE (draft: $PR_IS_DRAFT)
+- Base -> head:    $BASE_REF -> $HEAD_REF
+- Reviewed commit: $HEAD_OID
+- Size:            $PR_CHANGED_FILES changed files, +$PR_ADDITIONS / -$PR_DELETIONS
+
+The PR head is already checked out for you, detached, at:
+  $WORKDIR
+That directory is the code as it would be after merging the head commit. Read
+any file there for context - not just the changed ones.
+
+$PR_STATE_NOTE
+
+## Files you MUST read before reviewing
+
+1. $VET_DIR/checklist.merged.md - the review checklist (also inlined below)
+2. $VET_DIR/review-context.md   - the PR digest, description, commits, and the
+                                   EXISTING PR comments
+3. $VET_DIR/diff.patch          - the diff you are reviewing ($DIFF_LINES lines)
+4. $VET_DIR/comments.json       - existing review + issue comments, structured
+5. $VET_DIR/context-limits.txt  - exactly what was truncated, if anything
+
+Read them with your file-reading tool. They are large; do not skip them.
+
+## Context warnings you MUST carry into your output
+
+$(cat "$VET_DIR/context-limits.txt")
+
+Copy every limitation above into the "context_warnings" array of your output,
+in your own words but without softening it. If nothing was truncated, say so
+explicitly instead of leaving the array empty.
+
+## The checklist ($CHECKLIST_COUNT items)
+
+Go through these one at a time. Your "coverage" array MUST contain exactly one
+entry per checklist ID below, with an honest status:
+
+- checked_ok      you looked and the PR is fine on this point
+- problem_found   you looked and found a problem (also file it under findings)
+- not_applicable  the PR does not touch anything this item is about
+- not_checked     you could not check it (say why in the note) - this is
+                  acceptable and far better than guessing
+
+$(cat "$VET_DIR/checklist.merged.md")
+
+## Existing comments
+
+$COMMENTS_SHOWN comment(s) already exist on this PR, listed in
+$VET_DIR/review-context.md and $VET_DIR/comments.json. Read them. If a point has
+already been raised there, either drop it or set "already_raised": true on the
+finding and name the existing comment in "duplicates_to_avoid". Do not waste the
+author's time repeating feedback they already have.
+
+## How to write findings
+
+- One finding per distinct problem. Give each a short stable "id" like
+  "$reviewer_name-01".
+- "checklist_ids" links the finding back to the checklist item(s) it came from.
+  Use an empty array only for something genuinely outside the checklist.
+- "file" and "line" must point at the real location in the PR head. Use the
+  repository-relative path. Set "line" to 0 and explain in "body" when a finding
+  is not tied to one line.
+- "evidence" quotes the actual code or diff hunk that shows the problem. A
+  finding with no evidence is a guess - lower its "confidence" or drop it.
+- "suggestion" is the concrete replacement code when you can propose one, and an
+  empty string when you cannot. Do not invent a fix you are unsure of.
+- "severity": must_fix = correctness, security, or data loss; should_fix = a
+  real problem that is not blocking; nit = style or polish; question = you need
+  the author to clarify before you can judge.
+- Prefer few high-confidence findings over many speculative ones. It is fine to
+  return no findings if the PR is clean.
+
+$extra_guidance
+
+$REVIEWER_PROHIBITIONS
+
+## Output
+
+Return the structured JSON object required by your output schema. Nothing else.
+TASK
+}
+
+build_reviewer_task \
+  "Reviewer A (Claude)" \
+  "reviewer_a" \
+  "$VET_DIR/reviewer-a-task.md" \
+  "## Your angle
+
+Work from the code outwards. Open the changed files in the worktree and read the
+surrounding code, callers, and callees - not only the diff hunks. You are the
+reviewer most likely to catch a problem that is invisible in the diff alone:
+a caller that was not updated, an invariant broken elsewhere, a test that no
+longer covers what its name claims. Use git log and git show on the touched
+files to see whether this change contradicts a recent, deliberate one."
+
+build_reviewer_task \
+  "Reviewer B (Codex)" \
+  "reviewer_b" \
+  "$VET_DIR/reviewer-b-task.md" \
+  "## Your angle
+
+Work from the diff inwards. Go hunk by hunk through $VET_DIR/diff.patch and
+justify every changed line: why is it correct, and what input would break it?
+You are the reviewer most likely to catch a concrete defect in the new code
+itself - a bad boundary, an unhandled error, a missing authorization check, a
+query that will not scale. Be adversarial: for each hunk, actively try to
+construct an input or a sequence of events that makes it misbehave, and report
+what you find."
+
+# --- Manager system prompt ----------------------------------------------------
+#
+# The tmux event names live only in run-step now; the Manager never names them.
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  MANAGER_PANE="%dry-manager"
+  REVIEWER_A_PANE="%dry-reviewer-a"
+  REVIEWER_B_PANE="%dry-reviewer-b"
+  WINDOW_ID=""
+  CURRENT_WINDOW_NAME=""
+  WINDOW_SHORT_NAME="vet:${RUN_ID:0:15}"
+else
+  MANAGER_PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
+  CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$MANAGER_PANE" '#W')"
+  WINDOW_ID="$(tmux display-message -p -t "$MANAGER_PANE" '#{window_id}')"
+  WINDOW_SHORT_NAME="vet:${RUN_ID:0:15}"
+  REVIEWER_A_PANE=$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')
+  REVIEWER_B_PANE=$(tmux split-window -v -c "$WORKDIR" -d -t "$REVIEWER_A_PANE" -P -F '#{pane_id}')
+fi
+
+# NOTE: this heredoc is unquoted so the paths and pane IDs are baked in. Never
+# put an unescaped backtick or $( ) in it.
+cat > "$VET_DIR/manager-prompt.md" << PROMPT
+# You are a Review Manager
+
+You coordinate two independent PR reviewers in separate tmux panes and turn
+their two reports into ONE consolidated, paste-ready Markdown report.
+You do NOT review the code yourself, and you do NOT change any code.
+Speak Japanese to PO (user). Write English for agents.
+
+## Environment
+
+- Repository:        $REPO_SPEC
+- Pull request:      #$PR_NUMBER - $PR_TITLE
+- PR URL:            $PR_URL
+- PR state:          $PR_STATE (draft: $PR_IS_DRAFT, cross-repository: $IS_CROSS_REPOSITORY)
+- Base -> head:      $BASE_REF -> $HEAD_REF
+- Reviewed head OID: $HEAD_OID
+- PO's repository:   $REPO_ROOT
+- PR worktree:       $WORKDIR  (detached at the PR head, NO branch)
+- Artifacts:         $VET_DIR
+- Report to write:   $REPORT_PATH
+- Checklist:         $CHECKLIST_COUNT items ($CHECKLIST_OVERRIDES project overrides, $CHECKLIST_ADDED project additions)
+- Common checklist:  $COMMON_CHECKLIST_SOURCE
+- Project checklist: $PROJECT_CHECKLIST_SOURCE
+- Context truncated: $CONTEXT_TRUNCATED  (details: $VET_DIR/context-limits.txt)
+- Manager session:   $MANAGER_SESSION_ID
+- Reviewer A session: $REVIEWER_A_SESSION_ID
+- Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
+
+$PR_STATE_NOTE
+
+## Critical rules
+
+- This review is READ-ONLY. You and both reviewers must not edit, create, or
+  delete any file in $WORKDIR or in $REPO_ROOT. The single file you write is the
+  report at $REPORT_PATH, plus the task files under $VET_DIR.
+- NEVER commit, push, force-push, merge, rebase, cherry-pick, reset, checkout,
+  stash, or create a pull request. Not in the PR worktree, not in the PO's
+  repository.
+- NEVER post anything to GitHub - no review, no comment, no reaction, no label,
+  no approval - unless PO explicitly asks for it in this pane. When PO does ask,
+  first show the exact gh command you intend to run and wait for PO to confirm
+  it. Then run exactly that command and nothing more.
+- NEVER create additional git worktrees, including .claude/worktree or
+  .claude/worktrees. The only worktree is $WORKDIR.
+- NEVER run claude or codex directly. ALL reviewer work MUST go through the
+  run-step helper, using the exact command lines below. run-step is what drives
+  the reviewer panes; you never address a pane yourself.
+
+## Your permissions are enforced, not merely requested
+
+You are NOT running with skipped permissions. vet launched you with an explicit
+allowlist, so the rules above are backed by the CLI:
+
+- The ONLY command you may run without approval is $VET_DIR/run-step, with one
+  token from its closed set. That is deliberate: it is how you drive the agents.
+- You may write and edit exactly three things: $REPORT_PATH,
+  $VET_DIR/new-title.txt, and anything under $VET_DIR/notes/. Every other path -
+  including the rest of $VET_DIR, all of $WORKDIR, and all of $REPO_ROOT - will
+  stop and ask PO to approve it.
+- tmux, git, gh, cat, pbcopy and open are NOT allowlisted in any form. Read files
+  with the Read tool. vet already collected pr.json, diff.patch and
+  comments.json, so you need no network and no gh call to do your job.
+
+## Driving agents ANY way other than run-step is prohibited
+
+Do not run \`tmux send-keys\`, or any other tmux command, for any reason. Do not
+call $VET_DIR/run-reviewer-a, run-reviewer-b, run-wait or update-title directly.
+run-step is the only supported path, and typing keys into a reviewer pane by
+hand would execute them in a shell that has no permission layer at all - which
+is exactly what these restrictions exist to prevent.
+
+If you hit a permission prompt, that is the system working as designed. Do NOT
+try to work around it, do NOT look for an equivalent command that might slip
+through, and do NOT ask PO to relax permissions. Either the action was genuinely
+unnecessary - so drop it - or PO explicitly wants it, in which case explain what
+you are about to run and let PO approve that exact command.
+- Use the run-wait helper to wait for completion. NEVER poll with capture-pane.
+- Run BOTH reviewers. Never write the report from a single reviewer's output
+  without telling PO that the other one failed.
+- The two reviewers are independent. Do not show one reviewer the other's
+  findings.
+
+## Status handling
+
+Each helper writes an exit code to its status file before signaling completion.
+After every run-wait command, read the status file. If it is not 0, read the
+corresponding result file and stderr log if present, report the failure to PO in
+Japanese, and decide whether to retry that reviewer. Never wait indefinitely
+after a helper failure. Status 3 from Reviewer A means the installed claude CLI
+can no longer enforce a read-only reviewer - stop and tell PO; do not work
+around it. run-wait detects a disappeared pane and applies a
+$WAIT_TIMEOUT_SECONDS second timeout as a final fallback.
+
+## Commands
+
+Every agent action is one run-step call. run-step takes exactly ONE token and
+rejects anything else, including any extra argument. You never write a tmux
+command yourself.
+
+### Start Reviewer A (Claude, read-only)
+
+The task file is already written. Run:
+
+  $VET_DIR/run-step reviewer-a
+
+### Start Reviewer B (Codex, read-only)
+
+Start it immediately after Reviewer A so both run in parallel:
+
+  $VET_DIR/run-step reviewer-b
+
+### Wait for both and read their results
+
+  $VET_DIR/run-step wait-a
+
+Then read $VET_DIR/reviewer-a-status.txt and $VET_DIR/reviewer-a-result.json
+with the Read tool. Then:
+
+  $VET_DIR/run-step wait-b
+
+Then read $VET_DIR/reviewer-b-status.txt and $VET_DIR/reviewer-b-result.json
+with the Read tool.
+
+### Re-run a reviewer that failed
+
+Reviewer A, continuing its exact session:
+
+  $VET_DIR/run-step reviewer-a-resume
+
+Reviewer B, fresh:
+
+  $VET_DIR/run-step reviewer-b
+
+After either, wait again with the matching run-step wait-a / wait-b.
+
+### Update the pane title
+
+Write the new title to $VET_DIR/new-title.txt with the Write tool (a short
+Japanese title, for example: #$PR_NUMBER 認可チェック漏れ2件), then run:
+
+  $VET_DIR/run-step title
+
+## Reconciling the two reviews
+
+Both reviewers return the same JSON shape: summary, context_warnings, coverage
+(one entry per checklist ID), findings, duplicates_to_avoid. Reconcile them:
+
+1. DEDUPE. Two findings are the same when they concern the same defect, even if
+   the file, line, wording, or severity differ. Merge them into one finding and
+   record both reviewers in "sources". A finding both reviewers raised
+   independently is the strongest signal there is - say so in the report.
+2. KEEP checklist IDs. Every merged finding keeps the union of the
+   checklist_ids from both sides. Never drop them: they are how PO knows which
+   question produced the finding.
+3. CONTRADICTIONS. When the two reviewers disagree - one says a line is safe and
+   the other says it is a bug, or they assign very different severities - do NOT
+   silently pick one. Read the actual code at $WORKDIR yourself and resolve it.
+   If you can resolve it, record the resolution. If you cannot, record it as
+   unresolved and say what PO should check. Every contradiction goes in the
+   report.
+4. DROP ALREADY-RAISED FINDINGS. Anything already covered by an existing PR
+   comment (see $VET_DIR/comments.json) must be removed from the findings and
+   listed separately as "already raised on the PR". Do not make the author read
+   the same feedback twice.
+5. COVERAGE. Merge the two coverage arrays per checklist ID. If the reviewers
+   disagree on a status, take the worse one (problem_found > not_checked >
+   checked_ok > not_applicable) and note the disagreement.
+6. CONTEXT WARNINGS. Every warning in $VET_DIR/context-limits.txt goes into the
+   report verbatim in meaning. A report that silently covers only part of a PR
+   is a defect. If nothing was truncated, state that explicitly.
+
+## Writing the report
+
+Write $REPORT_PATH as GitHub-flavored Markdown that PO can paste into GitHub
+without editing. Structure:
+
+1. Header: PR title and URL, the reviewed head OID ($HEAD_OID), which checklist
+   sources were used, and the date.
+2. Context warnings: either the truncation warnings, or one explicit line saying
+   the whole PR was reviewed with no truncation.
+3. Findings grouped by severity (must_fix, should_fix, nit, question). Each
+   finding is a SELF-CONTAINED copy-paste block: the checklist IDs it came from,
+   a path/to/file.rb:123 reference, what is wrong, why it matters, which
+   reviewer(s) found it, and - when a concrete fix exists - a fenced
+   \`\`\`suggestion block containing the replacement code and nothing else.
+4. Coverage table: every checklist item with its ID, its question, and its final
+   status. All $CHECKLIST_COUNT of them, none omitted.
+5. Contradictions between the two reviewers, each resolved or explicitly flagged
+   as unresolved.
+6. Closing section listing the not_applicable and not_checked items, and the
+   findings dropped as already raised on the PR.
+
+After writing it, verify the file exists and tell PO in Japanese:
+  - the absolute report path
+  - how many must_fix / should_fix / nit / question findings there are
+  - whether coverage was complete
+  - the copy command: pbcopy < '$REPORT_PATH'
+
+## Workflow
+
+1. Read $VET_DIR/context-limits.txt and $VET_DIR/checklist.merged.md so you know
+   what was and was not covered before anything else.
+2. Run run-step reviewer-a, then immediately run-step reviewer-b, so both review
+   in parallel.
+3. Run run-step wait-a, then read its status file and result with Read.
+4. Run run-step wait-b, then read its status file and result with Read.
+5. Report any non-zero status to PO and decide whether to re-run that reviewer.
+6. Reconcile both outputs as described above. Read the real code in $WORKDIR to
+   settle contradictions.
+7. Write $REPORT_PATH.
+8. Report completion to PO in Japanese with the report path and the copy command.
+9. Do nothing on GitHub unless PO explicitly asks.
+PROMPT
+
+RUN_STATUS="running"
+if [[ "$DRY_RUN" == "true" ]]; then
+  RUN_STATUS="dry-run"
+fi
+write_state
+# The Manager's only allowlisted command. Generated last, once the pane IDs it
+# bakes in are known.
+write_run_step
+# The one place the Manager may write freely; nothing here is executed or
+# sourced, so a blanket rule over it is safe.
+mkdir -p "$VET_DIR/notes"
+
+{
+  printf 'vet run:           %s\n' "$RUN_ID"
+  printf 'Repository:        %s\n' "$REPO_SPEC"
+  printf 'Pull request:      #%s %s\n' "$PR_NUMBER" "$PR_TITLE"
+  printf 'PR URL:            %s\n' "$PR_URL"
+  printf 'PR state:          %s (draft: %s)\n' "$PR_STATE" "$PR_IS_DRAFT"
+  printf 'Reviewed head OID: %s\n' "$HEAD_OID"
+  printf 'Started at:        %s\n' "$STARTED_AT"
+  printf 'PR worktree:       %s (detached, no branch)\n' "$WORKDIR"
+  printf 'Your repository:   %s (untouched)\n' "$REPO_ROOT"
+  printf 'Artifacts:         %s\n' "$VET_DIR"
+  printf 'Report will be at: %s\n' "$REPORT_PATH"
+  printf 'Checklist:         %s items (common: %s, project: %s)\n' \
+    "$CHECKLIST_COUNT" "$COMMON_CHECKLIST_SOURCE" "$PROJECT_CHECKLIST_SOURCE"
+  printf 'Context truncated: %s\n' "$CONTEXT_TRUNCATED"
+  printf 'Wait timeout:      %s seconds\n' "$WAIT_TIMEOUT_SECONDS"
+} > "$VET_DIR/run-info.txt"
+
+cat "$VET_DIR/run-info.txt"
+echo ""
+if [[ "$CONTEXT_TRUNCATED" == "true" ]]; then
+  echo "WARNING: this review will not cover the whole PR:"
+  sed 's/^/  /' "$VET_DIR/context-limits.txt"
+  echo ""
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry run: no agent was launched and no pane was split."
+  echo "Generated artifacts:"
+  find "$VET_DIR" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | sed 's/^/  /'
+  echo ""
+  echo "Inspect the wiring with:"
+  printf "  cat '%s'\n" "$VET_DIR/checklist.merged.md"
+  printf "  cat '%s'\n" "$VET_DIR/reviewer-a-task.md"
+  printf "  cat '%s'\n" "$VET_DIR/manager-prompt.md"
+  echo ""
+  printf "Remove this dry run with: vet rm %s\n" "$RUN_ID"
+  exit 0
+fi
+
+# --- Launch Manager -----------------------------------------------------------
+
+tmux rename-window -t "$WINDOW_ID" "$WINDOW_SHORT_NAME"
+tmux select-pane -t "$MANAGER_PANE" -T "$PR_TITLE"
+tmux select-pane -t "$REVIEWER_A_PANE" -T "Reviewer A"
+tmux select-pane -t "$REVIEWER_B_PANE" -T "Reviewer B"
+tmux set-option -w -t "$WINDOW_ID" pane-border-status top
+tmux set-option -w -t "$WINDOW_ID" pane-border-format " #{pane_title} "
+tmux set-option -w -t "$WINDOW_ID" @vet_run_id "$RUN_ID"
+tmux set-option -w -t "$WINDOW_ID" @vet_state_file "$STATE_FILE"
+
+MANAGER_TASK="PR #$PR_NUMBER ($REPO_SPEC) のレビューを開始してください: $PR_TITLE
+$PR_URL
+
+チェックリスト $CHECKLIST_COUNT 項目、レビュー対象コミット $HEAD_OID。
+Reviewer A と Reviewer B を並行で起動し、両方の結果を突き合わせて
+$REPORT_PATH に統合レポートを書いてください。GitHub には何も投稿しないでください。"
+
+require_claude_enforcement_flags "Manager" || exit 1
+
+cd "$WORKDIR"
+set +e
+printf '[%s] Manager prompt sent for PR #%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$PR_NUMBER"
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude \
+  --setting-sources "" \
+  --strict-mcp-config \
+  --add-dir "$VET_DIR" \
+  --tools "$MANAGER_TOOLS" \
+  --allowedTools "$MANAGER_ALLOWED_TOOLS" \
+  --disallowedTools "$MANAGER_DISALLOWED_TOOLS" \
+  --append-system-prompt "$(cat "$VET_DIR/manager-prompt.md")" \
+  --session-id "$MANAGER_SESSION_ID" \
+  "$MANAGER_TASK"
+MANAGER_STATUS=$?
+set -e
+
+echo ""
+echo "Manager exited with status $MANAGER_STATUS."
+echo "PR worktree retained at: $WORKDIR"
+echo "Artifacts retained at:   $VET_DIR"
+if [[ -f "$REPORT_PATH" ]]; then
+  echo ""
+  echo "Report: $REPORT_PATH"
+  printf "Copy: pbcopy < '%s'\n" "$REPORT_PATH"
+  if [[ "$OPEN_REPORT" == "true" ]]; then
+    if command -v open >/dev/null 2>&1; then
+      open -R "$REPORT_PATH"
+    else
+      echo "Note: --open needs the macOS 'open' command, which is not available."
+    fi
+  fi
+else
+  echo ""
+  echo "No report was written at: $REPORT_PATH"
+  echo "Resume with: vet resume $RUN_ID"
+fi
+exit "$MANAGER_STATUS"
