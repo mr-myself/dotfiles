@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# whatdid — その日「やったこと」を git / squad / Claude会話ログ / GitHubレビュー /
+#           カレンダーから横断収集し、claude で1つの「やったこと」に統合して出力する。
+#
+# 使い方:
+#   whatdid              # 昨日分（デフォルト）
+#   whatdid today        # 今日分
+#   whatdid 2026-06-03   # 指定日
+#   whatdid 2026-06-03 2026-06-05   # 期間（開始〜終了、両端含む）
+
+set -uo pipefail
+
+REPOS_ROOT="$HOME/mr-myself/organization/xmile"   # xmile 配下のみ探索
+AUTHOR_RE="mr-myself|Keisuke|Hoshino|keisuke"     # 自分のコミット判定
+SQUAD_RUNS="$HOME/.local/state/squad/runs"
+CLAUDE_PROJECTS="$HOME/.claude/projects"
+
+# ---- 日付の解決（BSD/macOS date 前提） -------------------------------------
+resolve_date() {
+  case "$1" in
+    today)     date +%Y-%m-%d ;;
+    yesterday) date -v-1d +%Y-%m-%d ;;
+    *)         echo "$1" ;;
+  esac
+}
+
+if [ $# -eq 0 ]; then
+  START=$(date -v-1d +%Y-%m-%d); END="$START"
+elif [ $# -eq 1 ]; then
+  START=$(resolve_date "$1"); END="$START"
+else
+  START=$(resolve_date "$1"); END=$(resolve_date "$2")
+fi
+
+START_C="${START//-/}"   # 20260603 形式（squad ディレクトリ名照合用）
+END_C="${END//-/}"
+
+# ---- 既定動作: 全ソースを集めて claude で1つの「やったこと」に統合して出力 -------
+# 収集は同じスクリプトを WHATDID_RAW=1 で再帰呼び出しして得る（内部用、ユーザー向けの
+# オプションではない）。claude が無い時だけ生のソース別リストにフォールバックする。
+if [ -z "${WHATDID_RAW:-}" ]; then
+  if command -v claude >/dev/null 2>&1; then
+    raw=$(WHATDID_RAW=1 "$0" "$START" "$END")
+    if [ "$START" = "$END" ]; then datelabel="$START"; else datelabel="$START 〜 $END"; fi
+    done_items=$(printf '%s\n' "$raw" | claude -p "次は私の1日の作業ログです（コミット/Squadタスク/AI作業ログ/GitHubレビュー/カレンダー予定の寄せ集め）。やったことを日本語の箇条書きに統合してください。ルール: ソース別に分けない。同じチケット番号(EAR-xxxx)・PR番号・機能に関する項目は1つにまとめる。各項目は何をしたかが分かる簡潔な一文で、行頭は '- '。レビューは「PRレビューN件」のように集約。MTG/1on1も1項目として含める。前置き・解説・見出し・コードブロックは一切不要、箇条書きの行だけを出力。")
+    report=$(printf '【やったこと】(%s)\n%s\n※ なお、slackでの相談や議論はリストアップできていない\n\n【やること】\n- 仕事しながら対応\n\n【困ってること】\n- なし' \
+      "$datelabel" "$done_items")
+    printf '%s\n' "$report"
+    # Slack Webhook があれば常に投稿する
+    wh="$HOME/.config/whatdid/slack_webhook"
+    if [ -f "$wh" ]; then
+      url=$(cat "$wh")
+      payload=$(printf '%s' "$report" | python3 -c 'import json,sys; print(json.dumps({"text": sys.stdin.read()}))')
+      if curl -fsS -X POST -H 'Content-type: application/json' --data "$payload" "$url" >/dev/null 2>&1; then
+        echo "→ Slack へ投稿しました"
+      else
+        echo "→ Slack 投稿に失敗（~/.config/whatdid/slack_webhook を確認）" >&2
+      fi
+    fi
+    exit 0
+  fi
+  # claude が無ければそのまま生リストを出す（フォールバック）
+fi
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+
+echo
+if [ "$START" = "$END" ]; then bold "📋 やったこと  ($START)"; else bold "📋 やったこと  ($START 〜 $END)"; fi
+
+# ---- 1) Git コミット --------------------------------------------------------
+echo
+bold "── コミット ──"
+found_commit=0
+while IFS= read -r gitdir; do
+  repo=$(dirname "$gitdir")
+  name=$(basename "$repo")
+  out=$(git -C "$repo" log --all --no-merges \
+          --since="$START 00:00" --until="$END 23:59:59" \
+          --pretty=format:"%cd|%an|%s" --date=format:'%m/%d %H:%M' 2>/dev/null \
+        | grep -iE "\|($AUTHOR_RE)\|" \
+        | awk -F'|' '!seen[$3]++ {printf "  %s  [%s] %s\n", $1, "'"$name"'", $3}')
+  if [ -n "$out" ]; then echo "$out"; found_commit=1; fi
+done < <(find "$REPOS_ROOT" -maxdepth 2 -name .git -type d 2>/dev/null)
+[ "$found_commit" -eq 0 ] && echo "  (なし)"
+
+# ---- 2) Squad セッション（タイトル） ----------------------------------------
+echo
+bold "── Squad セッション ──"
+squad_out=""
+if [ -d "$SQUAD_RUNS" ]; then
+  for d in "$SQUAD_RUNS"/*/; do
+    base=$(basename "$d")
+    pref="${base%%-*}"                       # 先頭の YYYYMMDD
+    [[ "$pref" =~ ^[0-9]{8}$ ]] || continue
+    if [[ "$pref" < "$START_C" || "$pref" > "$END_C" ]]; then continue; fi
+    title=""
+    [ -f "$d/title.txt" ] && title=$(head -1 "$d/title.txt")
+    [ -z "$title" ] && [ -f "$d/new-title.txt" ] && title=$(head -1 "$d/new-title.txt")
+    [ -z "$title" ] && continue
+    squad_out+="  ${pref:4:2}/${pref:6:2}  $title"$'\n'
+  done
+fi
+squad_out=$(printf '%s' "$squad_out" | sort -u)
+if [ -n "$squad_out" ]; then echo "$squad_out"; else echo "  (なし)"; fi
+
+# ---- 3) Claude 会話セッション（各セッション最初の依頼文 = やったことの種） ----
+echo
+bold "── Claude セッション（依頼の冒頭）──"
+START="$START" END="$END" CLAUDE_PROJECTS="$CLAUDE_PROJECTS" python3 - <<'PY'
+import json, os, glob
+from datetime import datetime, timezone, timedelta
+JST = timezone(timedelta(hours=9))
+start = os.environ["START"]; end = os.environ["END"]
+root = os.environ["CLAUDE_PROJECTS"]
+rows = []
+for f in glob.glob(os.path.join(root, "*", "*.jsonl")):
+    if "/subagents/" in f:
+        continue
+    first = None
+    try:
+        for line in open(f, encoding="utf-8"):
+            try: o = json.loads(line)
+            except: continue
+            if o.get("type") != "user":
+                continue
+            ts = o.get("timestamp", "")
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(JST)
+            except:
+                continue
+            d = dt.date().isoformat()
+            if d < start or d > end:
+                continue
+            m = o.get("message", {})
+            c = m.get("content", "")
+            if isinstance(c, list):
+                txt = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+            else:
+                txt = c or ""
+            txt = txt.strip().replace("\n", " ")
+            # ツール結果やシステム的な行はスキップ
+            if not txt or txt.startswith("<") or txt.startswith("[{"):
+                continue
+            first = (dt, txt)
+            break  # そのセッション最初の人間依頼だけ
+    except Exception:
+        continue
+    if first:
+        rows.append(first)
+rows.sort(key=lambda r: r[0])
+if not rows:
+    print("  (なし)")
+for dt, txt in rows:
+    print(f"  {dt:%m/%d %H:%M}  {txt[:110]}")
+PY
+
+# ---- 4) GitHub で自分が提出したレビュー -------------------------------------
+echo
+bold "── レビュー (GitHub) ──"
+if ! command -v gh >/dev/null 2>&1; then
+  echo "  (gh 未インストール)"
+elif ! gh auth status >/dev/null 2>&1; then
+  echo "  (gh 未認証: gh auth login)"
+else
+  ME=$(gh api user --jq '.login' 2>/dev/null); ME="${ME:-$GH_USER}"
+  rev_out=$(ME="$ME" START="$START" END="$END" python3 - <<'PY'
+import subprocess, json, os
+from datetime import datetime, timedelta, timezone
+ME=os.environ["ME"]; START=os.environ["START"]; END=os.environ["END"]
+JST=timezone(timedelta(hours=9))
+lo=datetime.fromisoformat(START).replace(tzinfo=JST)
+hi=(datetime.fromisoformat(END)+timedelta(days=1)).replace(tzinfo=JST)
+def gh(*a):
+    return subprocess.run(["gh",*a], capture_output=True, text=True).stdout
+cands=json.loads(gh("search","prs","--owner","X-Mile","--reviewed-by",ME,
+                    "--updated",f">={START}","--limit","80",
+                    "--json","number,repository,title") or "[]")
+agg={}
+for c in cands:
+    repo=c["repository"]["nameWithOwner"]; num=c["number"]; title=c["title"]
+    for r in json.loads(gh("api",f"repos/{repo}/pulls/{num}/reviews") or "[]"):
+        if (r.get("user") or {}).get("login")!=ME: continue
+        sa=r.get("submitted_at")
+        if not sa: continue
+        t=datetime.fromisoformat(sa.replace("Z","+00:00"))
+        if lo<=t<hi:
+            agg.setdefault((repo,num,title),[]).append((t, r.get("state","")))
+rows=[]
+for (repo,num,title),items in agg.items():
+    items.sort(); t0=items[0][0]; states={s for _,s in items}
+    st=("APPROVED" if "APPROVED" in states
+        else "CHANGES_REQUESTED" if "CHANGES_REQUESTED" in states
+        else items[-1][1])
+    short={"APPROVED":"承認","CHANGES_REQUESTED":"要修正","COMMENTED":"コメント","DISMISSED":"取消"}.get(st,st)
+    rows.append((t0, f"  {t0.astimezone(JST):%m/%d %H:%M}  [{short}] {repo.split('/')[-1]} #{num} {title[:55]}"))
+for _,line in sorted(rows):
+    print(line)
+PY
+)
+  if [ -z "$(printf '%s' "$rev_out" | tr -d '[:space:]')" ]; then
+    echo "  (なし)"
+  else
+    printf '%s\n' "$rev_out"
+  fi
+fi
+
+# ---- 5) 予定（macOS カレンダー.app のローカルDBを直読み = 権限プロンプト不要）--
+# Calendar.sqlitedb はファイル権限的に本人が読める。EventKit(TCC)を経由しないので
+# tmux 下でも許可ダイアログ不要。日時は Core Data 基準(2001-01-01)なので +978307200 で unix へ。
+echo
+bold "── 予定 (カレンダー) ──"
+DB="$HOME/Library/Calendars/Calendar.sqlitedb"
+MYCAL="hoshino.keisuke@xmile.co.jp"   # 表示対象カレンダー名（変えたければここ）
+CAL_EXCLUDE="Lunch break|NO MTG"      # これらを含む予定は非表示（| 区切りで追加可）
+if [ ! -f "$DB" ]; then
+  echo "  (カレンダーDB未検出: Macのカレンダー.appに $MYCAL を追加してください)"
+elif ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "  (sqlite3 が見つかりません)"
+else
+  # 材料化済みイベント + 週次繰り返しルールの展開（移動/削除回は例外除外）を Python で。
+  cal_out=$(DB="$DB" START="$START" END="$END" MYCAL="$MYCAL" CAL_EXCLUDE="$CAL_EXCLUDE" python3 - <<'PY'
+import sqlite3, os
+from datetime import datetime, timedelta, date
+DB=os.environ["DB"]; START=os.environ["START"]; END=os.environ["END"]; MYCAL=os.environ["MYCAL"]
+EXCLUDE=[w for w in os.environ.get("CAL_EXCLUDE","").split("|") if w]
+COCOA=978307200  # Core Data(2001-01-01) -> unix
+start_d=date.fromisoformat(START); end_d=date.fromisoformat(END)
+con=sqlite3.connect(f"file:{DB}?mode=ro", uri=True); cur=con.cursor()
+cal_ids=[r[0] for r in cur.execute("SELECT ROWID FROM Calendar WHERE title=?", (MYCAL,))]
+if not cal_ids:
+    print("  (対象カレンダーなし: %s)" % MYCAL); raise SystemExit
+ph=",".join("?"*len(cal_ids))
+local=lambda ts: datetime.fromtimestamp(ts+COCOA)
+cs=datetime.combine(start_d, datetime.min.time()).timestamp()-COCOA
+ce=datetime.combine(end_d, datetime.max.time()).timestamp()-COCOA
+events={}
+# 1) 範囲内に start_date を持つ実体（単発 + 材料化済み繰り返し回）
+for sd, ad, summ in cur.execute(
+    f"""SELECT start_date, all_day, summary FROM CalendarItem
+        WHERE calendar_id IN ({ph}) AND start_date BETWEEN ? AND ?
+              AND summary IS NOT NULL""", (*cal_ids, cs, ce)):
+    dt=local(sd); events[(dt.strftime("%Y%m%d%H%M"), summ)]=(dt, ad, summ)
+# 2) 例外（移動/削除された個別回）= (master, 元の日) を展開から除外
+exceptions=set()
+for oid, od in cur.execute(
+    "SELECT orig_item_id, orig_date FROM CalendarItem WHERE orig_item_id IS NOT NULL AND orig_date IS NOT NULL"):
+    if od: exceptions.add((oid, local(od).date()))
+# 3) 週次ルールを範囲内へ展開
+WD={"SU":6,"MO":0,"TU":1,"WE":2,"TH":3,"FR":4,"SA":5}
+for owner, freq, interval, spec, rend, mstart, ad, summ in cur.execute(
+    f"""SELECT r.owner_id, r.frequency, r.interval, r.specifier, r.end_date,
+               ci.start_date, ci.all_day, ci.summary
+        FROM Recurrence r JOIN CalendarItem ci ON ci.ROWID=r.owner_id
+        WHERE ci.calendar_id IN ({ph})""", tuple(cal_ids)):
+    if freq!=2: continue            # weekly のみ（月次=祝日等は対象外）
+    interval=interval or 1; mdt=local(mstart)
+    if spec and "D=" in spec:
+        days={WD[t[-2:]] for t in spec.split("D=",1)[1].split(";")[0].split(",") if t[-2:] in WD}
+    else:
+        days={mdt.weekday()}
+    rend_d=local(rend).date() if rend else None
+    base_mon=mdt.date()-timedelta(days=mdt.date().weekday())
+    d=start_d
+    while d<=end_d:
+        if d.weekday() in days and d>=mdt.date() and (rend_d is None or d<=rend_d):
+            if ((d-timedelta(days=d.weekday()))-base_mon).days//7 % interval==0 and (owner,d) not in exceptions:
+                dt=datetime.combine(d, mdt.time())
+                events.setdefault((dt.strftime("%Y%m%d%H%M"), summ), (dt, ad, summ))
+        d+=timedelta(days=1)
+for dt, ad, summ in sorted(events.values(), key=lambda x: x[0]):
+    if any(w in summ for w in EXCLUDE): continue
+    label=dt.strftime("%m/%d")+(" 終日" if ad else dt.strftime(" %H:%M"))
+    print(f"  {label}  {summ}")
+PY
+)
+  if [ -z "$(printf '%s' "$cal_out" | tr -d '[:space:]')" ]; then
+    echo "  (予定なし)"
+  else
+    printf '%s\n' "$cal_out"
+  fi
+fi
+echo

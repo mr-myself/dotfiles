@@ -535,8 +535,28 @@ set -euo pipefail
 WORKDIR="$1"
 PROMPT_FILE="$2"
 SESSION_ID="$3"
+GUARD_BIN="$(dirname "$PROMPT_FILE")/manager-guard-bin"
 
 cd "$WORKDIR"
+mkdir -p "$GUARD_BIN"
+SQUAD_REAL_TMUX="$(command -v tmux)"
+export SQUAD_REAL_TMUX
+cat > "$GUARD_BIN/tmux" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    kill-server|kill-session|kill-window|kill-pane)
+      printf 'squad: blocked dangerous tmux command: %s\n' "$arg" >&2
+      exit 126
+      ;;
+  esac
+done
+exec "$SQUAD_REAL_TMUX" "$@"
+WRAPPER
+chmod +x "$GUARD_BIN/tmux"
+export PATH="$GUARD_BIN:$PATH"
+
 printf '[%s] Manager session resuming: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SESSION_ID"
 CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 exec claude \
   --dangerously-skip-permissions \
@@ -670,6 +690,7 @@ MODE="$7"
 TITLE_FILE="$8"
 STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
 STDERR_FILE="${RESULT_FILE%.json}.stderr.log"
+GUARD_BIN="${RESULT_FILE%.json}.guard-bin"
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -694,6 +715,25 @@ finish() {
 trap finish EXIT
 
 set_title "running since $(date '+%H:%M:%S')"
+mkdir -p "$GUARD_BIN"
+SQUAD_REAL_TMUX="$(command -v tmux)"
+export SQUAD_REAL_TMUX
+cat > "$GUARD_BIN/tmux" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    kill-server|kill-session|kill-window|kill-pane)
+      printf 'squad: blocked dangerous tmux command: %s\n' "$arg" >&2
+      exit 126
+      ;;
+  esac
+done
+exec "$SQUAD_REAL_TMUX" "$@"
+WRAPPER
+chmod +x "$GUARD_BIN/tmux"
+export PATH="$GUARD_BIN:$PATH"
+
 if [[ "$MODE" == "initial" ]]; then
   SESSION_ARGS=(--session-id "$SESSION_ID")
   log ">>> Coder prompt sent (initial session)."
@@ -703,6 +743,7 @@ else
 fi
 claude -p \
   --dangerously-skip-permissions \
+  --append-system-prompt "Never run 'tmux kill-server' under any circumstances, with or without -L or TMUX_TMPDIR. Never run tmux commands that kill sessions, windows, panes, or servers unless the PO explicitly requests that exact tmux operation. If temporary tmux test servers are created, leave them running and report the cleanup command instead of executing it." \
   "${SESSION_ARGS[@]}" \
   --output-format stream-json \
   --include-partial-messages \
@@ -990,6 +1031,12 @@ worktrees under the repository such as .claude/worktree or .claude/worktrees.
 - ALWAYS follow the full workflow in order.
 - The PO must be able to see agent work in the tmux panes.
 - Use the run-wait helper to wait for completion. NEVER poll with capture-pane.
+- NEVER run tmux kill-server, with or without -L or TMUX_TMPDIR. Do not ask
+  Coder or Advisor to run it either. If a temporary tmux server is created for
+  testing, leave it running and report the cleanup command to PO instead of
+  executing it.
+- NEVER run tmux kill-session, kill-window, or kill-pane unless PO explicitly
+  requests that exact tmux operation. This includes test cleanup commands.
 - After each Coder run, ALWAYS run the RuboCop helper and require exit status 0.
   The helper runs RuboCop autocorrect and verification only on changed
   Rails/Ruby files, never the full repo.
@@ -1047,7 +1094,9 @@ editing. Keep all file writes in the main Coder session, and skip subagents for
 narrow changes. Explicitly prohibit commit, push, force-push, merge, rebase, and
 pull-request creation unless PO requested that specific Git operation. Explicitly
 prohibit creating any additional git worktree, including .claude/worktree or
-.claude/worktrees. Then run:
+.claude/worktrees. Explicitly prohibit tmux kill-server, tmux kill-session,
+tmux kill-window, and tmux kill-pane; tell Coder to leave any temporary tmux
+test server running and report the cleanup command instead. Then run:
 
   tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $CODER_EVENT $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial $SQUAD_DIR/title.txt' Enter
   $SQUAD_DIR/run-wait '$CODER_EVENT' '$SQUAD_DIR/coder-status.txt' '$CODER_PANE' '$WAIT_TIMEOUT_SECONDS' 'Coder'
@@ -1086,8 +1135,9 @@ RuboCop status is 0. Then run:
 
 Write an English request to $SQUAD_DIR/coder-task.txt. Include all must_fix
 findings and require updated tests and RuboCop. Reiterate that Coder must not
-create additional git worktrees and must keep all work in $WORKDIR. Continue the
-exact Coder session:
+create additional git worktrees and must keep all work in $WORKDIR. Reiterate
+that Coder must not run tmux kill-server, tmux kill-session, tmux kill-window,
+or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
 
   tmux send-keys -t $CODER_PANE '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $CODER_EVENT $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume $SQUAD_DIR/title.txt' Enter
   $SQUAD_DIR/run-wait '$CODER_EVENT' '$SQUAD_DIR/coder-status.txt' '$CODER_PANE' '$WAIT_TIMEOUT_SECONDS' 'Coder fix'
@@ -1112,6 +1162,26 @@ PROMPT
 # --- Launch Manager -----------------------------------------------------------
 
 cd "$WORKDIR"
+MANAGER_GUARD_BIN="$SQUAD_DIR/manager-guard-bin"
+mkdir -p "$MANAGER_GUARD_BIN"
+SQUAD_REAL_TMUX="$(command -v tmux)"
+export SQUAD_REAL_TMUX
+cat > "$MANAGER_GUARD_BIN/tmux" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    kill-server|kill-session|kill-window|kill-pane)
+      printf 'squad: blocked dangerous tmux command: %s\n' "$arg" >&2
+      exit 126
+      ;;
+  esac
+done
+exec "$SQUAD_REAL_TMUX" "$@"
+WRAPPER
+chmod +x "$MANAGER_GUARD_BIN/tmux"
+export PATH="$MANAGER_GUARD_BIN:$PATH"
+
 set +e
 printf '[%s] Manager prompt sent for squad: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$SQUAD_TITLE"
 CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude --dangerously-skip-permissions \

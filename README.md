@@ -15,6 +15,9 @@ vim
 zsh
 - ln -s ~/dotfiles/_zshrc ~/.zshrc
 
+local bin
+- mkdir -p ~/.local/bin
+
 takt (global)
 - ln -s ~/mr-myself/setup/dotfiles/_takt ~/.takt
 
@@ -23,6 +26,10 @@ takt (per-project)
 
 squad
 - ln -s ~/mr-myself/setup/dotfiles/squad ~/.local/bin/squad
+- ln -s ~/mr-myself/setup/dotfiles/squad-herdr ~/.local/bin/squad-herdr
+
+whatdid
+- ln -s ~/mr-myself/setup/dotfiles/whatdid ~/.local/bin/whatdid
 
 ## And more
 I recommend you to use 'oh-my-zsh'!
