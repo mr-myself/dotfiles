@@ -1,105 +1,104 @@
-# vet — common review checklist
+# vet 共通レビュー観点
 
-This is the default checklist every `vet` review starts from. Both reviewers are
-required to answer every item as `checked_ok`, `problem_found`, `not_applicable`,
-or `not_checked`, and the consolidated report shows the status of each one.
+`vet` のレビュアー2人が使う共通の観点。**チェックリストではなくレンズ**として使う。
 
-## Format
+各項目は「この角度から変更を見ろ」という指示であって、埋めるべき欄ではない。
+**問題が見つかったときだけ報告する。** 問題がない項目・対象外の項目については、
+確認したことも含めて何も書かない。沈黙が「問題なし」を意味する。
 
-Only lines matching this exact shape are parsed as checklist items:
+前は全45項目それぞれに checked_ok / not_applicable などの状態を書かせていた。
+その結果、実際の指摘3件に対して192行のレポートが出て、うち104行は指摘ではなかった。
+出力の半分以上が「問題ありません」の羅列だった。だからやめた。
 
-    - [ID] A single concrete question a reviewer can answer yes / no / N-A.
+## 形式
 
-The hyphen must be at column 0. `ID` must start with an uppercase letter and may
-contain uppercase letters, digits, `_` and `-`. Every other line — headings,
-blank lines, indented lines, prose like this paragraph — is ignored, so the file
-stays readable for humans. That is also why the example above is indented: it
-documents the format without becoming a checklist item.
+項目として解釈されるのは、次の形の行だけ:
 
-## Project overrides
+    - [ID] 一行の問いかけ
 
-A repository can add `.vet/checklist.md` (or `.review/checklist.md`) to tailor
-the review. It is merged on top of this file:
+ハイフンは行頭（0カラム目）に置くこと。`ID` は英大文字で始まり、英大文字・数字・
+`_`・`-` を含められる。見出し・空行・インデントされた行・この段落のような散文は
+すべて無視される。上の例がインデントしてあるのは、そのためにわざとそうしている。
 
-- Same ID  -> the project's text **replaces** the text below (source becomes
-  `project-override`).
-- New ID   -> **appended** after the common items, in file order.
+## プロジェクト固有の上書き
 
-The merged result is written to the run directory as `checklist.merged.md` and
-`checklist.json`, each item tagged with its source, so a report always shows
-which questions were actually asked and where they came from.
+リポジトリ側に `.vet/checklist.md`（または `.review/checklist.md`）を置くと、
+このファイルの上にマージされる。同じ ID なら本文を差し替え、新しい ID なら末尾に
+追加される。ID を保っているのは、この上書きを効かせ続けるため。
 
-## Correctness
+## 正しさ
 
-- [COR-001] Does the change actually do what the PR description claims it does?
-- [COR-002] Are all edge cases of the new logic handled: empty input, single element, maximum size, zero, and negative values?
-- [COR-003] Are null / nil / undefined values handled everywhere the new code dereferences a value that can be absent?
-- [COR-004] Are off-by-one and boundary conditions correct in every new loop, slice, range, or pagination calculation?
-- [COR-006] If the change touches concurrent or async code, is shared state protected against races, deadlocks, and lost updates?
-- [COR-007] Are time zones, clock skew, and date arithmetic handled correctly wherever the change deals with dates or timestamps?
+- [COR-001] PR の説明どおりの動作を実際にしているか
+- [COR-002] 新ロジックの境界値（空・最大・境界）を扱えているか
+- [COR-003] 新コードが参照する値の null/nil/undefined を扱えているか
 
-## Security and authorization
+## セキュリティ・認可
 
-- [SEC-001] Is an authorization boundary checked on every new or modified endpoint, action, job, and background task?
-- [SEC-002] Can a user reach another tenant's, organization's, or user's data through any new query, parameter, or identifier?
-- [SEC-003] Is all externally supplied input validated and are permitted parameters explicitly allowlisted rather than passed through wholesale?
-- [SEC-004] Is every new database query parameterized, with no string interpolation of user input into SQL, shell, or template code?
-- [SEC-005] Is user-controlled content escaped correctly at each output site (HTML, JSON, CSV, log, shell, redirect URL)?
-- [SEC-006] Are secrets, tokens, passwords, and personal data kept out of source, logs, error messages, and fixtures?
-- [SEC-007] Do new dependencies, or version bumps of existing ones, come from a trusted source and pin a specific version?
+- [SEC-001] 新規/変更の全エンドポイント・ジョブで認可境界を検査しているか
+- [SEC-002] 新しいクエリ・パラメータ・ID から他テナント/他ユーザーのデータに到達できないか
+- [SEC-003] 外部入力を検証し明示的に許可リスト化しているか
+- [SEC-004] 新規の DB/シェル/SQL/テンプレート利用がインジェクションに耐えるか
 
-## Data integrity and migrations
+## データ・マイグレーション
 
-- [DAT-001] Does every migration have a safe, tested rollback path, or is its irreversibility explicitly documented?
-- [DAT-002] Will the migration run without long table locks or downtime at production data volumes?
-- [DAT-003] Are database constraints (not-null, unique, foreign key) kept consistent with the application-level validations?
-- [DAT-004] Is existing data backfilled or defaulted so that rows written before this change remain valid afterwards?
-- [DAT-005] Are operations that must succeed or fail together actually wrapped in a single transaction?
+- [DAT-002] マイグレーションが本番規模で危険なロックやダウンタイムなしに走るか
+- [DAT-003] DB 制約・スキーマ上限・アプリ側バリデーションが一致しているか
 
-## Error handling
+## エラー処理
 
-- [ERR-001] Is every new external call (HTTP, database, queue, filesystem) guarded against failure and timeout?
-- [ERR-002] Are exceptions caught narrowly and handled, rather than swallowed by a bare rescue / catch-all that hides real faults?
-- [ERR-003] Do error messages give the caller enough to act on, without leaking internals, stack traces, or sensitive values?
-- [ERR-004] Are retries bounded, backed off, and safe to repeat (idempotent) for the operation being retried?
+- [ERR-001] 新しい外部呼び出し・DB・キュー・FS 操作が失敗とタイムアウトに備えているか
 
-## Tests
+## テスト
 
-- [TEST-001] Is there a test that fails without this change and passes with it?
-- [TEST-002] Are the edge cases and error paths introduced by this change covered, not just the happy path?
-- [TEST-003] Do the tests assert observable behaviour rather than restating the implementation?
-- [TEST-004] Are the tests deterministic — free of real clocks, real network calls, random values, and inter-test order dependencies?
-- [TEST-006] Were existing tests deleted, skipped, or weakened, and if so is the reason justified in the PR?
+- [TEST-001] この変更がなければ落ち、あれば通るテストがあるか
+- [TEST-002] ハッピーパスだけでなく境界とエラー経路を覆えているか
 
-## Backward compatibility
+## 互換性
 
-- [COMPAT-001] Is every change to a public API, response shape, or event payload backward compatible for existing clients?
-- [COMPAT-002] Are removals and renames staged behind a deprecation path instead of breaking callers immediately?
-- [COMPAT-003] Can the new code and the currently deployed code run side by side during a rolling deploy?
+- [COMPAT-001] 公開 API・レスポンス形・イベント・生成型の変更が後方互換か
 
-## Performance
+## パフォーマンス
 
-- [PERF-001] Does the change introduce an N+1 query or a query inside a loop?
-- [PERF-002] Are new or modified queries supported by an index, and do they avoid full scans on large tables?
-- [PERF-003] Does the change load an unbounded collection into memory instead of paginating or streaming?
-- [PERF-004] Is work that does not need to block the request moved to a background job?
+- [PERF-001] N+1 やループ内クエリを持ち込んでいないか
+- [PERF-002] 変更クエリがインデックスに乗り、大テーブルの全走査を避けているか
+- [PERF-003] 大量データでの LIMIT/OFFSET、重い集計、無制限ロードなど、本番規模で遅くなるパターンを持ち込んでいないか
 
-## Observability
+## 結線
 
-- [OBS-001] Can this change be diagnosed in production from logs, metrics, or traces alone?
-- [OBS-002] Do new log lines carry enough correlating context (request id, tenant, entity id) without logging sensitive data?
-- [OBS-003] Are new failure modes surfaced to monitoring rather than failing silently?
+- [INTEG-001] バックエンド・API・データ構造の変更が、それを消費する UI や呼び出し側まで実際に配線されているか（生成物やサーバ側だけで止まっていないか）
 
-## Maintainability
+## 45 項目から外した ID
 
-- [MNT-001] Is the change consistent with the surrounding code's existing patterns, naming, and structure?
-- [MNT-002] Do names describe intent accurately, so a reader does not have to read the body to know what something does?
-- [MNT-003] Is duplicated logic factored out where it genuinely repeats, without inventing premature abstraction?
-- [MNT-004] Are comments explaining *why* present where the code is non-obvious, and are stale comments updated?
-- [MNT-005] Is dead code, debug output, commented-out code, and leftover scaffolding removed?
+外した観点は下に残しておく。ID は再利用しない。必要になったら
+プロジェクト側の `.vet/checklist.md` に同じ ID で書けば復活する。
+（この節の行はインデントしてあるので、項目としては解釈されない）
 
-## Documentation and operations
-
-- [DOC-001] Are user-facing or developer-facing docs updated to match the behaviour this PR changes?
-- [OPS-001] Are new configuration values and environment variables documented, with sane defaults and a clear failure mode when missing?
-- [OPS-002] Does this change require a deploy-order, migration-order, or manual operational step that is written down?
+    COR-004  ループ/スライス/範囲/ページングの off-by-one
+    COR-006  並行・非同期の共有状態、競合・デッドロック・ロストアップデート
+    COR-007  タイムゾーン・クロックスキュー・日付演算
+    SEC-005  出力箇所ごとのエスケープ（HTML/JSON/CSV/ログ/シェル/リダイレクト）
+    SEC-006  秘密情報がソース・ログ・エラー・フィクスチャに混ざっていないか
+    SEC-007  新規依存やバージョン更新の出所とピン留め
+    DAT-001  マイグレーションのロールバック手段
+    DAT-004  既存データのバックフィル・デフォルト
+    DAT-005  同時に成功/失敗すべき操作のトランザクション
+    ERR-002  例外を握りつぶしていないか
+    ERR-003  エラーメッセージの情報量と内部情報の漏れ
+    ERR-004  リトライの上限・バックオフ・冪等性
+    TEST-003 実装の写経ではなく観測可能な振る舞いを検証しているか
+    TEST-004 テストの決定性（実時計・実ネットワーク・乱数・順序依存）
+    TEST-006 既存テストの削除・skip・弱体化
+    COMPAT-002 削除・改名の段階的な非推奨経路
+    COMPAT-003 ローリングデプロイ中の新旧同居
+    PERF-004 リクエストを塞がない処理のバックグラウンド化
+    OBS-001  ログ・メトリクス・トレースだけで本番の障害を診断できるか
+    OBS-002  ログの相関情報と機微情報の扱い
+    OBS-003  新しい失敗経路が監視に出るか
+    MNT-001  周辺コードのパターン・命名・構造との一貫性
+    MNT-002  名前が意図を表しているか
+    MNT-003  重複ロジックの括り出し
+    MNT-004  なぜを説明するコメント、陳腐化したコメント
+    MNT-005  デッドコード・デバッグ出力・コメントアウト・残骸
+    DOC-001  ドキュメントの追随
+    OPS-001  新しい設定値・環境変数の文書化とデフォルト
+    OPS-002  デプロイ順・マイグレーション順・手作業の手順

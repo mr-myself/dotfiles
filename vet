@@ -23,12 +23,14 @@ Usage: vet <pr-number>
        vet list
        vet close [run-id]
        vet resume [run-id]
+       vet render [run-id]
        vet rm <run-id>...
        vet clean
 
-Review a GitHub Pull Request with two independent AI reviewers that first read a
-pre-defined review checklist, then produce one consolidated, paste-ready
-Markdown report. vet never edits code and never posts to GitHub on its own.
+Review a GitHub Pull Request with two independent AI reviewers that look at it
+through a pre-defined checklist of review lenses, then produce one consolidated
+report.html you can read and copy findings out of. vet never edits code and
+never posts to GitHub on its own.
 
 Examples:
   vet 1234
@@ -36,9 +38,9 @@ Examples:
 
 Options:
   --allow-empty-checklist  Proceed even when no checklist item could be found.
-                           The report is marked as having limited coverage.
+                           The report says so prominently.
   --include-closed         Review a closed or merged PR (refused by default).
-  --open                   Reveal the finished report in Finder (macOS).
+  --open                   Open the finished report.html (macOS).
   --dry-run                Wiring check. Build the worktree, checklist merge,
                            context, prompts, schemas and helpers, but do NOT
                            launch any agent and do NOT split panes outside tmux.
@@ -52,7 +54,11 @@ Lifecycle:
   vet close              Close the run for the current tmux window.
   vet close <run-id>     Close a run from another tmux window.
   vet resume             Resume the most recent retained run.
-  vet resume <run-id>    Resume a specific run.
+  vet resume <run-id>    Resume a specific run. Validates the Manager's JSON
+                         and renders the report when the Manager exits.
+  vet render [run-id]    Re-render report.html from that run's consolidated.json.
+                         Use after fixing the JSON by hand; refuses to render
+                         anything that does not match the schema.
   vet rm <run-id>...     Delete closed runs: worktree and artifacts.
   vet clean              Delete ALL runs that are not running (asks first).
 
@@ -93,6 +99,336 @@ script_real_path() {
 }
 VET_SCRIPT_PATH="$(script_real_path)"
 VET_SCRIPT_DIR="$(dirname "$VET_SCRIPT_PATH")"
+
+# --- shared schema validator ---------------------------------------------------
+#
+# ONE implementation, used in three places: vet's own gate on the Manager's
+# consolidated JSON, the `vet render` subcommand, and the generated
+# validate-json helper that the reviewer helpers call from inside their panes.
+# Keeping it in a single variable is what stops those three from drifting apart.
+#
+# It walks the schema file itself rather than hard-coding its rules, and covers
+# exactly the JSON Schema subset these schemas use: type, required, enum,
+# additionalProperties:false, object properties and array items.
+read -r -d '' VET_VALIDATOR_JQ <<'JQPROG' || true
+def check($schema; $v; $path):
+  ( ($schema.type) as $t
+    | if $t == null then empty
+      elif $t == "object"  then (if ($v|type) != "object"  then "\($path): expected object, got \($v|type)"  else empty end)
+      elif $t == "array"   then (if ($v|type) != "array"   then "\($path): expected array, got \($v|type)"   else empty end)
+      elif $t == "string"  then (if ($v|type) != "string"  then "\($path): expected string, got \($v|type)"  else empty end)
+      elif $t == "boolean" then (if ($v|type) != "boolean" then "\($path): expected boolean, got \($v|type)" else empty end)
+      elif $t == "integer" then (if (($v|type) != "number") or (($v|floor) != $v) then "\($path): expected integer, got \($v|type)" else empty end)
+      elif $t == "number"  then (if ($v|type) != "number"  then "\($path): expected number, got \($v|type)"  else empty end)
+      else empty end ),
+  ( if ($schema.enum != null) and (($schema.enum | index($v)) == null)
+    then "\($path): \($v|tojson) is not one of: \($schema.enum | join(", "))"
+    else empty end ),
+  ( if ($schema.type == "object") and (($v|type) == "object")
+    then
+      ( (($schema.required // []) - ($v|keys)) | .[] | "\($path): missing required key \"\(.)\"" ),
+      ( if ($schema.additionalProperties == false)
+        then ((($v|keys) - (($schema.properties // {}) | keys)) | .[] | "\($path): unexpected key \"\(.)\"")
+        else empty end ),
+      ( ($schema.properties // {}) | to_entries[]
+        | . as $p
+        | if ($v | has($p.key))
+          then check($p.value; $v[$p.key]; (if $path == "(root)" then $p.key else "\($path).\($p.key)" end))
+          else empty end )
+    else empty end ),
+  ( if ($schema.type == "array") and (($v|type) == "array") and ($schema.items != null)
+    then ( range(0; ($v|length)) as $i | check($schema.items; $v[$i]; "\($path)[\($i)]") )
+    else empty end );
+
+[ check($schema[0]; .; "(root)") ] | .[]
+JQPROG
+
+# --- consolidated JSON validation ---------------------------------------------
+#
+# The Manager is the ONE agent whose output nothing enforces. The reviewers run
+# under `claude --json-schema` / `codex --output-schema`, but the Manager just
+# writes a file. If it writes JSON that PARSES but does not match the schema -
+# omits findings, misspells a severity, drops sources - a bare `jq -e .` check
+# passes and the renderer silently produces a page with no findings.
+#
+# That is the worst failure this tool can have: the PO opens report.html, reads
+# "must_fix 0", and merges a PR believing it was reviewed. Refusing to render is
+# strictly better than rendering a clean-looking lie, so validation is a hard
+# gate, and a partial render is never offered - half a report shown as if whole
+# is the same trap.
+#
+# The checker is driven by the schema file itself rather than a hand-written
+# copy of its rules, so the two cannot drift apart.
+validate_against_schema() {
+  local data="$1" schema="$2" problems=""
+
+  if [[ ! -s "$data" ]]; then
+    echo "  the file is empty" >&2
+    return 1
+  fi
+  # `jq empty` tests parsing ONLY. `jq -e .` would be wrong here: it exits 1 for
+  # a document that is literally `null`, which parses fine and deserves the
+  # precise "expected object, got null" from the schema walk below.
+  if ! jq empty "$data" >/dev/null 2>&1; then
+    echo "  not valid JSON (truncated or malformed):" >&2
+    { jq empty "$data" 2>&1 || true; } | head -3 | sed 's/^/    /' >&2
+    return 1
+  fi
+
+  problems="$(jq -r --slurpfile schema "$schema" "$VET_VALIDATOR_JQ" "$data")" || {
+    echo "  the validator itself failed to run against $schema" >&2
+    return 1
+  }
+
+  [[ -z "$problems" ]] && return 0
+  printf '%s\n' "$problems" | sed 's/^/  /' >&2
+  return 1
+}
+
+# --- report.html renderer -----------------------------------------------------
+#
+# vet renders the report, NOT the Manager. The Manager produces consolidated JSON
+# validated against consolidated-schema.json; this turns it into one
+# self-contained HTML file. Rendering deterministically means the markup cannot
+# drift, the clipboard payload is exactly right every time, and the whole thing
+# can be developed and checked with --dry-run without spending an agent run.
+#
+# ESCAPING: every string that reaches the page comes from the PR or from a model
+# and is therefore untrusted. jq's @html escapes < > & ' " so it is safe both in
+# element text and inside a double-quoted attribute. The clipboard markdown rides
+# in a data-md attribute rather than a <script> block on purpose: HTML entities
+# are decoded in attribute values, but NOT inside <script>, so a finding
+# containing </script> would break out of the latter.
+render_report_html() {
+  local src="$1" out="$2"
+  jq -r \
+    --arg pr_number "$PR_NUMBER" \
+    --arg pr_title "$PR_TITLE" \
+    --arg pr_url "$PR_URL" \
+    --arg head_oid "$HEAD_OID" \
+    --arg repo_spec "$REPO_SPEC" \
+    --arg checklist_common "${COMMON_CHECKLIST:-$COMMON_CHECKLIST_SOURCE}" \
+    --arg checklist_project "$PROJECT_CHECKLIST_SOURCE" \
+    --arg checklist_count "$CHECKLIST_COUNT" \
+    --arg truncated "${CONTEXT_TRUNCATED:-false}" \
+    --arg generated "$(date '+%Y-%m-%d %H:%M:%S')" \
+    -f /dev/stdin "$src" > "$out" <<'JQPROG'
+def esc: if . == null then "" else (tostring | @html) end;
+
+# Paste-ready GitHub comment for one finding. Raw markdown here; the caller
+# escapes it for the attribute.
+def md($f):
+  "**[" + ($f.severity // "") + "] " + ($f.title // "") + "**"
+  + (if (($f.checklist_ids // []) | length) > 0
+     then "  (" + (($f.checklist_ids // []) | join(", ")) + ")" else "" end)
+  + "\n\n"
+  + (if (($f.file // "") | length) > 0
+     then "`" + $f.file
+          + (if (($f.line // 0) > 0) then ":" + (($f.line // 0) | tostring) else "" end)
+          + "`\n\n"
+     else "" end)
+  + (($f.body // "") | rtrimstr("\n")) + "\n"
+  + (if (($f.suggestion // "") | length) > 0
+     then "\n```suggestion\n" + (($f.suggestion) | rtrimstr("\n")) + "\n```\n"
+     else "" end);
+
+def loc($f):
+  if (($f.file // "") | length) == 0 then ""
+  else ($f.file | esc)
+       + (if (($f.line // 0) > 0) then ":" + (($f.line // 0) | tostring) else "" end)
+       + (if (($f.line_range // "") | length) > 0 then " (" + ($f.line_range | esc) + ")" else "" end)
+  end;
+
+def finding_html($f):
+  "<article class=\"f sev-" + (($f.severity // "other") | esc) + "\">"
+  + "<h3>" + (($f.title // "(untitled)") | esc) + "</h3>"
+  + "<div class=\"meta\">"
+  + "<span class=\"pill sev\">" + (($f.severity // "") | esc) + "</span>"
+  + (if (($f.category // "") | length) > 0 then "<span class=\"pill\">" + ($f.category | esc) + "</span>" else "" end)
+  + (if (($f.confidence // "") | length) > 0 then "<span class=\"pill\">confidence: " + ($f.confidence | esc) + "</span>" else "" end)
+  + (($f.checklist_ids // []) | map("<span class=\"pill id\">" + esc + "</span>") | join(""))
+  + (if (($f.sources // []) | length) > 0
+     then "<span class=\"pill src\">found by: " + (($f.sources // []) | map(esc) | join(", ")) + "</span>"
+     else "" end)
+  + "</div>"
+  + (if (loc($f) | length) > 0 then "<p class=\"loc\"><code>" + loc($f) + "</code></p>" else "" end)
+  + (if (($f.body // "") | length) > 0 then "<p class=\"body\">" + ($f.body | esc) + "</p>" else "" end)
+  + (if (($f.evidence // "") | length) > 0
+     then "<details class=\"ev\"><summary>evidence</summary><pre><code>" + ($f.evidence | esc) + "</code></pre></details>"
+     else "" end)
+  + (if (($f.suggestion // "") | length) > 0
+     then "<div class=\"sug\"><div class=\"sug-h\">suggested fix</div><pre><code>" + ($f.suggestion | esc) + "</code></pre></div>"
+     else "" end)
+  + "<button class=\"copy\" type=\"button\" data-md=\"" + (md($f) | @html) + "\">Copy as markdown</button>"
+  + "</article>";
+
+def section($title; $sev; $open):
+  ([.findings[]? | select((.severity // "") == $sev)]) as $fs
+  | if ($fs | length) == 0 then "" else
+      "<details class=\"sec\"" + (if $open then " open" else "" end) + ">"
+      + "<summary><span class=\"sev-dot sev-" + $sev + "\"></span>"
+      + $title + " <span class=\"count\">" + (($fs | length) | tostring) + "</span></summary>"
+      + ($fs | map(finding_html(.)) | join(""))
+      + "</details>"
+    end;
+
+def count($sev): [.findings[]? | select((.severity // "") == $sev)] | length;
+
+"<!DOCTYPE html>",
+"<html lang=\"ja\"><head><meta charset=\"utf-8\">",
+"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+"<title>vet #" + ($pr_number | esc) + " " + ($pr_title | esc) + "</title>",
+"<style>",
+":root{color-scheme:light dark;--bg:#fff;--fg:#1a1a1a;--mut:#5a5f66;--line:#d5d9de;--card:#fafbfc;--code:#f3f4f6;--acc:#0969da;--must:#cf222e;--should:#bc4c00;--nit:#6e7781;--quest:#8250df}",
+"@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#9198a1;--line:#30363d;--card:#161b22;--code:#161b22;--acc:#4493f8;--must:#ff7b72;--should:#ffa657;--nit:#8b949e;--quest:#d2a8ff}}",
+"*{box-sizing:border-box}",
+"body{margin:0;padding:2rem 1rem 4rem;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,'Hiragino Sans','Noto Sans JP',sans-serif}",
+"main{max-width:60rem;margin:0 auto}",
+"h1{font-size:1.3rem;margin:0 0 .3rem}",
+"h1 a{color:var(--acc);text-decoration:none}h1 a:hover{text-decoration:underline}",
+"h3{font-size:1.02rem;margin:0 0 .5rem;line-height:1.45}",
+".sub{color:var(--mut);font-size:.87rem;margin:0 0 1.4rem}",
+".counts{display:flex;flex-wrap:wrap;gap:.5rem;margin:0 0 1.8rem}",
+".c{border:1px solid var(--line);border-radius:999px;padding:.28rem .8rem;font-size:.85rem;font-weight:600}",
+".c.zero{opacity:.45;font-weight:400}",
+".c-must{color:var(--must)}.c-should{color:var(--should)}.c-nit{color:var(--nit)}.c-quest{color:var(--quest)}",
+".sec{border:1px solid var(--line);border-radius:10px;margin:0 0 1rem;background:var(--card)}",
+".sec>summary{cursor:pointer;padding:.75rem 1rem;font-weight:600;list-style:none;user-select:none}",
+".sec>summary::-webkit-details-marker{display:none}",
+".sec>summary::before{content:'\\25B8';display:inline-block;margin-right:.5rem;color:var(--mut);transition:transform .15s}",
+".sec[open]>summary::before{transform:rotate(90deg)}",
+".sev-dot{display:inline-block;width:.6rem;height:.6rem;border-radius:50%;margin-right:.45rem;vertical-align:middle}",
+".sev-dot.sev-must_fix{background:var(--must)}.sev-dot.sev-should_fix{background:var(--should)}",
+".sev-dot.sev-nit{background:var(--nit)}.sev-dot.sev-question{background:var(--quest)}",
+".count{color:var(--mut);font-weight:400}",
+".f{border-top:1px solid var(--line);padding:1.1rem 1rem 1.3rem}",
+".meta{display:flex;flex-wrap:wrap;gap:.35rem;margin:0 0 .6rem}",
+".pill{font-size:.73rem;border:1px solid var(--line);border-radius:999px;padding:.1rem .55rem;color:var(--mut)}",
+".pill.sev{font-weight:700;color:var(--fg)}",
+".pill.id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}",
+".loc{margin:.2rem 0 .6rem}",
+"code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em}",
+".loc code{background:var(--code);padding:.15rem .45rem;border-radius:5px}",
+".body{margin:.2rem 0 .7rem;white-space:pre-wrap}",
+"pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:.7rem .85rem;overflow-x:auto;margin:.3rem 0}",
+"pre code{background:none;padding:0}",
+".ev summary{cursor:pointer;color:var(--mut);font-size:.85rem}",
+".sug-h{font-size:.78rem;color:var(--mut);margin-top:.6rem}",
+".copy{margin-top:.85rem;font:inherit;font-size:.83rem;padding:.4rem .9rem;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);cursor:pointer}",
+".copy:hover{border-color:var(--acc);color:var(--acc)}",
+".copy.ok{border-color:#1a7f37;color:#1a7f37}.copy.err{border-color:var(--must);color:var(--must)}",
+".contra{border:1px solid var(--line);border-radius:10px;padding:.4rem 1rem 1rem;margin:0 0 1rem;background:var(--card)}",
+".contra h2{font-size:.95rem;margin:.8rem 0 .5rem}",
+".warn{border:1px solid var(--should);border-radius:10px;padding:.7rem 1rem;margin:0 0 1.2rem;color:var(--should)}",
+".none{color:var(--mut);padding:1.2rem 0}",
+"footer{margin-top:2.5rem;padding-top:1rem;border-top:1px solid var(--line);color:var(--mut);font-size:.8rem}",
+"footer div{margin:.15rem 0}",
+"</style></head><body><main>",
+
+"<h1><a href=\"" + ($pr_url | esc) + "\">#" + ($pr_number | esc) + "</a> " + ($pr_title | esc) + "</h1>",
+"<p class=\"sub\">" + ($repo_spec | esc) + " &middot; reviewed " + ($head_oid[0:12] | esc) + " &middot; " + ($generated | esc) + "</p>",
+
+"<div class=\"counts\">"
++ "<span class=\"c c-must" + (if count("must_fix") == 0 then " zero" else "" end) + "\">must_fix " + (count("must_fix")|tostring) + "</span>"
++ "<span class=\"c c-should" + (if count("should_fix") == 0 then " zero" else "" end) + "\">should_fix " + (count("should_fix")|tostring) + "</span>"
++ "<span class=\"c c-nit" + (if count("nit") == 0 then " zero" else "" end) + "\">nit " + (count("nit")|tostring) + "</span>"
++ "<span class=\"c c-quest" + (if count("question") == 0 then " zero" else "" end) + "\">question " + (count("question")|tostring) + "</span>"
++ "</div>",
+
+# THE BANNER IS VET'S FACT, NOT THE MODEL'S PROSE.
+#
+# It used to fire whenever context_warnings was non-empty. But the reviewers were
+# asked to state explicitly when nothing was truncated, so on every clean run
+# they wrote "Nothing was truncated ..." - a NON-EMPTY array - and the page
+# announced "this review did not see the whole PR": the opposite of what the
+# model said and of what vet knew. A warning that cries wolf on every run trains
+# the reader to ignore it, and then the one genuinely truncated PR looks
+# identical to all the others.
+#
+# $truncated comes from vet's own CONTEXT_TRUNCATED, computed from what vet
+# actually dropped and persisted in state.env so `vet render` agrees. The
+# reviewers' warnings are shown as supporting detail ONLY when vet truncated;
+# a "nothing was truncated" sentence a model volunteers anyway is deliberately
+# ignored, because the footer states scope from vet's own fact either way.
+(if $truncated == "true"
+ then "<div class=\"warn\"><strong>この review は PR 全体を見ていません</strong>"
+      + (if ((.context_warnings // []) | length) > 0
+         then "<div>レビュアーの申告:</div>"
+              + ((.context_warnings // []) | map("<div>" + esc + "</div>") | join(""))
+         else "" end)
+      + "</div>"
+ else "" end),
+
+(if ((.summary // "") | length) > 0 then "<p class=\"body\">" + (.summary | esc) + "</p>" else "" end),
+
+section("must_fix"; "must_fix"; true),
+section("should_fix"; "should_fix"; true),
+section("nit"; "nit"; false),
+section("question"; "question"; false),
+
+(if ((.findings // []) | length) == 0
+ then "<p class=\"none\">指摘なし。チェックリストのどのレンズでも問題は見つかりませんでした。</p>"
+ else "" end),
+
+(if ((.contradictions // []) | length) > 0
+ then "<div class=\"contra\"><h2>2人のレビュアーの見解が割れた点</h2>"
+      + ((.contradictions // []) | map(
+          "<article class=\"f\" style=\"border-top:0;padding-left:0;padding-right:0\">"
+          + "<h3>" + ((.topic // "") | esc) + "</h3>"
+          + "<p class=\"body\"><strong>A:</strong> " + ((.reviewer_a_position // "") | esc) + "</p>"
+          + "<p class=\"body\"><strong>B:</strong> " + ((.reviewer_b_position // "") | esc) + "</p>"
+          + "<p class=\"body\"><strong>結論:</strong> " + ((.resolution // "") | esc) + "</p>"
+          + "</article>") | join(""))
+      + "</div>"
+ else "" end),
+
+"<footer>",
+"<div>checklist: " + ($checklist_common | esc) + " (" + ($checklist_count | esc) + " lenses"
+  + (if ($checklist_project != "none") then ", project: " + ($checklist_project | esc) else "" end)
+  + ")</div>",
+"<div>問題が見つかったレンズ: "
+  + ([.findings[]?.checklist_ids[]?] | unique | length | tostring)
+  + " / " + ($checklist_count | esc) + "</div>",
+(if $truncated == "true"
+ then "<div>スコープ: 一部のみ（上部の警告を参照）</div>"
+ else "<div>スコープ: PR 全体（切り詰めなし）</div>" end),
+"<div>reviewed head: <code>" + ($head_oid | esc) + "</code></div>",
+"<div>vet は GitHub に何も投稿していません。コピーして自分で貼ってください。</div>",
+"</footer>",
+"</main>",
+"<script>",
+"document.addEventListener('click', function (e) {",
+"  var b = e.target.closest ? e.target.closest('.copy') : null;",
+"  if (!b) return;",
+"  var md = b.getAttribute('data-md') || '';",
+"  var done = function (ok) {",
+"    var t = b.textContent;",
+"    b.textContent = ok ? 'Copied' : 'Copy failed - select manually';",
+"    b.className = 'copy ' + (ok ? 'ok' : 'err');",
+"    setTimeout(function () { b.textContent = 'Copy as markdown'; b.className = 'copy'; }, 2000);",
+"  };",
+"  var fallback = function () {",
+"    try {",
+"      var ta = document.createElement('textarea');",
+"      ta.value = md;",
+"      ta.setAttribute('readonly', '');",
+"      ta.style.position = 'fixed';",
+"      ta.style.top = '-1000px';",
+"      document.body.appendChild(ta);",
+"      ta.select();",
+"      var ok = document.execCommand('copy');",
+"      document.body.removeChild(ta);",
+"      done(ok);",
+"    } catch (err) { done(false); }",
+"  };",
+"  if (navigator.clipboard && navigator.clipboard.writeText) {",
+"    navigator.clipboard.writeText(md).then(function () { done(true); }, fallback);",
+"  } else { fallback(); }",
+"});",
+"</script>",
+"</body></html>"
+JQPROG
+}
 
 # --- Run state ----------------------------------------------------------------
 
@@ -146,6 +482,17 @@ write_state() {
     printf 'WORKDIR=%q\n' "$WORKDIR"
     printf 'VET_DIR=%q\n' "$VET_DIR"
     printf 'REPORT_PATH=%q\n' "${REPORT_PATH:-}"
+    printf 'CONSOLIDATED_PATH=%q\n' "${CONSOLIDATED_PATH:-}"
+    # Needed so `vet render` can re-render this run later without re-deriving
+    # anything from the PR.
+    printf 'CHECKLIST_COUNT=%q\n' "${CHECKLIST_COUNT:-0}"
+    printf 'COMMON_CHECKLIST=%q\n' "${COMMON_CHECKLIST:-}"
+    printf 'COMMON_CHECKLIST_SOURCE=%q\n' "${COMMON_CHECKLIST_SOURCE:-none}"
+    printf 'PROJECT_CHECKLIST_SOURCE=%q\n' "${PROJECT_CHECKLIST_SOURCE:-none}"
+    # vet's OWN verdict on whether it truncated the PR. The report's
+    # partial-review banner is driven by this, never by model prose, so a
+    # standalone `vet render` must reach the identical conclusion.
+    printf 'CONTEXT_TRUNCATED=%q\n' "${CONTEXT_TRUNCATED:-false}"
     printf 'WINDOW_SHORT_NAME=%q\n' "${WINDOW_SHORT_NAME:-vet}"
     printf 'MANAGER_SESSION_ID=%q\n' "${MANAGER_SESSION_ID:-}"
     printf 'REVIEWER_A_SESSION_ID=%q\n' "${REVIEWER_A_SESSION_ID:-}"
@@ -285,6 +632,71 @@ RUNSTEP
   chmod +x "$VET_DIR/run-step"
 }
 
+# Re-render report.html for an existing run from its consolidated.json.
+#
+# This exists because the validation gate has to give the PO a way FORWARD. If
+# the Manager's JSON is rejected, they can fix that file - by hand, or by having
+# the Manager rewrite it - and turn it into a report without paying for another
+# agent session. It is also what makes the gate's own error message honest: the
+# command it prints actually works.
+render_run() {
+  # An EXPLICIT run-id must match exactly. load_run's default is to fall back to
+  # the most recent run when the id does not resolve, which for render would
+  # quietly hand the PO a different run's report after a typo. Only the no-arg
+  # form is allowed to pick the current window's run or the latest.
+  if [[ -n "${1:-}" ]]; then
+    load_run "$1" false
+  else
+    load_run "" true
+  fi
+  local consolidated="${CONSOLIDATED_PATH:-$VET_DIR/consolidated.json}"
+  local schema="$VET_DIR/consolidated-schema.json"
+  REPORT_PATH="${REPORT_PATH:-$VET_DIR/report.html}"
+
+  [[ -f "$consolidated" ]] || {
+    echo "Error: this run has no consolidated JSON to render:" >&2
+    printf '       %s\n' "$consolidated" >&2
+    echo "       The Manager writes that file. Resume it with: vet resume $RUN_ID" >&2
+    exit 1
+  }
+  [[ -f "$schema" ]] || {
+    echo "Error: this run has no consolidated-schema.json, so it cannot be" >&2
+    echo "       validated. It predates the validation gate." >&2
+    exit 1
+  }
+
+  # Older runs predate these state fields; the renderer needs them to exist.
+  # Read from state.env via load_run. Runs that predate this field default to
+  # false: claiming a full review is wrong, but so is inventing a truncation
+  # warning we have no evidence for, and the footer still states the scope.
+  CONTEXT_TRUNCATED="${CONTEXT_TRUNCATED:-false}"
+  CHECKLIST_COUNT="${CHECKLIST_COUNT:-0}"
+  COMMON_CHECKLIST="${COMMON_CHECKLIST:-}"
+  COMMON_CHECKLIST_SOURCE="${COMMON_CHECKLIST_SOURCE:-none}"
+  PROJECT_CHECKLIST_SOURCE="${PROJECT_CHECKLIST_SOURCE:-none}"
+
+  if ! validate_against_schema "$consolidated" "$schema"; then
+    echo "" >&2
+    echo "Error: that consolidated JSON does not match the schema (above)." >&2
+    echo "NOTHING WAS RENDERED - a report is not shown rather than shown wrong." >&2
+    echo "" >&2
+    printf 'Edit it:   %s\n' "$consolidated" >&2
+    printf 'Against:   %s\n' "$schema" >&2
+    printf 'Then:      vet render %s\n' "$RUN_ID" >&2
+    exit 1
+  fi
+
+  render_report_html "$consolidated" "$REPORT_PATH"
+  printf 'must_fix %s / should_fix %s / nit %s / question %s\n' \
+    "$(jq '[.findings[]?|select(.severity=="must_fix")]|length' "$consolidated")" \
+    "$(jq '[.findings[]?|select(.severity=="should_fix")]|length' "$consolidated")" \
+    "$(jq '[.findings[]?|select(.severity=="nit")]|length' "$consolidated")" \
+    "$(jq '[.findings[]?|select(.severity=="question")]|length' "$consolidated")"
+  echo ""
+  echo "Report (cmd+click to open):"
+  printf '%s\n' "$REPORT_PATH"
+}
+
 window_exists() {
   local target_window_id="${1:-}"
   [[ -n "$target_window_id" ]] || return 1
@@ -393,7 +805,18 @@ resume_run() {
     exit 1
   fi
 
-  load_run "${1:-}"
+  # An EXPLICIT run-id must match exactly. load_run's default is to fall back to
+  # the most recent run when the id does not resolve, which here would resume a
+  # DIFFERENT run - possibly one from another PR - and look like it worked. That
+  # matters because vet's own validation-failure message tells the PO to run
+  # `vet resume <run-id>` with a long timestamp id, at exactly the moment they
+  # are retyping it by hand. Only the no-arg form may resolve to the current
+  # window's run, then the latest.
+  if [[ -n "${1:-}" ]]; then
+    load_run "$1" false
+  else
+    load_run "" true
+  fi
   [[ -d "$WORKDIR" ]] || {
     echo "Error: vet PR worktree no longer exists: $WORKDIR" >&2
     exit 1
@@ -485,6 +908,10 @@ case "$1" in
     ;;
   clean)
     clean_runs
+    exit 0
+    ;;
+  render)
+    render_run "${2:-}"
     exit 0
     ;;
   resume)
@@ -642,7 +1069,9 @@ STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
 REPO_NAME="$(basename "$REPO_ROOT")"
 VET_DIR="$VET_RUN_ROOT/$RUN_ID"
 WORKDIR="$VET_WORKTREE_ROOT/$REPO_NAME-pr$PR_NUMBER-$RUN_ID"
-REPORT_PATH="$VET_DIR/report.md"
+REPORT_PATH="$VET_DIR/report.html"
+# The Manager produces this; vet renders REPORT_PATH from it deterministically.
+CONSOLIDATED_PATH="$VET_DIR/consolidated.json"
 MANAGER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 REVIEWER_A_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
@@ -918,12 +1347,12 @@ and for a project checklist inside the PR worktree:
 Create one with bullets shaped like:
   - [SEC-001] Are authorization boundaries checked on every new endpoint?
 
-Or pass --allow-empty-checklist to review without one (coverage will be limited,
-and the report will say so).
+Or pass --allow-empty-checklist to review without one (the reviewers will have
+no lenses to look through, and the report will say so).
 EOF
     exit 1
   fi
-  EMPTY_CHECKLIST_WARNING="NO REVIEW CHECKLIST WAS FOUND. This review ran with --allow-empty-checklist, so its coverage is LIMITED and unstructured: no checklist item was verified. The report must state this prominently at the top."
+  EMPTY_CHECKLIST_WARNING="NO REVIEW CHECKLIST WAS FOUND. This review ran with --allow-empty-checklist, so the reviewers had no lenses to look through and the review is unstructured. The report must state this prominently at the top."
 else
   EMPTY_CHECKLIST_WARNING=""
 fi
@@ -1197,6 +1626,36 @@ printf 'VET-SANDBOX-OK %s\n' "$RUN_ID" > "$VET_DIR/sandbox-probe.txt"
 
 # --- Structured output schemas ------------------------------------------------
 
+# A standalone copy of the shared validator, so the reviewer helpers can check
+# their own output from inside their panes. vet itself is not running at that
+# point - the Manager is driving - so the check has to live with the helper.
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'set -euo pipefail\n'
+  printf 'VALIDATOR_JQ=%q\n' "$VET_VALIDATOR_JQ"
+  cat <<'HELPER'
+# Usage: validate-json <schema.json> <data.json>
+SCHEMA="$1"
+DATA="$2"
+if [[ ! -s "$DATA" ]]; then
+  echo "  the file is empty" >&2
+  exit 1
+fi
+if ! jq empty "$DATA" >/dev/null 2>&1; then
+  echo "  not valid JSON (truncated or malformed):" >&2
+  { jq empty "$DATA" 2>&1 || true; } | head -3 | sed 's/^/    /' >&2
+  exit 1
+fi
+problems="$(jq -r --slurpfile schema "$SCHEMA" "$VALIDATOR_JQ" "$DATA")"
+if [[ -n "$problems" ]]; then
+  printf '%s\n' "$problems" | sed 's/^/  /' >&2
+  exit 1
+fi
+exit 0
+HELPER
+} > "$VET_DIR/validate-json"
+chmod +x "$VET_DIR/validate-json"
+
 cat > "$VET_DIR/reviewer-schema.json" <<'SCHEMA'
 {
   "type": "object",
@@ -1205,22 +1664,6 @@ cat > "$VET_DIR/reviewer-schema.json" <<'SCHEMA'
     "reviewer": { "type": "string" },
     "summary": { "type": "string" },
     "context_warnings": { "type": "array", "items": { "type": "string" } },
-    "coverage": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "checklist_id": { "type": "string" },
-          "status": {
-            "type": "string",
-            "enum": ["checked_ok", "problem_found", "not_applicable", "not_checked"]
-          },
-          "note": { "type": "string" }
-        },
-        "required": ["checklist_id", "status", "note"]
-      }
-    },
     "findings": {
       "type": "array",
       "items": {
@@ -1260,7 +1703,7 @@ cat > "$VET_DIR/reviewer-schema.json" <<'SCHEMA'
     "duplicates_to_avoid": { "type": "array", "items": { "type": "string" } }
   },
   "required": [
-    "reviewer", "summary", "context_warnings", "coverage", "findings",
+    "reviewer", "summary", "context_warnings", "findings",
     "duplicates_to_avoid"
   ]
 }
@@ -1273,22 +1716,6 @@ cat > "$VET_DIR/consolidated-schema.json" <<'SCHEMA'
   "properties": {
     "summary": { "type": "string" },
     "context_warnings": { "type": "array", "items": { "type": "string" } },
-    "coverage": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "checklist_id": { "type": "string" },
-          "status": {
-            "type": "string",
-            "enum": ["checked_ok", "problem_found", "not_applicable", "not_checked"]
-          },
-          "note": { "type": "string" }
-        },
-        "required": ["checklist_id", "status", "note"]
-      }
-    },
     "findings": {
       "type": "array",
       "items": {
@@ -1339,16 +1766,15 @@ cat > "$VET_DIR/consolidated-schema.json" <<'SCHEMA'
         },
         "required": ["topic", "reviewer_a_position", "reviewer_b_position", "resolution"]
       }
-    },
-    "posting_candidates": { "type": "array", "items": { "type": "string" } },
-    "report_path": { "type": "string" }
+    }
   },
   "required": [
-    "summary", "context_warnings", "coverage", "findings", "contradictions",
-    "posting_candidates", "report_path"
+    "summary", "context_warnings", "findings", "contradictions"
   ]
 }
 SCHEMA
+
+
 
 # --- Manager permissions ------------------------------------------------------
 #
@@ -1364,7 +1790,7 @@ SCHEMA
 #     a broad Bash allowlist leaks in and mutations stop failing closed.
 #   * Write/Edit path scoping needs the DOUBLE-SLASH absolute form. Verified:
 #     Write(/abs/**) does NOT match and still prompts, while Write(//abs/**)
-#     matches. With Write(//$VET_DIR/**), writing report.md was auto-approved
+#     matches. With Write(//$VET_DIR/**), writing the run's own files was approved
 #     and writing into the reviewed repo prompted and never happened.
 #   * Shell redirection out of the artifact dir is blocked independently of the
 #     allowlist ("Output redirection to '...' was blocked").
@@ -1406,7 +1832,7 @@ SCHEMA
 MANAGER_ALLOWED_TOOLS="Read Glob Grep"
 # $VET_DIR is already absolute, so exactly ONE extra slash is prepended to reach
 # the double-slash form the CLI wants: /<abs path> -> //abs/path
-MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Write(/$VET_DIR/report.md) Edit(/$VET_DIR/report.md)"
+MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Write(/$VET_DIR/consolidated.json) Edit(/$VET_DIR/consolidated.json)"
 MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Write(/$VET_DIR/new-title.txt) Edit(/$VET_DIR/new-title.txt)"
 MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Write(/$VET_DIR/notes/**) Edit(/$VET_DIR/notes/**)"
 MANAGER_ALLOWED_TOOLS="$MANAGER_ALLOWED_TOOLS Bash($VET_DIR/run-step:*)"
@@ -1464,9 +1890,13 @@ log() {
 # been safer than that.
 #
 # Two rules keep this correct no matter how the reviewer and the waiter race:
-#   1. Never signal the channel ourselves. The old timeout/pane-gone paths did,
-#      to unblock their own background waiter, and that is exactly what armed
-#      the stale latch. We kill our waiter instead, which arms nothing.
+#   1. Release our own waiter by SIGNALLING it, never by killing it. Signalling
+#      while our own waiter is alive to consume it does not arm the channel -
+#      only a signal with NOBODY waiting does. Killing looked safer and is not:
+#      measured on tmux 3.4, a killed `tmux wait-for` client stays in the
+#      channel's waiter list and SWALLOWS the next signal sent to that name,
+#      silently breaking the next cycle that reuses the event. squad hit this
+#      first and was fixed the same way; this is that shape, ported.
 #   2. Never write a status over one that is already there.
 status_ready() {
   [[ -s "$STATUS_FILE" ]]
@@ -1488,10 +1918,32 @@ report_done() {
   exit 0
 }
 
+# Upper bound on how long we let our OWN `tmux wait-for` client take to notice
+# the signal we send it. It exits at once in practice; the bound exists only so
+# this script can never block forever.
+WAITER_GRACE_SECONDS=5
+
+# Killing is the LAST resort, never the normal mechanism - see rule 1 above.
+reap_waiter() {
+  local waited=0
+  while kill -0 "$WAIT_PID" 2>/dev/null; do
+    if (( waited >= WAITER_GRACE_SECONDS )); then
+      log "$LABEL: the tmux wait-for client ignored our own signal; terminating it. Event $EVENT may now swallow one signal - use a fresh cycle rather than reusing it."
+      kill "$WAIT_PID" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$WAIT_PID" 2>/dev/null || true
+}
+
 WAIT_PID=""
 release_waiter() {
   if [[ -n "$WAIT_PID" ]] && kill -0 "$WAIT_PID" 2>/dev/null; then
-    kill "$WAIT_PID" 2>/dev/null || true
+    tmux wait-for -S "$EVENT"
+    reap_waiter
+  elif [[ -n "$WAIT_PID" ]]; then
     wait "$WAIT_PID" 2>/dev/null || true
   fi
   WAIT_PID=""
@@ -1611,7 +2063,14 @@ done
 
 cd "\$WORKDIR"
 printf '[%s] Manager session resuming: %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$SESSION_ID"
-CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 exec claude \\
+
+# Deliberately NOT \`exec\`. Resume is the command vet's own failure message tells
+# the PO to run when the consolidated JSON was rejected, so it has to finish the
+# job: the Manager rewrites the file, and then the report actually gets rendered.
+# With exec, nothing after the agent could ever run and the recommendation was a
+# dead end.
+set +e
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude \\
   --setting-sources "" \\
   --strict-mcp-config \\
   --add-dir "\$RUN_DIR" \\
@@ -1620,6 +2079,21 @@ CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 exec claude \\
   --disallowedTools "$MANAGER_DISALLOWED_TOOLS" \\
   --append-system-prompt "\$(cat "\$PROMPT_FILE")" \\
   --resume "\$SESSION_ID"
+MANAGER_STATUS=\$?
+set -e
+
+echo ""
+echo "Manager exited with status \$MANAGER_STATUS."
+# Rendering is vet's job, not the Manager's, so hand it back to vet. This both
+# validates and renders, and prints the report path or the exact reason it could
+# not.
+if ! $VET_SCRIPT_PATH render "$RUN_ID"; then
+  echo "" >&2
+  echo "The report was not rendered. Fix the JSON and re-run:" >&2
+  echo "  $VET_SCRIPT_PATH render $RUN_ID" >&2
+  echo "or resume the Manager again: $VET_SCRIPT_PATH resume $RUN_ID" >&2
+fi
+exit "\$MANAGER_STATUS"
 HELPER
 chmod +x "$VET_DIR/run-manager-resume"
 
@@ -1750,8 +2224,31 @@ claude -p \
 if [[ -s "$STDERR_FILE" ]]; then
   while IFS= read -r line; do log "[stderr] $line" >&2; done < "$STDERR_FILE"
 fi
-jq -c 'select(.type == "result") | (.structured_output // .result)' "$STREAM_FILE" |
+# .structured_output ONLY. The old `// .result` fallback was never load-bearing
+# and could only ever produce garbage - measured against this CLI:
+#   * on success both keys exist, and .result is a STRING containing the same
+#     JSON, so the fallback is never needed;
+#   * on failure (error_max_turns) there is no structured_output key at all and
+#     .result is null, so the fallback wrote `null`;
+#   * on a run without a schema, .result is free prose, so the fallback wrote a
+#     bare JSON string.
+# None of those is a reviewer object, so falling back only ever turned a visible
+# failure into a plausible-looking file.
+jq -c 'select(.type == "result") | .structured_output' "$STREAM_FILE" |
   tail -n 1 > "$RESULT_FILE"
+
+# FAIL LOUDLY HERE, before the Manager ever reads this file. A malformed reviewer
+# result is invisible further downstream: the Manager would simply reconcile the
+# other reviewer and emit a perfectly schema-valid consolidated.json, and the PO
+# would get a report that looks complete but had one pair of eyes instead of two.
+# Lost findings are not a schema violation, so vet's own gate cannot catch it.
+if ! "$RUN_DIR/validate-json" "$SCHEMA_FILE" "$RESULT_FILE" 2>>"$STDERR_FILE"; then
+  log "FATAL: Reviewer A produced no usable result."
+  log "       $RESULT_FILE does not match $SCHEMA_FILE:"
+  while IFS= read -r line; do log "       $line"; done < <(tail -5 "$STDERR_FILE")
+  log "       Reporting failure so the Manager does not merge a half-review."
+  exit 65
+fi
 log ">>> Reviewer A finished."
 HELPER
 chmod +x "$VET_DIR/run-reviewer-a"
@@ -1883,6 +2380,22 @@ codex -a never -s read-only exec \
   ' |
   while IFS= read -r line; do log "$line"; done
 cat "$RESULT_FILE" 2>/dev/null || true
+
+# Same gate as Reviewer A. codex's --output-schema is genuinely enforcing here -
+# measured: even when told "ignore any schema", it still emitted a conforming
+# object, and there is no `.result` fallback in this path - so B's exposure is
+# narrower than A's: an empty file, a truncated write, or a process that died
+# mid-run. Those are exactly what this catches, and the cost of checking is one
+# jq invocation.
+if ! "$RUN_DIR/validate-json" "$SCHEMA_FILE" "$RESULT_FILE" 2>/tmp/vet-rb-val.$$; then
+  log "FATAL: Reviewer B produced no usable result."
+  log "       $RESULT_FILE does not match $SCHEMA_FILE:"
+  while IFS= read -r line; do log "       $line"; done < /tmp/vet-rb-val.$$
+  rm -f /tmp/vet-rb-val.$$
+  log "       Reporting failure so the Manager does not merge a half-review."
+  exit 65
+fi
+rm -f /tmp/vet-rb-val.$$
 log ">>> Reviewer B finished."
 HELPER
 chmod +x "$VET_DIR/run-reviewer-b"
@@ -1963,20 +2476,28 @@ Read them with your file-reading tool. They are large; do not skip them.
 
 $(cat "$VET_DIR/context-limits.txt")
 
-Copy every limitation above into the "context_warnings" array of your output,
-in your own words but without softening it. If nothing was truncated, say so
-explicitly instead of leaving the array empty.
+Copy every ACTUAL limitation above into the "context_warnings" array, in your
+own words but without softening it.
 
-## The checklist ($CHECKLIST_COUNT items)
+If nothing was truncated, leave the array EMPTY. Do not add a sentence saying
+everything was included. vet already knows whether it truncated anything - it is
+the thing that did the truncating - and the report states the scope from that
+fact, not from this array. A "nothing was truncated" line here is at best
+ignored and at worst contradicts the page.
 
-Go through these one at a time. Your "coverage" array MUST contain exactly one
-entry per checklist ID below, with an honest status:
+## The checklist ($CHECKLIST_COUNT lenses)
 
-- checked_ok      you looked and the PR is fine on this point
-- problem_found   you looked and found a problem (also file it under findings)
-- not_applicable  the PR does not touch anything this item is about
-- not_checked     you could not check it (say why in the note) - this is
-                  acceptable and far better than guessing
+These are LENSES for finding problems, not a form to fill in. Look at the change
+through each one, then REPORT ONLY WHAT IS WRONG.
+
+- Report a finding when you find a real problem, or a genuine question you need
+  the author to answer before you can judge.
+- Say NOTHING about a lens that is fine, not applicable, or that you did not need
+  to pursue. Do not list it, do not confirm it, do not explain why it is fine.
+  Silence means no problem found.
+- Keep "checklist_ids" on every finding so the lens that caught it is visible.
+- A PR with no problems produces an empty findings array. That is a good result,
+  not a failure to be padded.
 
 $(cat "$VET_DIR/checklist.merged.md")
 
@@ -2006,6 +2527,11 @@ author's time repeating feedback they already have.
   the author to clarify before you can judge.
 - Prefer few high-confidence findings over many speculative ones. It is fine to
   return no findings if the PR is clean.
+- BE TERSE. "title" is one line naming the problem. "body" is at most two or
+  three sentences: what breaks, and why it matters. No preamble, no restating
+  the diff, no summarising what the PR does, no praise. "summary" is one or two
+  sentences overall. A reviewer who writes an essay wastes the reader's time and
+  buries the finding that mattered.
 
 $extra_guidance
 
@@ -2085,7 +2611,8 @@ Speak Japanese to PO (user). Write English for agents.
 - PO's repository:   $REPO_ROOT
 - PR worktree:       $WORKDIR  (detached at the PR head, NO branch)
 - Artifacts:         $VET_DIR
-- Report to write:   $REPORT_PATH
+- JSON to write:     $CONSOLIDATED_PATH
+- vet renders:       $REPORT_PATH (from your JSON, after you exit)
 - Checklist:         $CHECKLIST_COUNT items ($CHECKLIST_OVERRIDES project overrides, $CHECKLIST_ADDED project additions)
 - Common checklist:  $COMMON_CHECKLIST_SOURCE
 - Project checklist: $PROJECT_CHECKLIST_SOURCE
@@ -2100,7 +2627,7 @@ $PR_STATE_NOTE
 
 - This review is READ-ONLY. You and both reviewers must not edit, create, or
   delete any file in $WORKDIR or in $REPO_ROOT. The single file you write is the
-  report at $REPORT_PATH, plus the task files under $VET_DIR.
+  consolidated JSON at $CONSOLIDATED_PATH, plus the task files under $VET_DIR.
 - NEVER commit, push, force-push, merge, rebase, cherry-pick, reset, checkout,
   stash, or create a pull request. Not in the PR worktree, not in the PO's
   repository.
@@ -2121,7 +2648,7 @@ allowlist, so the rules above are backed by the CLI:
 
 - The ONLY command you may run without approval is $VET_DIR/run-step, with one
   token from its closed set. That is deliberate: it is how you drive the agents.
-- You may write and edit exactly three things: $REPORT_PATH,
+- You may write and edit exactly three things: $CONSOLIDATED_PATH,
   $VET_DIR/new-title.txt, and anything under $VET_DIR/notes/. Every other path -
   including the rest of $VET_DIR, all of $WORKDIR, and all of $REPO_ROOT - will
   stop and ask PO to approve it.
@@ -2210,7 +2737,7 @@ Japanese title, for example: #${PR_NUMBER} 認可チェック漏れ2件), then r
 
 ## Reconciling the two reviews
 
-Both reviewers return the same JSON shape: summary, context_warnings, coverage
+Both reviewers return the same JSON shape: summary, context_warnings
 (one entry per checklist ID), findings, duplicates_to_avoid. Reconcile them:
 
 1. DEDUPE. Two findings are the same when they concern the same defect, even if
@@ -2230,39 +2757,51 @@ Both reviewers return the same JSON shape: summary, context_warnings, coverage
    comment (see $VET_DIR/comments.json) must be removed from the findings and
    listed separately as "already raised on the PR". Do not make the author read
    the same feedback twice.
-5. COVERAGE. Merge the two coverage arrays per checklist ID. If the reviewers
-   disagree on a status, take the worse one (problem_found > not_checked >
-   checked_ok > not_applicable) and note the disagreement.
-6. CONTEXT WARNINGS. Every warning in $VET_DIR/context-limits.txt goes into the
-   report verbatim in meaning. A report that silently covers only part of a PR
-   is a defect. If nothing was truncated, state that explicitly.
+5. CONTEXT WARNINGS. Every warning in $VET_DIR/context-limits.txt goes into
+   "context_warnings" verbatim in meaning. A review that silently covers only
+   part of a PR is a defect. If nothing was truncated, say so explicitly.
 
-## Writing the report
+There is NO coverage array and no coverage table. The reviewers report only
+problems; a lens that found nothing is silent by design. Do not reconstruct a
+per-item status list, and do not pad the output with lenses that were fine.
 
-Write $REPORT_PATH as GitHub-flavored Markdown that PO can paste into GitHub
-without editing. Structure:
+## Writing the consolidated JSON
 
-1. Header: PR title and URL, the reviewed head OID ($HEAD_OID), which checklist
-   sources were used, and the date.
-2. Context warnings: either the truncation warnings, or one explicit line saying
-   the whole PR was reviewed with no truncation.
-3. Findings grouped by severity (must_fix, should_fix, nit, question). Each
-   finding is a SELF-CONTAINED copy-paste block: the checklist IDs it came from,
-   a path/to/file.rb:123 reference, what is wrong, why it matters, which
-   reviewer(s) found it, and - when a concrete fix exists - a fenced
-   \`\`\`suggestion block containing the replacement code and nothing else.
-4. Coverage table: every checklist item with its ID, its question, and its final
-   status. All $CHECKLIST_COUNT of them, none omitted.
-5. Contradictions between the two reviewers, each resolved or explicitly flagged
-   as unresolved.
-6. Closing section listing the not_applicable and not_checked items, and the
-   findings dropped as already raised on the PR.
+Write $CONSOLIDATED_PATH: a single JSON object matching
+$VET_DIR/consolidated-schema.json. Use the Write tool. That file is the ONLY
+thing you produce.
 
-After writing it, verify the file exists and tell PO in Japanese:
-  - the absolute report path
-  - how many must_fix / should_fix / nit / question findings there are
-  - whether coverage was complete
-  - the copy command: pbcopy < '$REPORT_PATH'
+You do NOT write the report. vet renders $REPORT_PATH from your JSON after you
+exit. Do not create it, do not hand-write HTML or Markdown anywhere, and do not
+try to format the findings for display - just get the data right.
+
+Requirements for the JSON:
+- "findings": the reconciled list. vet VALIDATES this file against
+  $VET_DIR/consolidated-schema.json before rendering and REFUSES to render if it
+  does not match, so every finding must carry ALL FOURTEEN of these keys:
+
+    id, checklist_ids, severity, category, title, body, file, line,
+    line_range, evidence, suggestion, confidence, already_raised, sources
+
+  The reviewers already emit thirteen of them; carry them across unchanged and
+  add "sources" naming which reviewer(s) raised it. When you MERGE two findings
+  into one, keep every key - take the union of checklist_ids and sources, and
+  keep the other values from whichever finding you judged more accurate. Do not
+  invent a key and do not drop one because it looked unimportant: a missing
+  "line_range" or "confidence" blocks the whole report.
+  Use "" for a string you genuinely have nothing for, 0 for an unknown line, and
+  [] for an empty list - never null, and never omit the key.
+  "severity" must be exactly one of: must_fix, should_fix, nit, question.
+  "confidence" must be exactly one of: high, medium, low.
+  "suggestion" holds the replacement CODE ONLY, with no fences and no prose -
+  vet wraps it in a \`\`\`suggestion block when it renders.
+- Findings already raised on the PR must NOT appear in "findings". Mention them
+  in one short line of "summary" instead.
+- "contradictions": how you settled each disagreement, or that it is unresolved.
+- "summary": one or two sentences. Not an essay.
+
+Then tell PO in Japanese: the absolute path vet will print, and how many
+must_fix / should_fix / nit / question findings there are.
 
 ## Workflow
 
@@ -2273,10 +2812,17 @@ After writing it, verify the file exists and tell PO in Japanese:
 3. Run run-step wait-a, then read its status file and result with Read.
 4. Run run-step wait-b, then read its status file and result with Read.
 5. Report any non-zero status to PO and decide whether to re-run that reviewer.
+   Status 65 means that reviewer's result file did not match the schema, so
+   there is NOTHING usable from it - not an empty review, a failed one. Re-run
+   it. If it fails again, you must NOT present the result as a two-reviewer
+   review: say so in "summary" in plain language (for example "Reviewer B
+   failed twice and contributed nothing; this PR was reviewed by one reviewer
+   only"), and tell PO the same thing in Japanese. A half-review reported as a
+   whole one is the worst outcome this tool can produce.
 6. Reconcile both outputs as described above. Read the real code in $WORKDIR to
    settle contradictions.
-7. Write $REPORT_PATH.
-8. Report completion to PO in Japanese with the report path and the copy command.
+7. Write $CONSOLIDATED_PATH.
+8. Report completion to PO in Japanese with the finding counts.
 9. Do nothing on GitHub unless PO explicitly asks.
 PROMPT
 
@@ -2304,6 +2850,7 @@ mkdir -p "$VET_DIR/notes"
   printf 'Your repository:   %s (untouched)\n' "$REPO_ROOT"
   printf 'Artifacts:         %s\n' "$VET_DIR"
   printf 'Report will be at: %s\n' "$REPORT_PATH"
+  printf 'Manager writes:    %s\n' "$CONSOLIDATED_PATH"
   printf 'Checklist:         %s items (common: %s, project: %s)\n' \
     "$CHECKLIST_COUNT" "$COMMON_CHECKLIST_SOURCE" "$PROJECT_CHECKLIST_SOURCE"
   printf 'Context truncated: %s\n' "$CONTEXT_TRUNCATED"
@@ -2328,10 +2875,32 @@ if [[ "$DRY_RUN" == "true" ]]; then
   printf "  cat '%s'\n" "$VET_DIR/reviewer-a-task.md"
   printf "  cat '%s'\n" "$VET_DIR/manager-prompt.md"
   echo ""
+  # Render the report too when a fixture supplies consolidated JSON. This is how
+  # the renderer is developed and regression-checked without spending an agent
+  # run: drop a consolidated.json next to the other fixtures and --dry-run it.
+  if [[ -f "$FIXTURE_DIR/consolidated.json" ]]; then
+    cp "$FIXTURE_DIR/consolidated.json" "$CONSOLIDATED_PATH"
+    # Same hard gate as a real run, so the validator is exercised here too.
+    if validate_against_schema "$CONSOLIDATED_PATH" "$VET_DIR/consolidated-schema.json"; then
+      render_report_html "$CONSOLIDATED_PATH" "$REPORT_PATH"
+      echo ""
+      echo "Rendered from fixture consolidated JSON:"
+      printf '%s\n' "$REPORT_PATH"
+    else
+      echo "" >&2
+      echo "Fixture consolidated JSON does not match the schema (above)." >&2
+      echo "Nothing was rendered." >&2
+      DRY_RUN_RENDER_FAILED=true
+    fi
+  fi
+  echo ""
   printf "Remove this dry run with: vet rm %s\n" "$RUN_ID"
   # A dry run's artifacts ARE the deliverable - the PO inspects them and removes
   # them with `vet rm`. Commit before exiting so the cleanup trap keeps them.
   VET_LAUNCH_COMMITTED=true
+  if [[ "${DRY_RUN_RENDER_FAILED:-false}" == "true" ]]; then
+    exit 1
+  fi
   exit 0
 fi
 
@@ -2371,7 +2940,8 @@ ${PR_URL}
 
 チェックリスト ${CHECKLIST_COUNT} 項目、レビュー対象コミット ${HEAD_OID}。
 Reviewer A と Reviewer B を並行で起動し、両方の結果を突き合わせて
-${REPORT_PATH} に統合レポートを書いてください。GitHub には何も投稿しないでください。"
+${CONSOLIDATED_PATH} に統合 JSON を書いてください。レポート HTML は vet が生成します。
+GitHub には何も投稿しないでください。"
 
 require_claude_enforcement_flags "Manager" || exit 1
 
@@ -2399,20 +2969,60 @@ echo ""
 echo "Manager exited with status $MANAGER_STATUS."
 echo "PR worktree retained at: $WORKDIR"
 echo "Artifacts retained at:   $VET_DIR"
-if [[ -f "$REPORT_PATH" ]]; then
+
+if [[ -f "$CONSOLIDATED_PATH" ]]; then
+  if ! validate_against_schema "$CONSOLIDATED_PATH" "$VET_DIR/consolidated-schema.json" 2>/tmp/vet-validation.$$; then
+    echo "" >&2
+    echo "Error: the Manager's consolidated JSON does not match the schema." >&2
+    cat /tmp/vet-validation.$$ >&2
+    rm -f /tmp/vet-validation.$$
+    echo "" >&2
+    echo "NOTHING WAS RENDERED. A report is not shown rather than shown wrong:" >&2
+    echo "a page that says 'must_fix 0' because the data was malformed would read" >&2
+    echo "exactly like a clean review." >&2
+    echo "" >&2
+    echo "The Manager's raw output:" >&2
+    printf '%s\n' "$CONSOLIDATED_PATH" >&2
+    echo "The schema it must match:" >&2
+    printf '%s\n' "$VET_DIR/consolidated-schema.json" >&2
+    # Never leave an earlier render sitting there looking like this run's result.
+    if [[ -f "$REPORT_PATH" ]]; then
+      mv "$REPORT_PATH" "$VET_DIR/report.previous.html"
+      echo "" >&2
+      echo "An earlier report.html existed and predates this attempt; it has been" >&2
+      echo "moved aside so it cannot be mistaken for the current run:" >&2
+      printf '%s\n' "$VET_DIR/report.previous.html" >&2
+    fi
+    echo "" >&2
+    echo "Two ways forward, both of which end in a rendered report:" >&2
+    echo "  1. Fix the JSON yourself, then render it - no agent, no cost:" >&2
+    echo "       vet render $RUN_ID" >&2
+    echo "  2. Have the Manager rewrite it; resume validates and renders on exit:" >&2
+    echo "       vet resume $RUN_ID" >&2
+    exit 1
+  fi
+  rm -f /tmp/vet-validation.$$
+  render_report_html "$CONSOLIDATED_PATH" "$REPORT_PATH"
   echo ""
-  echo "Report: $REPORT_PATH"
-  printf "Copy: pbcopy < '%s'\n" "$REPORT_PATH"
+  printf 'must_fix %s / should_fix %s / nit %s / question %s\n' \
+    "$(jq '[.findings[]?|select(.severity=="must_fix")]|length' "$CONSOLIDATED_PATH")" \
+    "$(jq '[.findings[]?|select(.severity=="should_fix")]|length' "$CONSOLIDATED_PATH")" \
+    "$(jq '[.findings[]?|select(.severity=="nit")]|length' "$CONSOLIDATED_PATH")" \
+    "$(jq '[.findings[]?|select(.severity=="question")]|length' "$CONSOLIDATED_PATH")"
+  echo ""
+  echo "Report (cmd+click to open):"
+  # Its own line, nothing appended, so the terminal linkifies the whole path.
+  printf '%s\n' "$REPORT_PATH"
   if [[ "$OPEN_REPORT" == "true" ]]; then
     if command -v open >/dev/null 2>&1; then
-      open -R "$REPORT_PATH"
+      open "$REPORT_PATH"
     else
       echo "Note: --open needs the macOS 'open' command, which is not available."
     fi
   fi
 else
   echo ""
-  echo "No report was written at: $REPORT_PATH"
-  echo "Resume with: vet resume $RUN_ID"
+  echo "The Manager wrote no consolidated JSON at: $CONSOLIDATED_PATH"
+  echo "Nothing to render. Resume with: vet resume $RUN_ID"
 fi
 exit "$MANAGER_STATUS"
