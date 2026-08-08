@@ -730,6 +730,34 @@ render_run() {
   printf '%s\n' "$REPORT_PATH"
 }
 
+# The tmux window name, e.g. `vet #9194`.
+#
+# DISPLAY ONLY. Runs are resolved by WINDOW_ID and the @vet_run_id window option
+# (see window_exists, list_runs, close_run) and never by this string, so the
+# name can change freely without affecting resume/close/list/rm.
+#
+# It used to be `vet:<run-id-prefix>`. The tool name was never the problem - a
+# timestamp like `vet:20260807-211932` identifies the run to vet and tells a
+# human scanning a window list days later nothing. The PR number is what they
+# are actually looking for.
+#
+# tmux keeps this name: rename-window turns automatic-rename OFF for that
+# window (verified on tmux 3.4 - a window renamed this way kept its name with
+# `sleep` running in the pane), and `#` in the name is inserted literally by
+# format strings, not re-scanned as a format escape.
+window_short_name() {
+  local pr="${1:-}"
+  # Fall back to the run-id prefix, which is the string you would type into
+  # `vet close` / `vet rm`, so even a degraded name stays actionable. PR_NUMBER
+  # is validated as ^[0-9]+$ before any run starts, so this only fires for a
+  # truncated or hand-edited state.env on the resume path.
+  if [[ "$pr" =~ ^[0-9]+$ ]]; then
+    printf 'vet #%s' "$pr"
+  else
+    printf 'vet:%s' "${RUN_ID:0:15}"
+  fi
+}
+
 window_exists() {
   local target_window_id="${1:-}"
   [[ -n "$target_window_id" ]] || return 1
@@ -876,7 +904,10 @@ resume_run() {
   REVIEWER_A_PANE="$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')"
   REVIEWER_B_PANE="$(tmux split-window -v -c "$WORKDIR" -d -t "$REVIEWER_A_PANE" -P -F '#{pane_id}')"
   CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$WINDOW_ID" '#W')"
-  WINDOW_SHORT_NAME="${WINDOW_SHORT_NAME:-vet:${RUN_ID:0:15}}"
+  # Rebuilt from the PR number in state.env rather than reusing the persisted
+  # WINDOW_SHORT_NAME, so a run started before the naming change is renamed to
+  # the current scheme when it is resumed instead of keeping a stale timestamp.
+  WINDOW_SHORT_NAME="$(window_short_name "${PR_NUMBER:-}")"
   RUN_STATUS="running"
   write_state
   # run-step has the pane IDs baked in, so it must be regenerated for the panes
@@ -2524,7 +2555,9 @@ ignored and at worst contradicts the page.
 ## The checklist ($CHECKLIST_COUNT lenses)
 
 These are LENSES for finding problems, not a form to fill in. Look at the change
-through each one, then REPORT ONLY WHAT IS WRONG.
+through each one, then REPORT ONLY THE PROBLEMS YOU FIND. "Problem" is not
+limited to "broken": a rough edge on a line this PR changed counts, at nit
+severity. What you must not do is report that a lens was fine.
 
 - Report a finding when you find a real problem, or a genuine question you need
   the author to answer before you can judge.
@@ -2545,26 +2578,39 @@ already been raised there, either drop it or set "already_raised": true on the
 finding and name the existing comment in "duplicates_to_avoid". Do not waste the
 author's time repeating feedback they already have.
 
-## What is NOT a finding
+## Not a finding: unused, unwired, no caller yet
 
 未使用・未配線・呼び出し元なしは、それだけでは defect ではありません。部分的な
-着地や別 PR での配線は通常あり得ます。PR 本文がその配線まで明示的に約束している
-場合、または変更したコード自体が壊れている/危険/データを壊す場合だけ finding に
-してください。意図不明なら must_fix/should_fix ではなく question にしてください。
+着地や別 PR での配線は通常あり得ます。
+
+この種の指摘 - 変更したコードがまだどこからも呼ばれていない、別レイヤーやフロント
+エンドが追随していない - は、PR 本文がその配線まで明示的に約束している場合を除き、
+finding にしないでください。「除く」というのは本当に何も書かないという意味です。
+question に落とすことも、summary で触れることも含みません。読んで却下するだけの
+question は、字が小さくなっただけの同じ税金です。
+
 PR ラベル、変更ファイル数、生成ファイルの有無からスコープ義務を推測しないで
-ください。
+ください。A PR labelled for an area is not a promise to finish that area in this
+PR. Work here is split across PRs by owner, so labels, changed-file counts and
+regenerated files say nothing about what this PR owes.
 
-Two clarifications on the above.
+## Still a finding: anything about the lines this PR changed
 
-First, on 「意図不明なら question」: that means the CHANGED code itself is
-internally inconsistent or ambiguous. It does NOT mean "ask whether the missing
-wiring is coming in a later PR". When the PR body does not promise the wiring,
-OMIT the point entirely - no finding, not even a question. A question the reader
-has to read and dismiss on every run is the same tax in a smaller font.
+上の制限は「まだ配線されていない」という形の指摘にだけ掛かります。他の指摘を
+抑制するものではありません。
 
-Second, on the last sentence: a PR labelled for an area is not a promise to
-finish that area in this PR. Work here is split across PRs by owner, so labels,
-changed-file counts and regenerated files say nothing about what this PR owes.
+この PR が変更した行そのものについては、コードが壊れていなくても指摘してくだ
+さい。周囲の規約との不整合、抜けている境界条件、より安全な書き方があるといった
+点は、nit または should_fix として報告する価値があります。PO が求めているのは
+「怪しいところ」であって、「壊れていると証明できるところ」だけではありません。
+
+Concretely: a line this PR added that skips a normalisation every neighbouring
+line performs is a legitimate nit. Nothing breaks, and it is still worth saying.
+A review that reports only what is provably broken is not what this tool is for.
+
+意図不明なら must_fix/should_fix ではなく question にしてください。ただしこれは
+変更したコード自体が内部的に矛盾している・曖昧な場合の話であって、「足りない配線
+が後の PR で来るのか」を尋ねるためのものではありません。
 
 ## How to write findings
 
@@ -2586,17 +2632,21 @@ changed-file counts and regenerated files say nothing about what this PR owes.
     must_fix にしない。
 
   should_fix = a real problem in the changed code that is not blocking;
-  nit = style or polish; question = the CHANGED code itself looks internally
+  nit = style, polish, or a changed line that departs from the convention the
+  surrounding code follows - correctness is not required for a nit, and a nit is
+  a perfectly good thing to return; question = the CHANGED code itself looks internally
   inconsistent or ambiguous and you need the author to clarify before you can
   judge it. Do not use question to ask whether something outside this PR will be
   handled later - that is not your question to ask.
 - Prefer few high-confidence findings over many speculative ones. It is fine to
   return no findings if the PR is clean.
-- BE TERSE. "title" is one line naming the problem. "body" is at most two or
-  three sentences: what breaks, and why it matters. No preamble, no restating
-  the diff, no summarising what the PR does, no praise. "summary" is one or two
-  sentences overall. A reviewer who writes an essay wastes the reader's time and
-  buries the finding that mattered.
+- BE TERSE. This governs how much you WRITE per finding, never how many findings
+  you report. "title" is one line naming the problem. "body" is at most two or
+  three sentences: what the problem is, and why it matters. No preamble, no
+  restating the diff, no summarising what the PR does, no praise. "summary" is
+  one or two sentences overall. A reviewer who writes an essay wastes the
+  reader's time and buries the finding that mattered - but a reviewer who drops
+  a real finding to look concise has done the worse thing.
 
 $extra_guidance
 
@@ -2625,7 +2675,12 @@ contradicts a recent, deliberate one.
 Use that surrounding code only to test the CHANGED code's assumptions. Do not
 turn unchanged callers or future wiring into review subject matter. \"This new
 field is not read anywhere yet\" is an observation about the rest of the
-repository, not a defect in this PR - see 'What is NOT a finding' above."
+repository, not a defect in this PR.
+
+That restriction is about unwired code and nothing else. Reading the neighbours
+is also how you notice that a line this PR changed departs from the convention
+every neighbour follows - that comparison is one of the most useful things you
+can do here, and it belongs in the report as a nit or should_fix."
 
 build_reviewer_task \
   "Reviewer B (Codex)" \
@@ -2651,12 +2706,12 @@ if [[ "$DRY_RUN" == "true" ]]; then
   REVIEWER_B_PANE="%dry-reviewer-b"
   WINDOW_ID=""
   CURRENT_WINDOW_NAME=""
-  WINDOW_SHORT_NAME="vet:${RUN_ID:0:15}"
+  WINDOW_SHORT_NAME="$(window_short_name "$PR_NUMBER")"
 else
   MANAGER_PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
   CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$MANAGER_PANE" '#W')"
   WINDOW_ID="$(tmux display-message -p -t "$MANAGER_PANE" '#{window_id}')"
-  WINDOW_SHORT_NAME="vet:${RUN_ID:0:15}"
+  WINDOW_SHORT_NAME="$(window_short_name "$PR_NUMBER")"
   REVIEWER_A_PANE=$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')
   REVIEWER_B_PANE=$(tmux split-window -v -c "$WORKDIR" -d -t "$REVIEWER_A_PANE" -P -F '#{pane_id}')
 fi
@@ -2853,19 +2908,29 @@ Both reviewers return the same JSON shape: summary, context_warnings
 
    So: unused, unwired, no-caller-yet is NOT a defect on its own. Landing a
    change in parts, and wiring it up in a later PR by a different person, is
-   normal on this team. A finding of that shape survives ONLY when the PR body
-   explicitly promises the wiring, or when the CHANGED code itself is broken,
-   unsafe, or loses data.
+   normal on this team. A finding OF THAT SHAPE survives only when the PR body
+   explicitly promises the wiring.
+
+   That test applies to findings of that shape and to nothing else. It is NOT a
+   general bar that every finding must clear. A finding about a line this PR
+   actually changed is in scope even when nothing is broken - inconsistency with
+   the surrounding conventions, a missing edge case, a rough edge - and you keep
+   it, at nit or should_fix. Do not drop such a finding for being minor, and do
+   not demand it prove harm first. If both reviewers stayed silent you have
+   nothing to add; but when one of them raises a small real thing about a changed
+   line, it belongs in the report.
 
    NEVER infer a scope obligation from PR labels, from the number of changed
    files, or from the presence of generated files. A PR labelled for an area is
    not a promise to finish that area in this PR.
 
-   When a reviewer hands you such a finding and the PR body does not promise the
-   wiring, DROP IT - do not downgrade it to question, do not mention it in the
-   summary. Only use "question" when the CHANGED code itself looks internally
-   inconsistent or ambiguous. A question PO has to read and dismiss on every run
-   is the same tax in a smaller font.
+   So, returning to the unused/unwired shape only: when a reviewer hands you a
+   finding of THAT shape and the PR body does not promise the wiring, DROP IT -
+   do not downgrade it to question, do not mention it in the summary. (This
+   sentence is about unwired findings. It is not about the changed-line findings
+   two paragraphs up, which you keep.) Only use "question" when the CHANGED code
+   itself looks internally inconsistent or ambiguous. A question PO has to read
+   and dismiss on every run is the same tax in a smaller font.
 
    Concretely: a reviewer rating "the backend added a field the frontend does not
    send yet" as must_fix is the exact error this rule exists to stop. Unless the
