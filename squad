@@ -14,6 +14,7 @@ Usage: squad <task>
        squad resume [run-id]
        squad rm <run-id>...
        squad clean
+       squad base [--run <run-id>] [<ref>]
 
 Create an isolated git worktree and split the current tmux pane into 3 AI agents:
   Manager (Claude Code) - left, talks to you
@@ -31,6 +32,12 @@ Lifecycle:
   squad resume <run-id>  Resume a specific retained squad.
   squad rm <run-id>...   Delete closed squads: worktree, branch, and artifacts.
   squad clean            Delete ALL squads that are not running (asks first).
+
+Diff base (what Squad Cockpit compares this squad against):
+  squad base             Show the recorded base of the current window's squad.
+  squad base <ref>       Re-pin it to where this squad forked from <ref>.
+  squad base --run <run-id> [<ref>]
+                         Same, for a squad in another window.
 EOF
   exit "$status"
 }
@@ -218,6 +225,125 @@ close_run() {
   fi
   printf 'Squad closed: %s\n' "$RUN_ID"
   printf 'Resume with: squad resume %s\n' "$RUN_ID"
+}
+
+print_recorded_base() {
+  if [[ -n "${SQUAD_BASE_COMMIT:-}" ]]; then
+    printf 'Recorded base for %s: %s (%s)\n' \
+      "$RUN_ID" "$SQUAD_BASE_COMMIT" "${SQUAD_BASE_REF:-unknown}"
+  else
+    printf 'Recorded base for %s: not recorded\n' "$RUN_ID"
+  fi
+}
+
+# Show or RE-PIN the fork point Squad Cockpit diffs this run against.
+#
+# Cockpit uses SQUAD_BASE_COMMIT directly, but ONLY while it resolves to a commit
+# AND is an ancestor of the worktree HEAD; anything else is silently ignored and
+# it falls back to guessing a base branch. So this stores a commit satisfying
+# exactly that condition, and asserts it before returning.
+base_run() {
+  local run_id="${1:-}"
+  local requested="${2:-}"
+  local has_arg="${3:-false}"
+
+  # `false` = no hidden fallback to "the latest retained run", matching close.
+  load_run "$run_id" false
+
+  [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]] || {
+    echo "Error: the worktree for $RUN_ID is missing: ${WORKDIR:-<unset>}" >&2
+    exit 1
+  }
+  git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "Error: not a git worktree: $WORKDIR" >&2
+    exit 1
+  }
+
+  if [[ "$has_arg" != "true" ]]; then
+    print_recorded_base
+    return 0
+  fi
+
+  # Validate the input BEFORE touching state.env, so every rejection below
+  # leaves the file byte-for-byte unchanged.
+  [[ -n "$requested" ]] || {
+    echo "Error: squad base requires a non-empty ref or commit" >&2
+    exit 1
+  }
+  [[ "$requested" != -* ]] || {
+    echo "Error: invalid base '$requested': must not start with '-'" >&2
+    exit 1
+  }
+  # state.env is written with printf %q and sourced by bash, so %q already makes
+  # sourcing safe; this keeps the file inspectable by humans too.
+  [[ "$requested" != *[[:cntrl:]]* ]] || {
+    echo "Error: invalid base: control characters are not allowed" >&2
+    exit 1
+  }
+
+  local full_ref="" new_commit=""
+  if [[ "$requested" == refs/* ]]; then
+    # An explicit refs/... argument is taken literally.
+    if git -C "$WORKDIR" show-ref --verify --quiet "$requested"; then
+      full_ref="$requested"
+    fi
+  else
+    local candidate
+    for candidate in "refs/heads/$requested" "refs/remotes/$requested" \
+      "refs/tags/$requested"; do
+      if git -C "$WORKDIR" show-ref --verify --quiet "$candidate"; then
+        full_ref="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [[ -n "$full_ref" ]]; then
+    # An exact ref: record the FORK POINT, never the ref's tip. The tip is
+    # usually not an ancestor of HEAD, so cockpit would ignore it and fall back
+    # to guessing — and it is not where this run diverged anyway.
+    new_commit="$(git -C "$WORKDIR" merge-base "$full_ref" HEAD 2>/dev/null || true)"
+    [[ -n "$new_commit" ]] || {
+      echo "Error: '$requested' has no merge-base with HEAD in $WORKDIR" >&2
+      exit 1
+    }
+  else
+    # Not a ref: a commit-ish the operator typed deliberately. Accept it only if
+    # it is ALREADY an ancestor of HEAD, which is precisely what cockpit needs.
+    new_commit="$(
+      git -C "$WORKDIR" rev-parse --verify --quiet --end-of-options \
+        "$requested^{commit}" 2>/dev/null || true
+    )"
+    [[ -n "$new_commit" ]] || {
+      echo "Error: '$requested' is not a known ref or commit in $WORKDIR" >&2
+      exit 1
+    }
+    if ! git -C "$WORKDIR" merge-base --is-ancestor "$new_commit" HEAD 2>/dev/null; then
+      echo "Error: '$requested' is not an ancestor of HEAD, so Squad Cockpit" >&2
+      echo "would ignore it. Pass a branch/tag instead and squad will record" >&2
+      echo "the fork point, or pick a commit on this branch's history." >&2
+      exit 1
+    fi
+  fi
+
+  # The invariant cockpit itself applies. If it does not hold, this command has
+  # failed at its job, so fail loudly rather than record a base to be ignored.
+  git -C "$WORKDIR" rev-parse --verify --quiet "$new_commit^{commit}" >/dev/null || {
+    echo "Error: refusing to record '$new_commit': it is not a commit" >&2
+    exit 1
+  }
+  git -C "$WORKDIR" merge-base --is-ancestor "$new_commit" HEAD || {
+    echo "Error: refusing to record $new_commit: not an ancestor of HEAD" >&2
+    exit 1
+  }
+
+  # Only these two change. load_run sourced the TARGET run's state.env, so
+  # write_state re-emits every other key unchanged into that run's own
+  # $SQUAD_DIR — including when it is not the current tmux window.
+  SQUAD_BASE_COMMIT="$new_commit"
+  SQUAD_BASE_REF="$requested"
+  write_state
+  print_recorded_base
 }
 
 # Delete one retained run: its worktree, its squad branch, and its artifact
@@ -1407,6 +1533,31 @@ case "$1" in
     ;;
   clean)
     clean_runs
+    exit 0
+    ;;
+  base)
+    shift
+    base_target_run=""
+    # `--run` names another squad. A POSITIONAL run-id is deliberately not
+    # accepted: `squad base <x>` would be ambiguous between "inspect run x" and
+    # "set the base to ref x".
+    if [[ "${1:-}" == "--run" ]]; then
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --run requires a run-id (see: squad list)" >&2
+        exit 1
+      fi
+      base_target_run="$2"
+      shift 2
+    fi
+    if [[ $# -gt 1 ]]; then
+      echo "Error: squad base takes at most one ref (see: squad --help)" >&2
+      exit 1
+    fi
+    if [[ $# -eq 1 ]]; then
+      base_run "$base_target_run" "$1" true
+    else
+      base_run "$base_target_run" "" false
+    fi
     exit 0
     ;;
   resume)
