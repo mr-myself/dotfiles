@@ -4,6 +4,21 @@ set -euo pipefail
 # ==============================================================================
 # squad-herdr - AI 3-agent team orchestration via Herdr agents
 # ==============================================================================
+#
+# TODO(deferred): the following exist in the tmux-based `squad` and are NOT
+# ported yet. Do not read this file as having parity with `squad`.
+#   * `squad-herdr resume` - restarting a run's agents and regenerating the
+#     helpers and Manager prompt for an existing run.
+#   * `squad-herdr clean` - bulk removal of finished runs.
+#   * RuboCop verification (run-rubocop, rubocop-command.txt, the mandatory
+#     RuboCop step in the Manager workflow, and rubocop_status in
+#     coder-schema.json).
+#   * close_run rollback hardening: RUN_STATUS is written before the workspace
+#     is closed, so a failed `herdr workspace close` leaves the state saying
+#     closed while the workspace is still live.
+#   * Full failed-launch cleanup parity: cleanup_failed_launch does not undo
+#     herdr workspaces, tabs, or agents created before the failure.
+#   * SQUAD_BASE_COMMIT / SQUAD_BASE_REF recording in state.env.
 
 usage() {
   local status="${1:-1}"
@@ -12,11 +27,15 @@ Usage: squad-herdr <task>
        squad-herdr list
        squad-herdr close <run-id>
        squad-herdr rm <run-id>...
+       squad-herdr gen-helpers <dir>
 
 Create an isolated git worktree and launch 3 AI agents in Herdr:
   Manager (Claude Code) - talks to you
   Coder   (Claude Code) - implements code
   Advisor (Codex)       - plans and reviews
+
+`gen-helpers` only writes the generated helper scripts into <dir> and exits. It
+starts nothing, so it is the way to inspect or test helper generation.
 
 This is a Herdr prototype. Existing tmux-based `squad` remains the stable path.
 EOF
@@ -61,6 +80,7 @@ write_state() {
     printf 'MANAGER_AGENT=%q\n' "$MANAGER_AGENT"
     printf 'CODER_AGENT=%q\n' "$CODER_AGENT"
     printf 'ADVISOR_AGENT=%q\n' "$ADVISOR_AGENT"
+    printf 'CODER_SESSION_ID=%q\n' "$CODER_SESSION_ID"
     printf 'RUN_STATUS=%q\n' "${RUN_STATUS:-running}"
     printf 'WORKTREE_CREATED=%q\n' "${WORKTREE_CREATED:-false}"
   } > "$SQUAD_DIR/state.env"
@@ -148,9 +168,615 @@ remove_run() {
   rm -rf "$SQUAD_DIR"
 }
 
+# --- Generated helper scripts -------------------------------------------------
+# Ported from the tmux-based `squad`. The tmux parts are gone: there are no pane
+# titles and no `tmux wait-for` signalling. What remains is the part that
+# actually carried the protocol - a status file per step, written on every exit
+# path, and treated as the single source of truth by run-wait.
+#
+# Depends only on SQUAD_DIR and the three per-run herdr agent names, so
+# `squad-herdr gen-helpers <dir>` can exercise it without starting anything.
+#
+# TODO(deferred): squad regenerates these on every `resume` so an old run picks
+# up newer helpers. squad-herdr has no `resume` yet, so generation happens only
+# at launch.
+generate_helper_scripts() {
+  mkdir -p "$SQUAD_DIR"
+
+  # --- herdr guard --------------------------------------------------------------
+  # Shadows `herdr` on PATH for the Manager and the Coder, both of which run with
+  # permissions skipped. Generated once and shared, so the blocklist cannot drift
+  # between the two runners.
+  #
+  # THIS IS A SPEED BUMP, NOT A SECURITY BOUNDARY. It is trivially bypassed by an
+  # absolute path (/opt/homebrew/bin/herdr ...), by `command herdr`, by reading
+  # $SQUAD_REAL_HERDR, or by talking to the herdr socket directly. It exists to
+  # stop an ACCIDENTAL teardown, not a determined one. The prohibition in the
+  # Manager prompt and the Coder system prompt is the primary control.
+  #
+  # The blocklist is pinned to the herdr 0.7.3 command surface, enumerated from
+  # `herdr --help` and each `herdr <group> --help`. RE-CHECK IT ON EVERY HERDR
+  # UPGRADE: a renamed or newly added teardown verb silently stops being blocked.
+  # Deliberately NOT listed, because they do not exist in 0.7.3 and listing dead
+  # verbs makes the coverage look better than it is: `herdr session kill`,
+  # `herdr agent stop`.
+  mkdir -p "$SQUAD_DIR/guard-bin"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_REAL_HERDR=%q\n' "$(command -v herdr 2>/dev/null || printf 'herdr')"
+    cat <<'HELPER'
+# Blocked, grouped by what they destroy:
+#   workspace close / tab close / pane close  - the panes the PO is watching
+#   session stop / session delete             - the whole herdr session
+#   server stop / server live-handoff         - the server behind every session
+#   worktree remove                           - the squad's own git worktree
+#   config reset-keys                         - the PO's keybindings
+#   integration uninstall                     - the PO's agent integrations
+#   agent rename / pane release-agent         - not destructive to panes, but
+#     they clear the agent name send-to and run-wait resolve through, which
+#     breaks addressing for the whole run silently.
+case "${1:-} ${2:-}" in
+  "workspace close" | "tab close" | "pane close" | \
+    "session stop" | "session delete" | \
+    "server stop" | "server live-handoff" | \
+    "worktree remove" | \
+    "config reset-keys" | "integration uninstall" | \
+    "agent rename" | "pane release-agent")
+    printf 'squad-herdr: blocked dangerous herdr command: %s %s\n' "${1:-}" "${2:-}" >&2
+    exit 126
+    ;;
+esac
+exec "$SQUAD_REAL_HERDR" "$@"
+HELPER
+  } > "$SQUAD_DIR/guard-bin/herdr"
+  chmod +x "$SQUAD_DIR/guard-bin/herdr"
+
+  # --- squad-agent --------------------------------------------------------------
+  # The single source of truth for agent addressing. send-to, run-wait and the
+  # launch-time precondition check all resolve through this one implementation,
+  # so there is exactly one place where the herdr lookup can be wrong.
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'MANAGER_AGENT=%q\n' "$MANAGER_AGENT"
+    printf 'CODER_AGENT=%q\n' "$CODER_AGENT"
+    printf 'ADVISOR_AGENT=%q\n' "$ADVISOR_AGENT"
+    cat <<'HELPER'
+# Resolve one squad role to the herdr pane ID that currently plays it.
+#
+#   squad-agent <manager|coder|advisor>
+#
+# Prints the pane ID on success. On zero or ambiguous matches it prints nothing
+# to stdout and exits non-zero, so a caller can never act on a guess.
+#
+# TWO methods are tried, because it is not guaranteed that a pane started as
+# `herdr agent start <name> -- bash -l` is reported in the snapshot's agents[]
+# array: herdr may only populate that array for panes where it DETECTS a known
+# AI agent, and these panes run a plain login shell.
+#
+#   1. `herdr api snapshot` -> .result.snapshot.agents[] matched on .name.
+#      Exactly one match is required; several means two runs collided and we
+#      refuse to guess between them.
+#   2. `herdr agent get <name>` -> .result.agent.pane_id. Per `herdr agent
+#      --help`, targets accept unique agent names, so this resolves a named
+#      agent even when it is absent from agents[]. It answers
+#      {"error":{"code":"agent_not_found"}} with a non-zero exit when there is
+#      no such agent.
+#
+# Method 2 also accepts detected labels and terminal IDs, so a bare label could
+# in principle match a pane we did not mean. The returned .name is therefore
+# checked against the requested name whenever herdr reports one.
+
+if [[ $# -ne 1 ]]; then
+  printf 'Usage: squad-agent <manager|coder|advisor>\n' >&2
+  exit 2
+fi
+
+ROLE="$1"
+case "$ROLE" in
+  manager) AGENT_NAME="$MANAGER_AGENT" ;;
+  coder) AGENT_NAME="$CODER_AGENT" ;;
+  advisor) AGENT_NAME="$ADVISOR_AGENT" ;;
+  *)
+    printf 'Error: unknown squad role: %s (expected manager, coder, or advisor)\n' "$ROLE" >&2
+    exit 2
+    ;;
+esac
+
+# Method 1: the snapshot's agents[] array.
+if SNAPSHOT="$(herdr api snapshot 2>/dev/null)"; then
+  MATCHES=()
+  while IFS= read -r pane_id; do
+    [[ -n "$pane_id" ]] || continue
+    MATCHES+=("$pane_id")
+  done < <(
+    printf '%s' "$SNAPSHOT" |
+      jq -r --arg name "$AGENT_NAME" '
+        .result.snapshot.agents[]?
+        | select(.name == $name)
+        | .pane_id
+      ' 2>/dev/null || true
+  )
+
+  if [[ "${#MATCHES[@]}" -gt 1 ]]; then
+    printf 'Error: %s herdr agents are named %s (role %s): %s\n' \
+      "${#MATCHES[@]}" "$AGENT_NAME" "$ROLE" "${MATCHES[*]}" >&2
+    printf 'Refusing to guess between them.\n' >&2
+    exit 1
+  fi
+  if [[ "${#MATCHES[@]}" -eq 1 ]]; then
+    printf '%s\n' "${MATCHES[0]}"
+    exit 0
+  fi
+fi
+
+# Method 2: ask herdr to resolve the name directly.
+if AGENT_JSON="$(herdr agent get "$AGENT_NAME" 2>/dev/null)"; then
+  PANE_ID="$(
+    printf '%s' "$AGENT_JSON" |
+      jq -r --arg name "$AGENT_NAME" '
+        .result.agent
+        | select(.name == null or .name == $name)
+        | .pane_id // empty
+      ' 2>/dev/null || true
+  )"
+  if [[ -n "$PANE_ID" ]]; then
+    printf '%s\n' "$PANE_ID"
+    exit 0
+  fi
+fi
+
+printf 'Error: no live herdr agent is named %s (role %s).\n' "$AGENT_NAME" "$ROLE" >&2
+printf 'It is not in the snapshot agents list, and herdr agent get cannot resolve it.\n' >&2
+exit 1
+HELPER
+  } > "$SQUAD_DIR/squad-agent"
+  chmod +x "$SQUAD_DIR/squad-agent"
+
+  # --- send-to ----------------------------------------------------------------
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+# Run one shell command in the herdr pane that currently plays the given role.
+# Never falls back to a guessed pane: if the role cannot be resolved, nothing is
+# sent and the exit status is non-zero.
+#
+#   send-to [--status-file <path>] <manager|coder|advisor> <shell-command>
+#
+# Roles are accepted as aliases so the Manager prompt stays readable. Resolution
+# is delegated to squad-agent, which is the only place that knows how to turn a
+# role into a live herdr pane.
+#
+# --status-file exists to close a launch race, and it must be an explicit option
+# rather than a path parsed out of the command string, which would be fragile.
+#
+# `herdr pane run` only types the command into the target pane and presses
+# Enter. The runner has NOT started when send-to returns, so its own
+# `rm -f "$STATUS_FILE"` has not run either. The Manager runs a launch and then
+# the matching run-wait synchronously in its own pane, so without clearing here
+# run-wait's fast path would find the PREVIOUS round's status file and report
+# that old result before the new command had even begun. Clearing here is
+# guaranteed to precede the wait because it happens in the Manager's own pane,
+# before the command text is queued.
+#
+# Only a LAUNCH passes --status-file. A run-wait must never clear, or a repeated
+# wait would discard a real result and then block.
+
+STATUS_FILE=""
+LAUNCHED=false
+
+# THE STATUS FILE MUST NEVER OUTLIVE ITS ROUND.
+#
+# Every failure path below - a bad role, an unresolvable agent, a herdr socket
+# error, a failed `pane run` - happens AFTER the Manager has already decided to
+# run its run-wait line. If such a failure simply left the previous round's
+# status file in place, run-wait's fast path would read it and report that old
+# result as this round's completion. A silent wrong answer is worse than a hang,
+# so the file is cleared before anything that can fail, and any failure records
+# its own exit code in it.
+#
+# The trap deliberately does NOT write once the command has been dispatched:
+# writing send-to's own 0 there would make run-wait instantly report "finished
+# (status 0)" for a runner that had only just started - the same wrong-answer
+# bug in the other direction. After a successful dispatch the ONLY writer is the
+# runner's own EXIT trap.
+record_failed_launch() {
+  rc=$?
+  trap - EXIT
+  if [[ -n "$STATUS_FILE" && "$LAUNCHED" != "true" ]]; then
+    printf '%s\n' "$rc" > "$STATUS_FILE"
+  fi
+  exit "$rc"
+}
+trap record_failed_launch EXIT
+
+if [[ "${1:-}" == "--status-file" ]]; then
+  if [[ $# -lt 2 || -z "${2:-}" ]]; then
+    printf 'Error: --status-file requires a path.\n' >&2
+    exit 2
+  fi
+  STATUS_FILE="$2"
+  shift 2
+  # Before anything that can fail, including argument validation below.
+  rm -f "$STATUS_FILE"
+fi
+
+if [[ $# -ne 2 ]]; then
+  printf 'Usage: send-to [--status-file <path>] <manager|coder|advisor> <shell-command>\n' >&2
+  printf 'The command must be a single argument; quote it.\n' >&2
+  exit 2
+fi
+
+ROLE="$1"
+COMMAND="$2"
+
+if ! PANE="$("$SQUAD_DIR/squad-agent" "$ROLE")"; then
+  printf 'Error: send-to %s aborted, nothing was sent.\n' "$ROLE" >&2
+  exit 1
+fi
+
+herdr pane run "$PANE" "$COMMAND" >/dev/null
+LAUNCHED=true
+printf '[%s] sent to %s (pane %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$ROLE" "$PANE"
+HELPER
+  } > "$SQUAD_DIR/send-to"
+  chmod +x "$SQUAD_DIR/send-to"
+
+  # --- run-wait ---------------------------------------------------------------
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+# Block until one step's status file appears.
+#
+#   run-wait <status-file> <manager|coder|advisor> <timeout-seconds> <label>
+#
+# run-wait itself exits 0 for every outcome except an invalid role (2). The
+# outcome is the CONTENT of the status file: the runner's exit code, or 124 on
+# timeout, or 125 when the agent vanished without one.
+STATUS_FILE="$1"
+ROLE="$2"
+TIMEOUT_SECONDS="$3"
+LABEL="$4"
+
+# The status file is a local stat, so it is checked every second. A herdr
+# snapshot is far more expensive and an agent that died a few seconds ago is
+# still reported correctly, so agent liveness is checked far less often.
+AGENT_CHECK_INTERVAL_SECONDS=10
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+# COMPLETION IS THE STATUS FILE.
+#
+# Each runner deletes this file when it starts and writes it exactly once, from
+# an EXIT trap, when it finishes. So a non-empty status file means "this round
+# finished" and nothing else can mean that. -s rather than -f is deliberate: it
+# skips the instant during which the redirect has truncated the file but not yet
+# written to it.
+#
+# herdr does expose `herdr agent wait --status idle`, but agent status is a
+# heuristic over what the pane is displaying, and one status transition is not
+# tied to a particular round of work. The status file is.
+status_ready() {
+  [[ -s "$STATUS_FILE" ]]
+}
+
+# Fail closed on a bad role rather than waiting for something nothing will ever
+# produce, which would hang the Manager.
+case "$ROLE" in
+  manager | coder | advisor) ;;
+  *)
+    printf '125\n' > "$STATUS_FILE"
+    log "$LABEL: invalid role $ROLE (expected manager, coder, or advisor). Pass a role, never a pane ID."
+    exit 2
+    ;;
+esac
+
+# Returns 0 ONLY when the resolver definitively could not find the agent by any
+# supported method. squad-agent tries the snapshot first and then
+# `herdr agent get`, and both have to come back empty before we call it gone.
+#
+# This is intentionally not the same as "the resolver exited non-zero": a
+# transient herdr socket error also fails, and recording that as a dead agent
+# would turn a healthy run into a bogus 125. So a failure is re-checked once
+# after a short pause, and only a second consecutive failure counts.
+agent_gone() {
+  "$SQUAD_DIR/squad-agent" "$ROLE" >/dev/null 2>&1 && return 1
+  sleep 2
+  "$SQUAD_DIR/squad-agent" "$ROLE" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+report_done() {
+  log "$LABEL finished (status $(cat "$STATUS_FILE"))."
+  exit 0
+}
+
+# Fast path: the runner may have finished before this wait was ever called.
+if status_ready; then
+  report_done
+fi
+
+elapsed=0
+since_agent_check=0
+while :; do
+  # Authoritative check, always first.
+  if status_ready; then
+    report_done
+  fi
+
+  if ((since_agent_check >= AGENT_CHECK_INTERVAL_SECONDS)); then
+    since_agent_check=0
+    if agent_gone; then
+      # The agent may have vanished only after the runner finished.
+      if status_ready; then
+        report_done
+      fi
+      printf '125\n' > "$STATUS_FILE"
+      log "$LABEL: the herdr agent for role $ROLE no longer exists."
+      exit 0
+    fi
+  fi
+
+  if ((elapsed >= TIMEOUT_SECONDS)); then
+    # Re-read before giving up: the runner may have finished during the last
+    # sleep. Recording 124 over a real status would report a completed step as
+    # a timeout.
+    if status_ready; then
+      report_done
+    fi
+    printf '124\n' > "$STATUS_FILE"
+    log "$LABEL timed out after $TIMEOUT_SECONDS seconds."
+    exit 0
+  fi
+
+  sleep 1
+  ((elapsed += 1))
+  ((since_agent_check += 1))
+done
+HELPER
+  } > "$SQUAD_DIR/run-wait"
+  chmod +x "$SQUAD_DIR/run-wait"
+
+  # --- Runners (executed inside the Coder / Advisor panes) --------------------
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+SESSION_ID="$4"
+SCHEMA_FILE="$5"
+MODE="$6"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+STDERR_FILE="${RESULT_FILE%.json}.stderr.log"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  log ">>> Coder exited with status $rc."
+  exit "$rc"
+}
+trap finish EXIT
+
+# Clear the previous round's status so its presence unambiguously means "THIS
+# round finished". run-wait treats the status file as the single source of
+# truth, and the Manager re-runs the Coder via resume after every fix, so a
+# status left over from an earlier round would otherwise let the next wait
+# report a stale result as if it were fresh. Done AFTER the trap is installed,
+# so a failure from here on still records a status.
+rm -f "$STATUS_FILE"
+
+# The Coder runs with permissions skipped, and a single stray teardown command
+# would destroy the workspace the PO is watching. See guard-bin/herdr for what
+# this does and does not protect against.
+export PATH="$SQUAD_DIR/guard-bin:$PATH"
+
+if [[ "$MODE" == "initial" ]]; then
+  SESSION_ARGS=(--session-id "$SESSION_ID")
+  log ">>> Coder prompt sent (initial session)."
+else
+  SESSION_ARGS=(--resume "$SESSION_ID")
+  log ">>> Coder prompt sent (resuming fixed session $SESSION_ID)."
+fi
+claude -p \
+  --dangerously-skip-permissions \
+  --append-system-prompt "Never tear down any part of the PO's herdr session. In particular never run 'herdr workspace close', 'herdr tab close', 'herdr pane close', 'herdr session stop', 'herdr session delete', 'herdr server stop', 'herdr server live-handoff', 'herdr worktree remove', 'herdr config reset-keys', or 'herdr integration uninstall'. Never run 'herdr agent rename' or 'herdr pane release-agent' either: they clear the agent names this squad addresses through. If a temporary herdr workspace or pane is created for testing, leave it running and report the cleanup command instead of executing it." \
+  "${SESSION_ARGS[@]}" \
+  --output-format stream-json \
+  --include-partial-messages \
+  --verbose \
+  --json-schema "$(cat "$SCHEMA_FILE")" \
+  "$(cat "$TASK_FILE")" 2> "$STDERR_FILE" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "assistant" then
+      .message.content[]? |
+      if .type == "tool_use" then "[tool] \(.name)"
+      elif .type == "text" then .text
+      else empty end
+    elif .type == "result" then "[result] \(.subtype // "done")"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+
+if [[ -s "$STDERR_FILE" ]]; then
+  while IFS= read -r line; do log "[stderr] $line" >&2; done < "$STDERR_FILE"
+fi
+jq -c 'select(.type == "result") | (.structured_output // .result)' "$STREAM_FILE" |
+  tail -n 1 > "$RESULT_FILE"
+log ">>> Coder finished."
+HELPER
+  } > "$SQUAD_DIR/run-coder"
+  chmod +x "$SQUAD_DIR/run-coder"
+
+  # --- run-manager --------------------------------------------------------------
+  # The Manager pane is started as a plain login shell and this is dispatched
+  # into it with `herdr pane run`, exactly like every other step. That ordering
+  # is deliberate: it lets the launch verify that all three roles are resolvable
+  # BEFORE any AI starts, and it makes the first thing the run does a live test
+  # of the same dispatch path the whole protocol depends on.
+
+  cat > "$SQUAD_DIR/run-manager" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+WORKDIR="$1"
+PROMPT_FILE="$2"
+TASK_FILE="$3"
+MARKER_FILE="$4"
+GUARD_BIN="$(dirname "$PROMPT_FILE")/guard-bin"
+
+# Written before anything that can fail, so the launching squad-herdr can prove
+# the `herdr pane run` dispatch actually reached this pane rather than guessing
+# from a timeout.
+printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "$MARKER_FILE"
+
+cd "$WORKDIR"
+export PATH="$GUARD_BIN:$PATH"
+
+printf '[%s] Manager starting.\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 exec claude \
+  --dangerously-skip-permissions \
+  --allowedTools "Bash Read Glob Grep WebFetch WebSearch" \
+  --append-system-prompt "$(cat "$PROMPT_FILE")" \
+  "$(cat "$TASK_FILE")"
+HELPER
+  chmod +x "$SQUAD_DIR/run-manager"
+
+  cat > "$SQUAD_DIR/run-advisor" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+SCHEMA_FILE="$4"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  log ">>> Advisor exited with status $rc."
+  exit "$rc"
+}
+trap finish EXIT
+
+# See run-coder: cleared after the trap is installed, so every later exit path
+# still records a status.
+rm -f "$STATUS_FILE"
+
+log ">>> Advisor planning prompt sent."
+codex -a never -s read-only exec \
+  --json \
+  --output-schema "$SCHEMA_FILE" \
+  -o "$RESULT_FILE" \
+  "$(cat "$TASK_FILE")" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "item.started" then "[started] \(.item.type // "item")"
+    elif .type == "item.completed" and .item.type == "command_execution" then
+      "[command] \(.item.command // "")\n[exit] \(.item.exit_code // "unknown")"
+    elif .type == "item.completed" and .item.type == "agent_message" then .item.text
+    elif .type == "turn.completed" then "[turn] completed"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+cat "$RESULT_FILE" 2>/dev/null || true
+log ">>> Advisor finished."
+HELPER
+  chmod +x "$SQUAD_DIR/run-advisor"
+
+  cat > "$SQUAD_DIR/run-review" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+SCHEMA_FILE="$4"
+STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  log ">>> Advisor review exited with status $rc."
+  exit "$rc"
+}
+trap finish EXIT
+
+# See run-coder: cleared after the trap is installed, so every later exit path
+# still records a status.
+rm -f "$STATUS_FILE"
+
+log ">>> Advisor review prompt sent."
+# NOTE: codex `exec review` treats the scope flags (--uncommitted/--base/--commit)
+# as mutually exclusive with a custom [PROMPT]. We drive the review entirely from
+# the prompt (which instructs inspecting the uncommitted changes), so do NOT pass
+# --uncommitted here, or codex aborts with:
+#   error: the argument '--uncommitted' cannot be used with '[PROMPT]'
+codex -a never -s read-only exec review \
+  --json \
+  --output-schema "$SCHEMA_FILE" \
+  -o "$RESULT_FILE" \
+  "$(cat "$TASK_FILE")" |
+  tee "$STREAM_FILE" |
+  jq --unbuffered -r '
+    if .type == "item.started" then "[started] \(.item.type // "item")"
+    elif .type == "item.completed" and .item.type == "command_execution" then
+      "[command] \(.item.command // "")\n[exit] \(.item.exit_code // "unknown")"
+    elif .type == "item.completed" and .item.type == "agent_message" then .item.text
+    elif .type == "turn.completed" then "[turn] completed"
+    else empty end
+  ' |
+  while IFS= read -r line; do log "$line"; done
+cat "$RESULT_FILE" 2>/dev/null || true
+log ">>> Advisor review finished."
+HELPER
+  chmod +x "$SQUAD_DIR/run-review"
+}
+
 case "${1:-}" in
   -h|--help|"")
     usage 0
+    ;;
+  gen-helpers)
+    [[ -n "${2:-}" ]] || {
+      echo "Error: squad-herdr gen-helpers requires a target directory" >&2
+      exit 1
+    }
+    SQUAD_DIR="$2"
+    RUN_ID="${SQUAD_GEN_RUN_ID:-gen-helpers}"
+    MANAGER_AGENT="Manager-$RUN_ID"
+    CODER_AGENT="Coder-$RUN_ID"
+    ADVISOR_AGENT="Advisor-$RUN_ID"
+    generate_helper_scripts
+    printf 'Helper scripts written to %s\n' "$SQUAD_DIR"
+    exit 0
     ;;
   list)
     list_runs
@@ -215,6 +841,9 @@ SQUAD_DIR="$SQUAD_RUN_ROOT/$RUN_ID"
 MANAGER_AGENT="Manager-$RUN_ID"
 CODER_AGENT="Coder-$RUN_ID"
 ADVISOR_AGENT="Advisor-$RUN_ID"
+# Fixed up front so the Coder can be resumed into the SAME conversation for every
+# round of fixes. `claude -p --session-id` creates it on the first run.
+CODER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 WORKTREE_CREATED=false
 
 if [[ "$HAS_COMMITS" == "true" ]]; then
@@ -281,6 +910,7 @@ Artifacts:         $SQUAD_DIR
 Manager agent:     $MANAGER_AGENT
 Coder agent:       $CODER_AGENT
 Advisor agent:     $ADVISOR_AGENT
+Coder session:     $CODER_SESSION_ID
 Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
 INFO
 
@@ -392,6 +1022,9 @@ TAB_ID="$(active_tab_for_workspace "$WORKSPACE_ID")"
   exit 1
 }
 
+# Must precede the Manager prompt: the prompt hard-codes these helper paths.
+generate_helper_scripts
+
 cat > "$SQUAD_DIR/manager-prompt.md" << PROMPT
 # You are a Development Manager
 
@@ -413,27 +1046,93 @@ Speak Japanese to PO (user). Write English for agents.
 - Manager agent: $MANAGER_AGENT
 - Coder agent: $CODER_AGENT
 - Advisor agent: $ADVISOR_AGENT
+- Coder session ID: $CODER_SESSION_ID
 - Wait timeout: $WAIT_TIMEOUT_SECONDS seconds
 
 $WORKTREE_NOTE
 Agents must not create additional worktrees. In particular, do not create
 worktrees under the repository such as .claude/worktree or .claude/worktrees.
 
+## Agent addressing (roles, never pane IDs)
+
+The Coder and Advisor panes run plain login shells. You give them work by
+running a generated runner script inside their pane, and the runner drives
+claude or codex non-interactively with an enforced output schema.
+
+Herdr assigns pane IDs dynamically, so a pane ID is NEVER a stable address.
+Address agents by role only. The roles are exactly: manager, coder, advisor.
+
+  '$SQUAD_DIR/squad-agent' <role>                    # prints the live pane ID
+  '$SQUAD_DIR/send-to' [--status-file <path>] <role> '<command>'
+
+squad-agent maps the role to this run's stable herdr agent name and resolves it
+to a pane, first through \`herdr api snapshot\` (requiring exactly one match)
+and then through \`herdr agent get\`. send-to and run-wait both address agents
+through it, so if squad-agent cannot resolve a role, neither can they. On
+failure send-to sends nothing and exits non-zero.
+
+- NEVER run \`herdr pane run\`, \`herdr pane send-text\`, or \`herdr pane send-keys\`
+  yourself, and never write a literal herdr pane ID (such as w1:p2) in any command.
+- \`herdr agent send\` is for natural-language interactive fallback ONLY, when a
+  runner is wedged and PO asks you to poke the pane by hand. It is never part of
+  the normal workflow, because it produces no status file and no schema-checked
+  result.
+- If a helper reports that a role cannot be resolved, report that to PO and stop.
+  Do not guess a pane ID.
+
 ## Critical rules
 
 - BEFORE asking Advisor to plan, inspect the ticket URL or task context and
   replace the provisional squad title with a specific title.
-- NEVER run codex or claude commands directly. ALL work MUST go through
-  \`herdr agent send\` to the Coder and Advisor agents.
+- A squad title MUST include the ticket ID when one exists, the business object
+  or feature area, and the concrete change. Avoid vague titles such as
+  "CSV import", "API fix", or "bug fix". For example:
+  "EAR-123 | 車両マスタCSVインポートの重複検証追加".
+- NEVER run codex or claude commands directly. ALL work MUST go through the
+  send-to helper so that it lands in the agent panes.
 - NEVER skip the Advisor planning step.
 - ALWAYS follow the full workflow in order.
-- The PO must be able to see agent work in Herdr.
-- Use \`herdr agent wait\` to wait for completion. If Herdr cannot detect a
-  status transition for an agent, report that blocker to PO instead of polling forever.
+- The PO must be able to see agent work in the Herdr panes.
+- Use the run-wait helper to wait for completion. NEVER poll with
+  \`herdr pane read\` or \`herdr agent read\`.
+- NEVER run any herdr teardown command: \`herdr workspace close\`,
+  \`herdr tab close\`, \`herdr pane close\`, \`herdr session stop\`,
+  \`herdr session delete\`, \`herdr server stop\`, \`herdr server live-handoff\`,
+  \`herdr worktree remove\`, \`herdr config reset-keys\`, or
+  \`herdr integration uninstall\`. Never run \`herdr agent rename\` or
+  \`herdr pane release-agent\` either: they clear the agent names send-to and
+  run-wait resolve through, which breaks the whole squad silently.
+  Do not ask Coder or Advisor to run any of them either. This
+  includes test cleanup: if a temporary herdr workspace or pane is created for
+  testing, leave it running and report the cleanup command to PO instead of
+  executing it.
 - The Coder MUST run relevant automated tests for the task. If tests cannot run,
   report the exact blocker to PO and do not claim completion.
 - NEVER commit, push, force-push, merge, rebase, or create a pull request unless
   PO explicitly asks for that Git operation. Editing files is allowed.
+- NEVER create additional git worktrees, including Claude Code default locations
+  such as .claude/worktree or .claude/worktrees. Use only the isolated squad
+  worktree: $WORKDIR.
+
+## Status handling
+
+Every runner writes its exit code to its status file from an EXIT trap, so a
+status file is written on every exit path. run-wait treats that file as the
+single source of truth and blocks until it appears.
+
+After every run-wait command, read the status file. If it is not 0, read the
+corresponding result file if present, report the failure to PO, and decide
+whether the Coder can fix it. Never wait indefinitely after a helper failure.
+
+run-wait writes 125 into the status file when the herdr agent for that role no
+longer exists, and 124 when the $WAIT_TIMEOUT_SECONDS second timeout expires.
+run-wait itself always exits 0 except on an invalid role, so judge the outcome
+by the status file content, never by run-wait's exit status.
+
+A send-to that fails to launch also records its own non-zero exit code in the
+status file, so a failed launch can never be mistaken for a completed run. If
+send-to exits non-zero, report that to PO and do NOT run the matching run-wait
+expecting work to have started.
 
 ## Commands
 
@@ -441,10 +1140,11 @@ worktrees under the repository such as .claude/worktree or .claude/worktrees.
 
 Read the ticket URL or task context first. Write a concise, specific Japanese
 title to $SQUAD_DIR/new-title.txt. Include the detected ticket ID
-(${TICKET_ID:-none}) when available. Then run:
+(${TICKET_ID:-none}) when available. Distinguish this squad from parallel work
+on similar features by naming the business object and concrete change. Then run:
 
   cat > '$SQUAD_DIR/new-title.txt' <<'EOF'
-  (specific title)
+  (specific title, for example: EAR-123 | 車両マスタCSVインポートの重複検証追加)
   EOF
   '$SQUAD_DIR/update-title' '$SQUAD_DIR/title.txt' '$SQUAD_DIR/new-title.txt' '$WORKSPACE_ID' '$TAB_ID'
 
@@ -454,46 +1154,77 @@ Write an English request to $SQUAD_DIR/advisor-task.txt. Ask Advisor to inspect
 the repository, produce a scoped implementation plan, define acceptance criteria,
 identify relevant tests, and call out risks. Then run:
 
-  herdr agent send '$ADVISOR_AGENT' "\$(cat '$SQUAD_DIR/advisor-task.txt')"
-  herdr agent wait '$ADVISOR_AGENT' --status working --timeout 30000 || true
-  herdr agent wait '$ADVISOR_AGENT' --status idle --timeout $((WAIT_TIMEOUT_SECONDS * 1000))
-  herdr agent read '$ADVISOR_AGENT' --source recent --lines 200 > '$SQUAD_DIR/advisor-result.txt'
-  cat '$SQUAD_DIR/advisor-result.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/advisor-status.txt' advisor '$SQUAD_DIR/run-advisor $SQUAD_DIR/advisor-task.txt $SQUAD_DIR/advisor-result.json $SQUAD_DIR/advisor-status.txt $SQUAD_DIR/plan-schema.json'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/advisor-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor planning'
+  cat '$SQUAD_DIR/advisor-status.txt'
+  cat '$SQUAD_DIR/advisor-result.json'
 
 ### Ask Coder to implement
 
 Write an English request to $SQUAD_DIR/coder-task.txt. Include the approved plan
 and acceptance criteria. Require Coder to inspect project rules, implement the
-change, run relevant automated tests, and return the verification report. Then run:
+change, run relevant automated tests, and return the structured verification
+report. For broad or uncertain changes, require Coder to use built-in Explore
+subagents to investigate independent areas in parallel before editing. Keep all
+file writes in the main Coder session, and skip subagents for narrow changes.
+Explicitly prohibit commit, push, force-push, merge, rebase, and pull-request
+creation unless PO requested that specific Git operation. Explicitly prohibit
+creating any additional git worktree, including .claude/worktree or
+.claude/worktrees. Explicitly prohibit every herdr teardown command:
+\`herdr workspace close\`, \`herdr tab close\`, \`herdr pane close\`,
+\`herdr session stop\`, \`herdr session delete\`, \`herdr server stop\`,
+\`herdr server live-handoff\`, \`herdr worktree remove\`,
+\`herdr config reset-keys\`, and \`herdr integration uninstall\`; also
+\`herdr agent rename\` and \`herdr pane release-agent\`, which clear the agent
+names this squad addresses through. Tell Coder to leave any temporary herdr
+workspace or pane running and report the cleanup command instead. Then run:
 
-  herdr agent send '$CODER_AGENT' "\$(cat '$SQUAD_DIR/coder-task.txt')"
-  herdr agent wait '$CODER_AGENT' --status working --timeout 30000 || true
-  herdr agent wait '$CODER_AGENT' --status idle --timeout $((WAIT_TIMEOUT_SECONDS * 1000))
-  herdr agent read '$CODER_AGENT' --source recent --lines 300 > '$SQUAD_DIR/coder-result.txt'
-  cat '$SQUAD_DIR/coder-result.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/coder-status.txt' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.json $SQUAD_DIR/coder-status.txt $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder'
+  cat '$SQUAD_DIR/coder-status.txt'
+  cat '$SQUAD_DIR/coder-result.json'
 
 ### Ask Advisor to review
 
 Write an English request to $SQUAD_DIR/review-task.txt. Tell Advisor to inspect
-all uncommitted changes, verify behavior against the approved acceptance criteria,
-and check the Coder's test report. Then run:
+all uncommitted changes, verify behavior against the approved acceptance
+criteria, check the Coder's test report, and return must_fix findings. A pass
+verdict is allowed only when relevant tests actually ran. Then run:
 
-  herdr agent send '$ADVISOR_AGENT' "\$(cat '$SQUAD_DIR/review-task.txt')"
-  herdr agent wait '$ADVISOR_AGENT' --status working --timeout 30000 || true
-  herdr agent wait '$ADVISOR_AGENT' --status idle --timeout $((WAIT_TIMEOUT_SECONDS * 1000))
-  herdr agent read '$ADVISOR_AGENT' --source recent --lines 300 > '$SQUAD_DIR/review-result.txt'
-  cat '$SQUAD_DIR/review-result.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-task.txt $SQUAD_DIR/review-result.json $SQUAD_DIR/review-status.txt $SQUAD_DIR/review-schema.json'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/review-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor review'
+  cat '$SQUAD_DIR/review-status.txt'
+  cat '$SQUAD_DIR/review-result.json'
 
 ### Ask Coder to fix review findings
 
-Write an English request to $SQUAD_DIR/coder-task.txt. Include all must-fix
-findings and require updated tests. Then run:
+Write an English request to $SQUAD_DIR/coder-task.txt. Include all must_fix
+findings and require updated tests. Reiterate that Coder must not create
+additional git worktrees and must keep all work in $WORKDIR. Reiterate that
+Coder must not close, stop, delete, or hand off any herdr workspace, tab, pane,
+session, worktree, or server, and must not rename or release any agent,
+including for test cleanup. The final argument is \`resume\` rather than
+\`initial\`, which continues the exact same Coder session:
 
-  herdr agent send '$CODER_AGENT' "\$(cat '$SQUAD_DIR/coder-task.txt')"
-  herdr agent wait '$CODER_AGENT' --status working --timeout 30000 || true
-  herdr agent wait '$CODER_AGENT' --status idle --timeout $((WAIT_TIMEOUT_SECONDS * 1000))
-  herdr agent read '$CODER_AGENT' --source recent --lines 300 > '$SQUAD_DIR/coder-result.txt'
-  cat '$SQUAD_DIR/coder-result.txt'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/coder-status.txt' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.json $SQUAD_DIR/coder-status.txt $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder fix'
+  cat '$SQUAD_DIR/coder-status.txt'
+  cat '$SQUAD_DIR/coder-result.json'
+
+## Result files
+
+Each runner enforces a JSON schema, so the result file is structured JSON:
+
+- $SQUAD_DIR/advisor-result.json follows plan-schema.json: summary, scope,
+  acceptance_criteria, files_to_inspect, implementation_steps, tests, risks.
+- $SQUAD_DIR/coder-result.json follows coder-schema.json: summary,
+  changed_files, tests_run, tests_not_run, test_status, remaining_issues.
+- $SQUAD_DIR/review-result.json follows review-schema.json: verdict, summary,
+  must_fix, should_fix, test_gaps.
+
+The raw agent stream for each step is kept alongside as *.stream.jsonl, and the
+Coder's stderr as coder-result.stderr.log. Read those only when a step failed
+and the result file is missing or unusable.
 
 ## Workflow
 
@@ -501,7 +1232,7 @@ findings and require updated tests. Then run:
 2. Ask Advisor for a structured implementation plan.
 3. Show the plan to PO in Japanese and ask for approval.
 4. Ask Coder to implement the approved plan.
-5. Read Coder verification report.
+5. Read Coder status and structured verification report.
 6. Ask Advisor to review the uncommitted changes and verification evidence.
 7. If review verdict is must_fix, ask Coder to fix the issues.
 8. After every fix, repeat from step 5.
@@ -512,18 +1243,106 @@ PROMPT
 RUN_STATUS="running"
 write_state
 
+printf '%s' "$TASK" > "$SQUAD_DIR/manager-task.txt"
+
+# --- Launch -------------------------------------------------------------------
+#
+# ALL THREE PANES ARE PLAIN LOGIN SHELLS. Work arrives as a runner script
+# dispatched with `herdr pane run`; each runner drives claude or codex
+# non-interactively with an enforced output schema and writes a status file on
+# every exit path. An interactive agent could do neither.
+#
+# The Manager is a shell too, and its claude process is started by the same
+# `pane run` dispatch as every other step, at the very end. That buys two
+# things a plain `herdr agent start ... -- claude` could not:
+#
+#   1. Every role is proven addressable BEFORE any AI exists. If a pane started
+#      as `herdr agent start <name> -- bash -l` turns out not to be resolvable,
+#      the launch fails here with a clear message instead of handing a Manager
+#      control of a team it cannot reach.
+#   2. The very first thing the run does is exercise the dispatch path the whole
+#      protocol depends on, so a broken `pane run` fails loudly at launch rather
+#      than silently at the first delegation.
+#
+# The start ORDER and split layout are unchanged from the interactive version -
+# Manager first with no split, Coder split right, Advisor split down - because
+# the splits are relative to the tab's focused pane and reordering them would
+# rearrange the PO's panes.
 herdr agent start "$MANAGER_AGENT" --cwd "$WORKDIR" --workspace "$WORKSPACE_ID" --tab "$TAB_ID" --no-focus -- \
-  bash -lc 'sleep 3; exec "$@"' bash \
-  claude --dangerously-skip-permissions \
-  --allowedTools "Bash Read Glob Grep WebFetch WebSearch" \
-  --append-system-prompt "$(cat "$SQUAD_DIR/manager-prompt.md")" \
-  "$TASK"
+  bash -l
 
 herdr agent start "$CODER_AGENT" --cwd "$WORKDIR" --workspace "$WORKSPACE_ID" --tab "$TAB_ID" --split right --no-focus -- \
-  claude --dangerously-skip-permissions
+  bash -l
 
 herdr agent start "$ADVISOR_AGENT" --cwd "$WORKDIR" --workspace "$WORKSPACE_ID" --tab "$TAB_ID" --split down --focus -- \
-  codex
+  bash -l
+
+# Registration is not necessarily instant, so poll rather than taking one
+# snapshot. squad-agent is the same resolver send-to and run-wait use, so a role
+# that resolves here is a role they can address.
+AGENT_READY_TIMEOUT_SECONDS=20
+unresolved=""
+for role in manager coder advisor; do
+  waited=0
+  until "$SQUAD_DIR/squad-agent" "$role" >/dev/null 2>&1; do
+    if ((waited >= AGENT_READY_TIMEOUT_SECONDS)); then
+      unresolved="$unresolved $role"
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+done
+
+if [[ -n "$unresolved" ]]; then
+  echo "Error: these squad roles are not addressable through herdr:$unresolved" >&2
+  echo "" >&2
+  echo "Neither the snapshot agents list nor 'herdr agent get' can resolve their" >&2
+  echo "names, so send-to and run-wait could never reach them. The Manager was NOT" >&2
+  echo "started, because it would have had no way to drive its team." >&2
+  echo "" >&2
+  echo "The panes are still open and were left untouched. To tear the run down:" >&2
+  echo "  squad-herdr close $RUN_ID" >&2
+  exit 1
+fi
+
+# Dispatched exactly like every later step, through the resolver and send-to.
+#
+# Built with %q, NOT literal single quotes. send-to hands this string to
+# `herdr pane run`, which types it into a shell, so it has to survive being
+# re-parsed. A single quote anywhere in these paths - a repo basename with an
+# apostrophe, or a SQUAD_WORKTREE_ROOT under one - would terminate a
+# literal-quoted argument early and type a broken command, and the launch would
+# then die at the manager-started.txt timeout with perfectly valid paths.
+printf -v MANAGER_DISPATCH '%q %q %q %q %q' \
+  "$SQUAD_DIR/run-manager" \
+  "$WORKDIR" \
+  "$SQUAD_DIR/manager-prompt.md" \
+  "$SQUAD_DIR/manager-task.txt" \
+  "$SQUAD_DIR/manager-started.txt"
+"$SQUAD_DIR/send-to" manager "$MANAGER_DISPATCH"
+
+# run-manager writes the marker before anything that can fail, so its appearance
+# is proof the dispatch reached the pane and the shell ran it. Without this a
+# `pane run` that silently went nowhere would look exactly like a successful
+# launch.
+MANAGER_START_TIMEOUT_SECONDS=30
+waited=0
+until [[ -s "$SQUAD_DIR/manager-started.txt" ]]; do
+  if ((waited >= MANAGER_START_TIMEOUT_SECONDS)); then
+    echo "Error: the Manager did not start within $MANAGER_START_TIMEOUT_SECONDS seconds." >&2
+    echo "" >&2
+    echo "send-to resolved the Manager pane and 'herdr pane run' reported success," >&2
+    echo "but $SQUAD_DIR/manager-started.txt was never written, so the command did" >&2
+    echo "not actually execute in the pane. Check the Manager pane in Herdr." >&2
+    echo "" >&2
+    echo "The panes are still open and were left untouched. To tear the run down:" >&2
+    echo "  squad-herdr close $RUN_ID" >&2
+    exit 1
+  fi
+  sleep 1
+  waited=$((waited + 1))
+done
 
 herdr agent focus "$MANAGER_AGENT" || true
 
