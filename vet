@@ -551,6 +551,12 @@ WINDOW_SHORT_NAME=$(printf '%q' "${WINDOW_SHORT_NAME:-vet}")
 WAIT_TIMEOUT_SECONDS=$(printf '%q' "${WAIT_TIMEOUT_SECONDS:-7200}")
 EVENT_A=$(printf '%q' "vet-$RUN_ID-reviewer-a")
 EVENT_B=$(printf '%q' "vet-$RUN_ID-reviewer-b")
+VET_BIN=$(printf '%q' "$VET_SCRIPT_PATH")
+VET_RUN_ID=$(printf '%q' "$RUN_ID")
+# Baked, not inherited: vet render resolves a run id through VET_STATE_ROOT, and
+# run-step must not depend on whatever environment the Manager's pane happens to
+# have. Everything else here is baked for the same reason.
+VET_STATE_ROOT_BAKED=$(printf '%q' "$VET_STATE_ROOT")
 
 usage() {
   cat >&2 <<'USAGE'
@@ -563,6 +569,7 @@ closed set, and nothing else:
   wait-a             block until Reviewer A finishes
   wait-b             block until Reviewer B finishes
   title              apply <run dir>/new-title.txt to the pane titles
+  render             validate consolidated.json and render report.html
 
 Any other argument, a missing argument, or ANY extra argument is rejected.
 USAGE
@@ -622,6 +629,14 @@ case "\$1" in
     exec "\$RUN_DIR/update-title" "\$RUN_DIR/title.txt" "\$RUN_DIR/new-title.txt" \\
       "\$WINDOW_SHORT_NAME" "\$MANAGER_PANE" "\$REVIEWER_A_PANE" "\$REVIEWER_B_PANE"
     ;;
+  render)
+    # Hands rendering back to VET - the Manager never writes HTML. This exists
+    # because the Manager runs as an INTERACTIVE claude session: it finishes its
+    # work and then sits at the prompt, so anything vet does after claude returns
+    # only happens when the PO finally quits. Triggering the render here means the
+    # report exists the moment the review is done.
+    VET_STATE_ROOT="\$VET_STATE_ROOT_BAKED" exec "\$VET_BIN" render "\$VET_RUN_ID"
+    ;;
   *)
     printf 'Error: unknown step: %s\n' "\$1" >&2
     usage
@@ -639,11 +654,30 @@ RUNSTEP
 # the Manager rewrite it - and turn it into a report without paying for another
 # agent session. It is also what makes the gate's own error message honest: the
 # command it prints actually works.
+# Has report.html already been rendered from the CURRENT consolidated.json?
+#
+# The Manager renders the report itself as its last step, so by the time vet
+# regains control the report usually already exists and is correct. Re-rendering
+# would overwrite a good report with an identical one and print as though
+# something new had happened. Mtime is the honest test: if the JSON was touched
+# after the report was written, the report is stale and must be redone.
+report_is_current() {
+  local report="$1" consolidated="$2"
+  [[ -f "$report" ]] || return 1
+  # "Not older than", NOT "strictly newer than". The Manager writes the JSON and
+  # renders immediately after, so the two mtimes routinely land in the same
+  # second; `report -nt consolidated` is false there and we would pointlessly
+  # re-render and re-announce on every normal run. Only a JSON that is strictly
+  # newer than the report means the report is stale.
+  ! [[ "$consolidated" -nt "$report" ]]
+}
+
 render_run() {
   # An EXPLICIT run-id must match exactly. load_run's default is to fall back to
   # the most recent run when the id does not resolve, which for render would
   # quietly hand the PO a different run's report after a typo. Only the no-arg
   # form is allowed to pick the current window's run or the latest.
+  local mode="${2:-always}"
   if [[ -n "${1:-}" ]]; then
     load_run "$1" false
   else
@@ -675,6 +709,12 @@ render_run() {
   COMMON_CHECKLIST_SOURCE="${COMMON_CHECKLIST_SOURCE:-none}"
   PROJECT_CHECKLIST_SOURCE="${PROJECT_CHECKLIST_SOURCE:-none}"
 
+  if [[ "$mode" == "if-stale" ]] && report_is_current "$REPORT_PATH" "$consolidated"; then
+    echo "Report already rendered by the Manager; leaving it as is:"
+    printf '%s\n' "$REPORT_PATH"
+    return 0
+  fi
+
   if ! validate_against_schema "$consolidated" "$schema"; then
     echo "" >&2
     echo "Error: that consolidated JSON does not match the schema (above)." >&2
@@ -683,6 +723,9 @@ render_run() {
     printf 'Edit it:   %s\n' "$consolidated" >&2
     printf 'Against:   %s\n' "$schema" >&2
     printf 'Then:      vet render %s\n' "$RUN_ID" >&2
+    # The Manager reads this too, and its allowlist permits only run-step - so
+    # name the command it is actually able to run.
+    printf '           (as the Manager: %s/run-step render)\n' "$VET_DIR" >&2
     exit 1
   fi
 
@@ -911,7 +954,12 @@ case "$1" in
     exit 0
     ;;
   render)
-    render_run "${2:-}"
+    # --if-stale is for vet's own post-exit safety net, not for the PO.
+    if [[ "${2:-}" == "--if-stale" ]]; then
+      render_run "${3:-}" if-stale
+    else
+      render_run "${2:-}"
+    fi
     exit 0
     ;;
   resume)
@@ -2052,6 +2100,9 @@ WORKDIR="\$1"
 PROMPT_FILE="\$2"
 SESSION_ID="\$3"
 RUN_DIR="$VET_DIR"
+# Baked, not inherited - same reason as run-step: the render below resolves the
+# run through VET_STATE_ROOT and must not depend on the pane's environment.
+VET_STATE_ROOT_BAKED=$(printf '%q' "$VET_STATE_ROOT")
 
 for required_flag in --tools --setting-sources --allowedTools --disallowedTools --strict-mcp-config; do
   if ! claude --help 2>&1 | grep -q -- "\$required_flag"; then
@@ -2087,7 +2138,7 @@ echo "Manager exited with status \$MANAGER_STATUS."
 # Rendering is vet's job, not the Manager's, so hand it back to vet. This both
 # validates and renders, and prints the report path or the exact reason it could
 # not.
-if ! $VET_SCRIPT_PATH render "$RUN_ID"; then
+if ! VET_STATE_ROOT="\$VET_STATE_ROOT_BAKED" $VET_SCRIPT_PATH render --if-stale "$RUN_ID"; then
   echo "" >&2
   echo "The report was not rendered. Fix the JSON and re-run:" >&2
   echo "  $VET_SCRIPT_PATH render $RUN_ID" >&2
@@ -2800,7 +2851,27 @@ Requirements for the JSON:
 - "contradictions": how you settled each disagreement, or that it is unresolved.
 - "summary": one or two sentences. Not an essay.
 
-Then tell PO in Japanese: the absolute path vet will print, and how many
+## Rendering the report - YOUR LAST STEP, and it is not optional
+
+Writing the JSON is not the end. You must render the report yourself:
+
+  $VET_DIR/run-step render
+
+That validates $CONSOLIDATED_PATH against the schema and, if it passes, renders
+$REPORT_PATH and prints the path and the counts. vet renders it - you never
+write HTML.
+
+You have to do this because you are an INTERACTIVE session: after you finish you
+sit at the prompt until PO quits, and anything vet would do after you exit does
+not happen until then. If you skip this step, PO gets no report.
+
+IF run-step render FAILS, it prints exactly which field is wrong and renders
+nothing. That is the gate working. Do NOT tell PO you are done. Read the error,
+fix $CONSOLIDATED_PATH, and run run-step render again. Repeat until it
+succeeds. A run that ends with no report is a failed run, however good the JSON
+looked to you.
+
+Then tell PO in Japanese: the report path that run-step printed, and how many
 must_fix / should_fix / nit / question findings there are.
 
 ## Workflow
@@ -2822,8 +2893,11 @@ must_fix / should_fix / nit / question findings there are.
 6. Reconcile both outputs as described above. Read the real code in $WORKDIR to
    settle contradictions.
 7. Write $CONSOLIDATED_PATH.
-8. Report completion to PO in Japanese with the finding counts.
-9. Do nothing on GitHub unless PO explicitly asks.
+8. Run $VET_DIR/run-step render. If it fails, fix the JSON and run it again
+   until it succeeds - do not proceed to step 9 without a rendered report.
+9. Report completion to PO in Japanese with the report path and the finding
+   counts.
+10. Do nothing on GitHub unless PO explicitly asks.
 PROMPT
 
 RUN_STATUS="running"
@@ -3002,6 +3076,22 @@ if [[ -f "$CONSOLIDATED_PATH" ]]; then
     exit 1
   fi
   rm -f /tmp/vet-validation.$$
+  # SAFETY NET ONLY. The Manager renders the report itself as its final step,
+  # because it is an INTERACTIVE session that does not exit until PO quits -
+  # waiting for that would mean no report for the whole time PO is reading. So
+  # by the time we get here the report normally already exists and is correct.
+  # Re-rendering would replace a good report with an identical one and announce
+  # it as if it were new. We only render when the Manager did not, or when it
+  # changed the JSON after its last render.
+  if report_is_current "$REPORT_PATH" "$CONSOLIDATED_PATH"; then
+    echo ""
+    echo "Report (already rendered during the review):"
+    printf '%s\n' "$REPORT_PATH"
+    if [[ "$OPEN_REPORT" == "true" ]] && command -v open >/dev/null 2>&1; then
+      open "$REPORT_PATH"
+    fi
+    exit "$MANAGER_STATUS"
+  fi
   render_report_html "$CONSOLIDATED_PATH" "$REPORT_PATH"
   echo ""
   printf 'must_fix %s / should_fix %s / nit %s / question %s\n' \
