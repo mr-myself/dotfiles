@@ -42,6 +42,52 @@ EOF
   exit "$status"
 }
 
+# --- Herdr delegation ---------------------------------------------------------
+# Inside a herdr pane there is no tmux server to split, so every subcommand is
+# handed to squad-herdr instead. This is deliberately the FIRST thing that runs,
+# so lifecycle subcommands delegate too: a herdr run is recorded in
+# ~/.local/state/squad-herdr, and answering `list` or `close` from squad's own
+# state root would silently look in the wrong store.
+#
+# tmux wins when both are set. A tmux session started inside a herdr pane
+# exports HERDR_PANE_ID as well, and there the tmux path is the one that works.
+#
+# HERDR_PANE_ID is per-pane and names the pane this shell is in. Do NOT switch
+# this to HERDR_ACTIVE_*: those describe whichever pane the herdr UI currently
+# focuses, which is not necessarily the one running this command.
+if [[ -z "${TMUX:-}" && -n "${HERDR_PANE_ID:-}" ]]; then
+  squad_self="${BASH_SOURCE[0]}"
+  # Resolve symlinks so an installed ~/.local/bin/squad finds the squad-herdr
+  # that ships beside the real script, not one beside the symlink.
+  while [[ -L "$squad_self" ]]; do
+    squad_link="$(readlink "$squad_self")"
+    case "$squad_link" in
+      /*) squad_self="$squad_link" ;;
+      *) squad_self="$(dirname "$squad_self")/$squad_link" ;;
+    esac
+  done
+  squad_herdr="$(cd "$(dirname "$squad_self")" && pwd)/squad-herdr"
+  if [[ ! -x "$squad_herdr" ]]; then
+    squad_herdr="$(command -v squad-herdr 2>/dev/null || true)"
+  fi
+  if [[ -z "$squad_herdr" || ! -x "$squad_herdr" ]]; then
+    echo "Error: running inside a herdr pane, but squad-herdr was not found" >&2
+    echo "       next to squad or on PATH." >&2
+    exit 1
+  fi
+
+  # Usage text only. Every lifecycle instruction squad-herdr emits stays
+  # hard-coded as squad-herdr, because `squad close` and `squad-herdr close`
+  # read different state roots and must never be confused for each other.
+  #
+  # A plain exec, NOT `exec -a squad`: argv[0] is what squad-herdr would fall
+  # back to for its own name, and disguising it would make those hard-coded
+  # lifecycle strings inconsistent with a $0 that claims to be squad.
+  SQUAD_HERDR_DISPLAY_NAME="${0##*/}"
+  export SQUAD_HERDR_DISPLAY_NAME
+  exec "$squad_herdr" "$@"
+fi
+
 SQUAD_STATE_ROOT="${SQUAD_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/squad}"
 SQUAD_RUN_ROOT="$SQUAD_STATE_ROOT/runs"
 SQUAD_WORKTREE_ROOT="${SQUAD_WORKTREE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/squad/worktrees}"
@@ -1592,7 +1638,10 @@ WAIT_TIMEOUT_SECONDS="${SQUAD_WAIT_TIMEOUT_SECONDS:-7200}"
 ORIGINAL_WORKDIR="$(pwd)"
 
 if [[ -z "${TMUX:-}" ]]; then
-  echo "Error: squad must be run inside tmux" >&2
+  echo "Error: starting a squad needs either a tmux session or a herdr pane." >&2
+  echo "       In tmux, squad splits the current pane into three agents." >&2
+  echo "       In a herdr pane (HERDR_PANE_ID set), squad hands off to squad-herdr." >&2
+  echo "       Neither was detected here." >&2
   exit 1
 fi
 

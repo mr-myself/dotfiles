@@ -22,22 +22,28 @@ set -euo pipefail
 
 usage() {
   local status="${1:-1}"
-  cat <<'EOF'
-Usage: squad-herdr <task>
-       squad-herdr list
-       squad-herdr close <run-id>
-       squad-herdr rm <run-id>...
-       squad-herdr gen-helpers <dir>
+  # Display name ONLY, so `squad --help` inside a herdr pane shows the command
+  # the PO actually typed. It must never reach a lifecycle instruction: `squad
+  # close` and `squad-herdr close` read different state roots, so telling anyone
+  # to run the wrong one would point them at the wrong store. Every such string
+  # below stays hard-coded as squad-herdr.
+  local name="${SQUAD_HERDR_DISPLAY_NAME:-${0##*/}}"
+  cat <<EOF
+Usage: $name <task>
+       $name list
+       $name close <run-id>
+       $name rm <run-id>...
+       $name gen-helpers <dir>
 
 Create an isolated git worktree and launch 3 AI agents in Herdr:
   Manager (Claude Code) - talks to you
   Coder   (Claude Code) - implements code
   Advisor (Codex)       - plans and reviews
 
-`gen-helpers` only writes the generated helper scripts into <dir> and exits. It
+\`gen-helpers\` only writes the generated helper scripts into <dir> and exits. It
 starts nothing, so it is the way to inspect or test helper generation.
 
-This is a Herdr prototype. Existing tmux-based `squad` remains the stable path.
+This is a Herdr prototype. Existing tmux-based \`squad\` remains the stable path.
 EOF
   exit "$status"
 }
@@ -763,6 +769,17 @@ HELPER
 case "${1:-}" in
   -h|--help|"")
     usage 0
+    ;;
+  resume|clean|base)
+    # squad subcommands that squad-herdr does not implement yet. Without this
+    # arm they fall through to the new-run path below and get treated as a TASK
+    # DESCRIPTION, which silently creates a worktree and launches three agents.
+    # `squad` delegates every subcommand from inside a herdr pane, so `squad
+    # base` arriving here is a normal typo-level mistake, not an exotic one.
+    echo "Error: squad-herdr does not implement '$1' yet." >&2
+    echo "       Implemented: list, close, rm, gen-helpers, and <task>." >&2
+    echo "       Refusing to treat '$1' as a task description." >&2
+    exit 2
     ;;
   gen-helpers)
     [[ -n "${2:-}" ]] || {
