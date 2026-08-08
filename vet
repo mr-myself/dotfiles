@@ -317,8 +317,6 @@ def count($sev): [.findings[]? | select((.severity // "") == $sev)] | length;
 ".copy{margin-top:.85rem;font:inherit;font-size:.83rem;padding:.4rem .9rem;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);cursor:pointer}",
 ".copy:hover{border-color:var(--acc);color:var(--acc)}",
 ".copy.ok{border-color:#1a7f37;color:#1a7f37}.copy.err{border-color:var(--must);color:var(--must)}",
-".contra{border:1px solid var(--line);border-radius:10px;padding:.4rem 1rem 1rem;margin:0 0 1rem;background:var(--card)}",
-".contra h2{font-size:.95rem;margin:.8rem 0 .5rem}",
 ".warn{border:1px solid var(--should);border-radius:10px;padding:.7rem 1rem;margin:0 0 1.2rem;color:var(--should)}",
 ".none{color:var(--mut);padding:1.2rem 0}",
 "footer{margin-top:2.5rem;padding-top:1rem;border-top:1px solid var(--line);color:var(--mut);font-size:.8rem}",
@@ -370,17 +368,9 @@ section("question"; "question"; false),
  then "<p class=\"none\">指摘なし。チェックリストのどのレンズでも問題は見つかりませんでした。</p>"
  else "" end),
 
-(if ((.contradictions // []) | length) > 0
- then "<div class=\"contra\"><h2>2人のレビュアーの見解が割れた点</h2>"
-      + ((.contradictions // []) | map(
-          "<article class=\"f\" style=\"border-top:0;padding-left:0;padding-right:0\">"
-          + "<h3>" + ((.topic // "") | esc) + "</h3>"
-          + "<p class=\"body\"><strong>A:</strong> " + ((.reviewer_a_position // "") | esc) + "</p>"
-          + "<p class=\"body\"><strong>B:</strong> " + ((.reviewer_b_position // "") | esc) + "</p>"
-          + "<p class=\"body\"><strong>結論:</strong> " + ((.resolution // "") | esc) + "</p>"
-          + "</article>") | join(""))
-      + "</div>"
- else "" end),
+# The two reviewers' deliberation is deliberately NOT rendered. PO decides what
+# to fix; how the Manager arrived at a severity is its own business. The Manager
+# still reconciles disagreements - it just reports the decision, not the debate.
 
 "<footer>",
 "<div>checklist: " + ($checklist_common | esc) + " (" + ($checklist_count | esc) + " lenses"
@@ -1800,24 +1790,10 @@ cat > "$VET_DIR/consolidated-schema.json" <<'SCHEMA'
           "confidence", "already_raised", "sources"
         ]
       }
-    },
-    "contradictions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "topic": { "type": "string" },
-          "reviewer_a_position": { "type": "string" },
-          "reviewer_b_position": { "type": "string" },
-          "resolution": { "type": "string" }
-        },
-        "required": ["topic", "reviewer_a_position", "reviewer_b_position", "resolution"]
-      }
     }
   },
   "required": [
-    "summary", "context_warnings", "findings", "contradictions"
+    "summary", "context_warnings", "findings"
   ]
 }
 SCHEMA
@@ -1866,9 +1842,9 @@ SCHEMA
 #   * ALL gh, including read forms. A prefix rule cannot separate `gh api <path>`
 #     from `gh api -X POST <path>`, and vet already collected pr.json,
 #     diff.patch and comments.json, so the Manager needs no network at all.
-#   * ALL git. The Manager settles contradictions by READING the worktree and
-#     diff.patch, which the Read tool covers; a genuine need for git history is
-#     rare enough to be worth one prompt.
+#   * ALL git. The Manager settles reviewer disagreements by READING the worktree
+#     and diff.patch, which the Read tool covers; a genuine need for git history
+#     is rare enough to be worth one prompt.
 #   * cat / pbcopy / open - the Read tool replaces cat, and vet itself prints the
 #     pbcopy line when the run ends.
 #
@@ -2510,6 +2486,15 @@ The PR head is already checked out for you, detached, at:
 That directory is the code as it would be after merging the head commit. Read
 any file there for context - not just the changed ones.
 
+## What is under review
+
+レビュー対象はこの PR が変更したコードです。リポジトリ内の他のコード・呼び出し元・
+呼び出し先は、その変更が正しいか判断するための文脈であって、それ自体を直させる
+対象ではありません。
+
+Read as widely as you need to. The rule is not about where you look - it is about
+what counts as a DEFECT OF THIS PR.
+
 $PR_STATE_NOTE
 
 ## Files you MUST read before reviewing
@@ -2560,6 +2545,27 @@ already been raised there, either drop it or set "already_raised": true on the
 finding and name the existing comment in "duplicates_to_avoid". Do not waste the
 author's time repeating feedback they already have.
 
+## What is NOT a finding
+
+未使用・未配線・呼び出し元なしは、それだけでは defect ではありません。部分的な
+着地や別 PR での配線は通常あり得ます。PR 本文がその配線まで明示的に約束している
+場合、または変更したコード自体が壊れている/危険/データを壊す場合だけ finding に
+してください。意図不明なら must_fix/should_fix ではなく question にしてください。
+PR ラベル、変更ファイル数、生成ファイルの有無からスコープ義務を推測しないで
+ください。
+
+Two clarifications on the above.
+
+First, on 「意図不明なら question」: that means the CHANGED code itself is
+internally inconsistent or ambiguous. It does NOT mean "ask whether the missing
+wiring is coming in a later PR". When the PR body does not promise the wiring,
+OMIT the point entirely - no finding, not even a question. A question the reader
+has to read and dismiss on every run is the same tax in a smaller font.
+
+Second, on the last sentence: a PR labelled for an area is not a promise to
+finish that area in this PR. Work here is split across PRs by owner, so labels,
+changed-file counts and regenerated files say nothing about what this PR owes.
+
 ## How to write findings
 
 - One finding per distinct problem. Give each a short stable "id" like
@@ -2573,9 +2579,17 @@ author's time repeating feedback they already have.
   finding with no evidence is a guess - lower its "confidence" or drop it.
 - "suggestion" is the concrete replacement code when you can propose one, and an
   empty string when you cannot. Do not invent a fix you are unsure of.
-- "severity": must_fix = correctness, security, or data loss; should_fix = a
-  real problem that is not blocking; nit = style or polish; question = you need
-  the author to clarify before you can judge.
+- "severity":
+
+    must_fix = この PR で変更されたコードが明確に wrong / unsafe / data-losing /
+    broken。機能全体がまだ未完成、別箇所が未配線、テスト方針が薄い、だけでは
+    must_fix にしない。
+
+  should_fix = a real problem in the changed code that is not blocking;
+  nit = style or polish; question = the CHANGED code itself looks internally
+  inconsistent or ambiguous and you need the author to clarify before you can
+  judge it. Do not use question to ask whether something outside this PR will be
+  handled later - that is not your question to ask.
 - Prefer few high-confidence findings over many speculative ones. It is fine to
   return no findings if the PR is clean.
 - BE TERSE. "title" is one line naming the problem. "body" is at most two or
@@ -2603,9 +2617,15 @@ build_reviewer_task \
 Work from the code outwards. Open the changed files in the worktree and read the
 surrounding code, callers, and callees - not only the diff hunks. You are the
 reviewer most likely to catch a problem that is invisible in the diff alone:
-a caller that was not updated, an invariant broken elsewhere, a test that no
-longer covers what its name claims. Use git log and git show on the touched
-files to see whether this change contradicts a recent, deliberate one."
+an invariant the changed code breaks elsewhere, an assumption the new code makes
+about a caller that is not true, a test that no longer covers what its name
+claims. Use git log and git show on the touched files to see whether this change
+contradicts a recent, deliberate one.
+
+Use that surrounding code only to test the CHANGED code's assumptions. Do not
+turn unchanged callers or future wiring into review subject matter. \"This new
+field is not read anywhere yet\" is an observation about the rest of the
+repository, not a defect in this PR - see 'What is NOT a finding' above."
 
 build_reviewer_task \
   "Reviewer B (Codex)" \
@@ -2648,7 +2668,14 @@ cat > "$VET_DIR/manager-prompt.md" << PROMPT
 
 You coordinate two independent PR reviewers in separate tmux panes and turn
 their two reports into ONE consolidated, paste-ready Markdown report.
-You do NOT review the code yourself, and you do NOT change any code.
+
+You may READ the changed code and its context at $WORKDIR - as much as you need
+to reconcile the two reports, dedupe findings, check what the existing PR
+comments already cover, and enforce the scope rules below. Reading code is how
+you settle a disagreement about a severity instead of guessing. What you do NOT
+do is perform a third full review: you do not go looking for findings neither
+reviewer raised, and you do not change any code.
+
 Speak Japanese to PO (user). Write English for agents.
 
 ## Environment
@@ -2798,12 +2825,17 @@ Both reviewers return the same JSON shape: summary, context_warnings
 2. KEEP checklist IDs. Every merged finding keeps the union of the
    checklist_ids from both sides. Never drop them: they are how PO knows which
    question produced the finding.
-3. CONTRADICTIONS. When the two reviewers disagree - one says a line is safe and
-   the other says it is a bug, or they assign very different severities - do NOT
-   silently pick one. Read the actual code at $WORKDIR yourself and resolve it.
-   If you can resolve it, record the resolution. If you cannot, record it as
-   unresolved and say what PO should check. Every contradiction goes in the
-   report.
+3. SETTLE DISAGREEMENTS INTERNALLY. When the two reviewers disagree - one says a
+   line is safe and the other says it is a bug, or they assign very different
+   severities - do NOT silently pick one. Read the actual code at $WORKDIR and
+   decide. Then report ONLY THE DECISION: the finding, at the severity you
+   settled on. The deliberation is yours, not PO's. Do not write up who said
+   what, do not add a "the reviewers disagreed" note to the summary, and do not
+   put the reasoning in the finding body beyond what a reader needs to act.
+   If you genuinely cannot settle it, keep the finding at the LOWER severity and
+   say in one line of its body what PO should check to decide.
+   PO decides what to fix; your job is to hand them a clean list, not a
+   transcript of the argument.
 4. DROP ALREADY-RAISED FINDINGS. Anything already covered by an existing PR
    comment (see $VET_DIR/comments.json) must be removed from the findings and
    listed separately as "already raised on the PR". Do not make the author read
@@ -2811,6 +2843,33 @@ Both reviewers return the same JSON shape: summary, context_warnings
 5. CONTEXT WARNINGS. Every warning in $VET_DIR/context-limits.txt goes into
    "context_warnings" verbatim in meaning. A review that silently covers only
    part of a PR is a defect. If nothing was truncated, say so explicitly.
+6. ENFORCE THE SCOPE RULE. This is a BACKSTOP: the reviewers have the same rule,
+   but they may still break it, and when they do it is YOUR job to catch it -
+   not to escalate it.
+
+   What is under review is the code THIS PR CHANGED. Other code in the
+   repository, its callers and its callees, are context for judging whether the
+   change is correct - they are not themselves the subject of review.
+
+   So: unused, unwired, no-caller-yet is NOT a defect on its own. Landing a
+   change in parts, and wiring it up in a later PR by a different person, is
+   normal on this team. A finding of that shape survives ONLY when the PR body
+   explicitly promises the wiring, or when the CHANGED code itself is broken,
+   unsafe, or loses data.
+
+   NEVER infer a scope obligation from PR labels, from the number of changed
+   files, or from the presence of generated files. A PR labelled for an area is
+   not a promise to finish that area in this PR.
+
+   When a reviewer hands you such a finding and the PR body does not promise the
+   wiring, DROP IT - do not downgrade it to question, do not mention it in the
+   summary. Only use "question" when the CHANGED code itself looks internally
+   inconsistent or ambiguous. A question PO has to read and dismiss on every run
+   is the same tax in a smaller font.
+
+   Concretely: a reviewer rating "the backend added a field the frontend does not
+   send yet" as must_fix is the exact error this rule exists to stop. Unless the
+   PR body promised that frontend change, it does not go in the report at all.
 
 There is NO coverage array and no coverage table. The reviewers report only
 problems; a lens that found nothing is silent by design. Do not reconstruct a
@@ -2848,7 +2907,9 @@ Requirements for the JSON:
   vet wraps it in a \`\`\`suggestion block when it renders.
 - Findings already raised on the PR must NOT appear in "findings". Mention them
   in one short line of "summary" instead.
-- "contradictions": how you settled each disagreement, or that it is unresolved.
+- There is NO "contradictions" key. The schema forbids unknown keys, so adding
+  one FAILS the render gate. How you settled a disagreement is not reported -
+  only the finding you settled on.
 - "summary": one or two sentences. Not an essay.
 
 ## Rendering the report - YOUR LAST STEP, and it is not optional
@@ -2876,13 +2937,15 @@ must_fix / should_fix / nit / question findings there are.
 
 ## Workflow
 
-1. Read $VET_DIR/context-limits.txt and $VET_DIR/checklist.merged.md so you know
-   what was and was not covered before anything else.
-2. Run run-step reviewer-a, then immediately run-step reviewer-b, so both review
-   in parallel.
-3. Run run-step wait-a, then read its status file and result with Read.
-4. Run run-step wait-b, then read its status file and result with Read.
-5. Report any non-zero status to PO and decide whether to re-run that reviewer.
+1. Run run-step reviewer-a, then immediately run-step reviewer-b, so both review
+   in parallel. Do this FIRST, before reading anything. Every second you spend
+   reading before this point is a second both reviewers are not yet running, and
+   nothing you would read changes what you launch. The checklist is for the
+   reviewers, not for you - you do not review, and there is no coverage table to
+   fill in.
+2. Run run-step wait-a, then read its status file and result with Read.
+3. Run run-step wait-b, then read its status file and result with Read.
+4. Report any non-zero status to PO and decide whether to re-run that reviewer.
    Status 65 means that reviewer's result file did not match the schema, so
    there is NOTHING usable from it - not an empty review, a failed one. Re-run
    it. If it fails again, you must NOT present the result as a two-reviewer
@@ -2890,8 +2953,11 @@ must_fix / should_fix / nit / question findings there are.
    failed twice and contributed nothing; this PR was reviewed by one reviewer
    only"), and tell PO the same thing in Japanese. A half-review reported as a
    whole one is the worst outcome this tool can produce.
+5. Now read $VET_DIR/context-limits.txt - this is the point where you need it,
+   not before. It tells you what was truncated so you can fill "context_warnings"
+   and judge how much of the PR the reviewers actually saw.
 6. Reconcile both outputs as described above. Read the real code in $WORKDIR to
-   settle contradictions.
+   settle disagreements, and apply the scope rule as a backstop.
 7. Write $CONSOLIDATED_PATH.
 8. Run $VET_DIR/run-step render. If it fails, fix the JSON and run it again
    until it succeeds - do not proceed to step 9 without a rendered report.
