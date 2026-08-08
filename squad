@@ -117,6 +117,29 @@ write_state() {
   STATE_FILE="$SQUAD_DIR/state.env"
 }
 
+# The tmux WINDOW name to use before the Manager has decided what this run is
+# about.
+#
+# DISPLAY ONLY. Runs are resolved by WINDOW_ID and by the @squad_run_id /
+# @squad_role PANE options (see window_exists and squad-pane), never by this
+# string, so the window name can change freely.
+#
+# The Manager replaces this with a two-word description of the actual work as
+# soon as it has read the ticket - see update-title. Until then there is nothing
+# true to say about the work, so this only has to IDENTIFY the run: the ticket ID
+# when one was detected, otherwise the old squad:<timestamp>, which is unique and
+# says which tool owns the window. Deliberately NOT a generic word like 作業中:
+# several concurrent squads would all show the same thing, which is less useful
+# than a timestamp, and this placeholder is also what PO is left looking at if
+# the Manager dies before its first title update.
+placeholder_window_name() {
+  if [[ -n "${TICKET_ID:-}" ]]; then
+    printf '%s' "$TICKET_ID"
+  else
+    printf 'squad:%s' "${RUN_ID:0:15}"
+  fi
+}
+
 window_exists() {
   local target_window_id="${1:-}"
   [[ -n "$target_window_id" ]] || return 1
@@ -569,7 +592,14 @@ HELPER
     cat <<'HELPER'
 TITLE_FILE="$1"
 NEW_TITLE_FILE="$2"
-WINDOW_SHORT_NAME="$3"
+# $3 is the window name to fall back to when the Manager has not supplied a
+# short one - the placeholder squad chose at launch.
+FALLBACK_SHORT_NAME="$3"
+
+# How wide the tmux window name may be, in DISPLAY COLUMNS, not characters. A
+# window name sits in a list beside other windows, so this is a hard budget:
+# one Japanese character costs two columns, so 20 columns is about ten of them.
+SHORT_NAME_MAX_COLUMNS=20
 
 NEW_TITLE="$(
   tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
@@ -586,6 +616,73 @@ if [[ -z "$NEW_TITLE" ]]; then
 fi
 
 printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
+
+# Truncate to a display-column budget. `cut -c` counts characters, so it would
+# let a ten-character Japanese name occupy twenty columns; jq is used because it
+# is already a hard dependency of squad and is Unicode-aware, where the awk on
+# macOS is not. Wide ranges are the East Asian Wide/Fullwidth blocks.
+fit_to_columns() {
+  jq -Rr --argjson max "$2" '
+    # jq has NO hexadecimal literals, so these are decimal. The hex equivalent
+    # is in the comment beside each range.
+    def cw:
+      if . >= 4352 and (
+           . <= 4447                          # 1100-115F Hangul Jamo
+        or (. >= 11904 and . <= 12350)        # 2E80-303E CJK radicals, kana punct
+        or (. >= 12353 and . <= 13311)        # 3041-33FF kana, CJK compat
+        or (. >= 13312 and . <= 19903)        # 3400-4DBF CJK ext A
+        or (. >= 19968 and . <= 40959)        # 4E00-9FFF CJK unified
+        or (. >= 40960 and . <= 42191)        # A000-A4CF Yi
+        or (. >= 44032 and . <= 55203)        # AC00-D7A3 Hangul syllables
+        or (. >= 63744 and . <= 64255)        # F900-FAFF CJK compat ideographs
+        or (. >= 65072 and . <= 65135)        # FE30-FE6F CJK compat forms
+        or (. >= 65280 and . <= 65376)        # FF00-FF60 fullwidth forms
+        or (. >= 65504 and . <= 65510)        # FFE0-FFE6 fullwidth signs
+        or (. >= 127744 and . <= 129535)      # 1F300-1F9FF emoji
+        or (. >= 131072 and . <= 262141)      # 20000-3FFFD CJK ext B+
+      ) then 2 else 1 end;
+    def fit($m):
+      explode as $cp
+      | reduce range(0; ($cp | length)) as $i ({w: 0, out: [], done: false};
+          if .done then .
+          elif (.w + ($cp[$i] | cw)) > $m then .done = true
+          else .w = (.w + ($cp[$i] | cw)) | .out = (.out + [$cp[$i]])
+          end)
+      | .out | implode;
+    (explode | map(cw) | add // 0) as $width
+    | if $width <= $max then . else (fit($max - 2)) + ".." end
+  ' <<< "$1"
+}
+
+# The window name. The Manager writes a two-word description of what this run is
+# doing to new-short-name.txt at the same moment it writes the long title; the
+# long one goes to the Manager PANE, the short one to the WINDOW. When the
+# Manager has not written one yet, the launch placeholder stands.
+SHORT_NAME=""
+if [[ -s "$SQUAD_DIR/new-short-name.txt" ]]; then
+  SHORT_NAME="$(
+    tr '\n\r\t' '   ' < "$SQUAD_DIR/new-short-name.txt" |
+      sed -E \
+        -e 's/^[[:space:]]+//' \
+        -e 's/[[:space:]]+$//' \
+        -e 's/[[:space:]]+/ /g'
+  )"
+fi
+if [[ -n "$SHORT_NAME" ]]; then
+  SHORT_NAME="$(fit_to_columns "$SHORT_NAME" "$SHORT_NAME_MAX_COLUMNS")"
+fi
+# Keep the name we last applied rather than reverting to the launch placeholder.
+# Sliding a good window name back to squad:<timestamp> because one title update
+# happened to omit the short file is the exact thing this change exists to stop.
+if [[ -z "$SHORT_NAME" && -s "$SQUAD_DIR/short-name.txt" ]]; then
+  SHORT_NAME="$(head -n 1 "$SQUAD_DIR/short-name.txt")"
+fi
+if [[ -z "$SHORT_NAME" ]]; then
+  SHORT_NAME="$FALLBACK_SHORT_NAME"
+fi
+# Persisted so `squad resume` can restore the name without the Manager having to
+# set it again, exactly as title.txt restores the pane title.
+printf '%s\n' "$SHORT_NAME" > "$SQUAD_DIR/short-name.txt"
 
 retitle_agent() {
   local role="$1"
@@ -605,11 +702,12 @@ if ! MANAGER_PANE="$("$SQUAD_DIR/squad-pane" manager)"; then
   exit 1
 fi
 
-tmux rename-window -t "$MANAGER_PANE" "$WINDOW_SHORT_NAME"
+tmux rename-window -t "$MANAGER_PANE" "$SHORT_NAME"
 tmux select-pane -t "$MANAGER_PANE" -T "$NEW_TITLE"
 retitle_agent coder Coder
 retitle_agent advisor Advisor
-printf '[%s] Squad title updated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE"
+printf '[%s] Squad title updated: %s (window: %s)\n' \
+  "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE" "$SHORT_NAME"
 HELPER
   } > "$SQUAD_DIR/update-title"
   chmod +x "$SQUAD_DIR/update-title"
@@ -1302,15 +1400,36 @@ applies a $WAIT_TIMEOUT_SECONDS second timeout as a final fallback.
 
 ### Update the squad title after reading the ticket
 
-Read the ticket URL or task context first. Write a concise, specific Japanese
-title to $SQUAD_DIR/new-title.txt. Include the detected ticket ID
-(${TICKET_ID:-none}) when available. Distinguish this squad from parallel work
-on similar features by naming the business object and concrete change. Then run:
+Read the ticket URL or task context first, then write TWO files and run one
+command. They are one step - never write one without the other.
+
+1. $SQUAD_DIR/new-title.txt - the long title, shown on the Manager PANE.
+   A concise, specific Japanese title. Include the detected ticket ID
+   (${TICKET_ID:-none}) when available. Distinguish this squad from parallel
+   work on similar features by naming the business object and concrete change.
+
+2. $SQUAD_DIR/new-short-name.txt - the short name, shown as the tmux WINDOW
+   name. About two words, at most 20 display columns (roughly ten Japanese
+   characters); anything longer is truncated. It must say WHAT THIS RUN IS
+   DOING - not the tool, not a timestamp, not the ticket ID on its own.
+   Good: 車両CSV重複検証 / 権限まわり修正 / レポートHTML化
+   Bad:  squad / 作業中 / EAR-123 / 車両マスタCSVインポートの重複検証を追加する
+   It sits in a window list beside other windows, so brevity is the point.
+
+Then run:
 
   cat > '$SQUAD_DIR/new-title.txt' <<'EOF'
   (specific title, for example: EAR-123 | 車両マスタCSVインポートの重複検証追加)
   EOF
+  cat > '$SQUAD_DIR/new-short-name.txt' <<'EOF'
+  (two words, for example: CSV重複検証)
+  EOF
   '$SQUAD_DIR/update-title' '$SQUAD_DIR/title.txt' '$SQUAD_DIR/new-title.txt' '$WINDOW_SHORT_NAME'
+
+Re-run this whole step whenever the work materially changes - when the plan
+lands, or when the squad moves on to something the current name no longer
+describes. Keep both files in step with each other; the window name going stale
+is how PO loses track of which window is which.
 
 ### Ask Advisor for an implementation plan
 
@@ -1449,7 +1568,20 @@ resume_run() {
     exit 1
   fi
 
-  load_run "${1:-}"
+  # An EXPLICIT run-id must match exactly. Without this, load_run's fallback
+  # silently resolves a typo'd id to the most recent retained run - and resume
+  # does not just display that run, it attaches LIVE AGENTS to it. A Coder would
+  # start editing another squad's worktree and branch, which is far worse than
+  # the wrong thing merely being shown. `close`, `rm` and `base` all already
+  # refuse a bad id; resume was the only one that did not.
+  #
+  # Only the NO-ARG form may resolve on its own: the current window's run first,
+  # then the latest.
+  if [[ -n "${1:-}" ]]; then
+    load_run "$1" false
+  else
+    load_run "" true
+  fi
   [[ -d "$WORKDIR" ]] || {
     echo "Error: squad worktree no longer exists: $WORKDIR" >&2
     exit 1
@@ -1474,7 +1606,13 @@ resume_run() {
   CODER_PANE="$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')"
   ADVISOR_PANE="$(tmux split-window -v -c "$WORKDIR" -d -t "$CODER_PANE" -P -F '#{pane_id}')"
   CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$WINDOW_ID" '#W')"
-  WINDOW_SHORT_NAME="${WINDOW_SHORT_NAME:-squad:${RUN_ID:0:15}}"
+  # Restore the name the Manager last set, exactly as the pane title is restored
+  # from title.txt below. state.env's copy is the next best thing (it is written
+  # on every state change), and the placeholder is the last resort.
+  if [[ -s "$SQUAD_DIR/short-name.txt" ]]; then
+    WINDOW_SHORT_NAME="$(head -n 1 "$SQUAD_DIR/short-name.txt")"
+  fi
+  WINDOW_SHORT_NAME="${WINDOW_SHORT_NAME:-$(placeholder_window_name)}"
   RUN_STATUS="running"
   write_state
   tag_all_panes
@@ -1798,7 +1936,10 @@ printf '%s\n' "$SQUAD_TITLE" > "$SQUAD_DIR/title.txt"
 MANAGER_PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
 CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$MANAGER_PANE" '#W')"
 WINDOW_ID="$(tmux display-message -p -t "$MANAGER_PANE" '#{window_id}')"
-WINDOW_SHORT_NAME="squad:${RUN_ID:0:15}"
+WINDOW_SHORT_NAME="$(placeholder_window_name)"
+# Seeded now so `squad resume` has a name to restore even if the Manager never
+# reaches its first title update.
+printf '%s\n' "$WINDOW_SHORT_NAME" > "$SQUAD_DIR/short-name.txt"
 CODER_PANE=$(tmux split-window -h -c "$WORKDIR" -d -t "$MANAGER_PANE" -P -F '#{pane_id}')
 ADVISOR_PANE=$(tmux split-window -v -c "$WORKDIR" -d -t "$CODER_PANE" -P -F '#{pane_id}')
 
