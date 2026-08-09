@@ -1731,7 +1731,10 @@ cat > "$VET_DIR/reviewer-schema.json" <<'SCHEMA'
   "additionalProperties": false,
   "properties": {
     "reviewer": { "type": "string" },
-    "summary": { "type": "string" },
+    "summary": {
+      "type": "string",
+      "description": "WRITTEN IN JAPANESE. One or two sentences overall."
+    },
     "context_warnings": { "type": "array", "items": { "type": "string" } },
     "findings": {
       "type": "array",
@@ -1752,8 +1755,14 @@ cat > "$VET_DIR/reviewer-schema.json" <<'SCHEMA'
               "maintainability", "tests", "ux", "docs", "ops", "other"
             ]
           },
-          "title": { "type": "string" },
-          "body": { "type": "string" },
+          "title": {
+            "type": "string",
+            "description": "WRITTEN IN JAPANESE. One line naming the problem."
+          },
+          "body": {
+            "type": "string",
+            "description": "WRITTEN IN JAPANESE. At most two or three sentences: what the problem is and why it matters."
+          },
           "file": { "type": "string" },
           "line": { "type": "integer" },
           "line_range": { "type": "string" },
@@ -1783,7 +1792,10 @@ cat > "$VET_DIR/consolidated-schema.json" <<'SCHEMA'
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "summary": { "type": "string" },
+    "summary": {
+      "type": "string",
+      "description": "WRITTEN IN JAPANESE. One or two sentences. Not an essay."
+    },
     "context_warnings": { "type": "array", "items": { "type": "string" } },
     "findings": {
       "type": "array",
@@ -1804,8 +1816,14 @@ cat > "$VET_DIR/consolidated-schema.json" <<'SCHEMA'
               "maintainability", "tests", "ux", "docs", "ops", "other"
             ]
           },
-          "title": { "type": "string" },
-          "body": { "type": "string" },
+          "title": {
+            "type": "string",
+            "description": "WRITTEN IN JAPANESE. One line naming the problem."
+          },
+          "body": {
+            "type": "string",
+            "description": "WRITTEN IN JAPANESE. At most two or three sentences: what the problem is and why it matters."
+          },
           "file": { "type": "string" },
           "line": { "type": "integer" },
           "line_range": { "type": "string" },
@@ -2517,11 +2535,20 @@ The PR head is already checked out for you, detached, at:
 That directory is the code as it would be after merging the head commit. Read
 any file there for context - not just the changed ones.
 
+## The language rule - instructions English, findings Japanese
+
+Everything in this task is written in English. WHAT YOU WRITE BACK IS JAPANESE.
+"title", "body" and "summary" are pasted verbatim into a GitHub comment by a
+Japanese-speaking reviewer, so they must read as natural Japanese. Identifiers,
+file paths, code, and the severity/category enum values stay as they are.
+
+This applies to every finding, including ones you feel are minor.
+
 ## What is under review
 
-レビュー対象はこの PR が変更したコードです。リポジトリ内の他のコード・呼び出し元・
-呼び出し先は、その変更が正しいか判断するための文脈であって、それ自体を直させる
-対象ではありません。
+What is under review is the code THIS PR CHANGED. Other code in the repository -
+its callers, its callees - is context for judging whether that change is
+correct. It is not itself something you are asking anyone to fix.
 
 Read as widely as you need to. The rule is not about where you look - it is about
 what counts as a DEFECT OF THIS PR.
@@ -2580,37 +2607,39 @@ author's time repeating feedback they already have.
 
 ## Not a finding: unused, unwired, no caller yet
 
-未使用・未配線・呼び出し元なしは、それだけでは defect ではありません。部分的な
-着地や別 PR での配線は通常あり得ます。
+Unused, unwired, no-caller-yet is not a defect on its own. Landing a change in
+parts, and wiring it up in a later PR, is a normal way to work.
 
-この種の指摘 - 変更したコードがまだどこからも呼ばれていない、別レイヤーやフロント
-エンドが追随していない - は、PR 本文がその配線まで明示的に約束している場合を除き、
-finding にしないでください。「除く」というのは本当に何も書かないという意味です。
-question に落とすことも、summary で触れることも含みません。読んで却下するだけの
-question は、字が小さくなっただけの同じ税金です。
+A finding OF THAT KIND - the changed code is not called from anywhere yet,
+another layer or the frontend has not caught up - must not be filed unless the
+PR description explicitly promises that wiring. "Must not be filed" means write
+nothing at all: not a question, not a mention in the summary. A question the
+reader only has to read and dismiss is the same tax in a smaller font.
 
-PR ラベル、変更ファイル数、生成ファイルの有無からスコープ義務を推測しないで
-ください。A PR labelled for an area is not a promise to finish that area in this
-PR. Work here is split across PRs by owner, so labels, changed-file counts and
-regenerated files say nothing about what this PR owes.
+Never infer a scope obligation from PR labels, from the number of changed files,
+or from the presence of generated files. A PR labelled for an area is not a
+promise to finish that area in this PR. Work here is split across PRs by owner,
+so labels, changed-file counts and regenerated files say nothing about what this
+PR owes.
 
 ## Still a finding: anything about the lines this PR changed
 
-上の制限は「まだ配線されていない」という形の指摘にだけ掛かります。他の指摘を
-抑制するものではありません。
+The restriction above applies ONLY to findings of the "not wired up yet" shape.
+It does not suppress anything else.
 
-この PR が変更した行そのものについては、コードが壊れていなくても指摘してくだ
-さい。周囲の規約との不整合、抜けている境界条件、より安全な書き方があるといった
-点は、nit または should_fix として報告する価値があります。PO が求めているのは
-「怪しいところ」であって、「壊れていると証明できるところ」だけではありません。
+For the lines this PR actually changed, report what you find even when the code
+is not broken. Inconsistency with the conventions of the surrounding code, a
+missing edge case, a safer way of writing it - all of these are worth reporting,
+at nit or should_fix. What the reader wants is anything that looks off, not only
+what you can prove is broken.
 
 Concretely: a line this PR added that skips a normalisation every neighbouring
 line performs is a legitimate nit. Nothing breaks, and it is still worth saying.
 A review that reports only what is provably broken is not what this tool is for.
 
-意図不明なら must_fix/should_fix ではなく question にしてください。ただしこれは
-変更したコード自体が内部的に矛盾している・曖昧な場合の話であって、「足りない配線
-が後の PR で来るのか」を尋ねるためのものではありません。
+If the intent is unclear, use question rather than must_fix/should_fix. But that
+is for when the CHANGED code is itself internally inconsistent or ambiguous - it
+is not for asking whether some missing wiring is coming in a later PR.
 
 ## How to write findings
 
@@ -2627,9 +2656,9 @@ A review that reports only what is provably broken is not what this tool is for.
   empty string when you cannot. Do not invent a fix you are unsure of.
 - "severity":
 
-    must_fix = この PR で変更されたコードが明確に wrong / unsafe / data-losing /
-    broken。機能全体がまだ未完成、別箇所が未配線、テスト方針が薄い、だけでは
-    must_fix にしない。
+    must_fix = the code THIS PR CHANGED is clearly wrong / unsafe / data-losing /
+    broken. The feature as a whole not being finished yet, another part not
+    being wired up, or the testing being thin are NOT must_fix on their own.
 
   should_fix = a real problem in the changed code that is not blocking;
   nit = style, polish, or a changed line that departs from the convention the
@@ -2647,6 +2676,10 @@ A review that reports only what is provably broken is not what this tool is for.
   one or two sentences overall. A reviewer who writes an essay wastes the
   reader's time and buries the finding that mattered - but a reviewer who drops
   a real finding to look concise has done the worse thing.
+- WRITE "title", "body" AND "summary" IN JAPANESE. They go straight into a
+  GitHub comment for a Japanese-speaking author. Everything you were given is in
+  English; what you hand back is not. Keep identifiers, paths, code and the
+  enum values (severity, category, confidence) exactly as they are.
 
 $extra_guidance
 
@@ -2731,7 +2764,19 @@ you settle a disagreement about a severity instead of guessing. What you do NOT
 do is perform a third full review: you do not go looking for findings neither
 reviewer raised, and you do not change any code.
 
-Speak Japanese to PO (user). Write English for agents.
+## The language rule - instructions English, output Japanese
+
+These instructions, and the reviewers' instructions, are in English. THE REPORT
+IS IN JAPANESE.
+
+- Every finding's "title" and "body", and the "summary", MUST be Japanese. They
+  are pasted straight into a GitHub comment for a Japanese-speaking author.
+  The reviewers were told to write them in Japanese; when you MERGE or REWRITE
+  finding text, the result stays Japanese. If a reviewer hands you English text
+  anyway, translate it rather than passing it through.
+- Identifiers, file paths, code, and the severity/category/confidence enum
+  values stay exactly as they are.
+- Speak Japanese to PO (user). Write English when you address the agents.
 
 ## Environment
 
@@ -2975,7 +3020,9 @@ Requirements for the JSON:
 - There is NO "contradictions" key. The schema forbids unknown keys, so adding
   one FAILS the render gate. How you settled a disagreement is not reported -
   only the finding you settled on.
-- "summary": one or two sentences. Not an essay.
+- "summary": one or two sentences, IN JAPANESE. Not an essay.
+- Every "title" and "body" in "findings" is IN JAPANESE, including ones you
+  merged, reworded or re-severitied. This is the text PO pastes into GitHub.
 
 ## Rendering the report - YOUR LAST STEP, and it is not optional
 
@@ -3140,13 +3187,16 @@ tmux set-option -w -t "$WINDOW_ID" @vet_state_file "$STATE_FILE"
 # from broken. Measured as safe regardless of what follows: ${VAR}, positional
 # $1/$@/$#/$?, ${VAR:-default} with a Japanese default, $((arith)) and
 # ${array[@]}. Only a bare $NAME is exposed.
-MANAGER_TASK="PR #${PR_NUMBER} (${REPO_SPEC}) のレビューを開始してください: ${PR_TITLE}
+MANAGER_TASK="Start the review of PR #${PR_NUMBER} (${REPO_SPEC}): ${PR_TITLE}
 ${PR_URL}
 
-チェックリスト ${CHECKLIST_COUNT} 項目、レビュー対象コミット ${HEAD_OID}。
-Reviewer A と Reviewer B を並行で起動し、両方の結果を突き合わせて
-${CONSOLIDATED_PATH} に統合 JSON を書いてください。レポート HTML は vet が生成します。
-GitHub には何も投稿しないでください。"
+Checklist: ${CHECKLIST_COUNT} lenses. Reviewed commit: ${HEAD_OID}.
+Launch Reviewer A and Reviewer B in parallel, reconcile both results, and write
+the consolidated JSON to ${CONSOLIDATED_PATH}. vet renders the report HTML.
+Post nothing to GitHub.
+
+This kickoff is in English because it is an instruction. Talk to PO in Japanese,
+and write the findings in Japanese, as your system prompt says."
 
 require_claude_enforcement_flags "Manager" || exit 1
 

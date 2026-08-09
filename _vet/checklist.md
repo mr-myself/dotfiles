@@ -1,110 +1,117 @@
-# vet 共通レビュー観点
+# vet shared review lenses
 
-`vet` のレビュアー2人が使う共通の観点。**チェックリストではなくレンズ**として使う。
+The shared lenses both `vet` reviewers use. They are **lenses, not a checklist**.
 
-各項目は「この角度から変更を見ろ」という指示であって、埋めるべき欄ではない。
-**問題が見つかったときだけ報告する。** 問題がない項目・対象外の項目については、
-確認したことも含めて何も書かない。沈黙が「問題なし」を意味する。
+Each item says "look at the change from this angle". It is not a box to fill in.
+**Report only what you find wrong.** Say nothing about a lens that is fine or not
+applicable - not even that you checked it. Silence means no problem found.
 
-前は全45項目それぞれに checked_ok / not_applicable などの状態を書かせていた。
-その結果、実際の指摘3件に対して192行のレポートが出て、うち104行は指摘ではなかった。
-出力の半分以上が「問題ありません」の羅列だった。だからやめた。
+These instructions are in English. THE FINDINGS THEMSELVES ARE WRITTEN IN
+JAPANESE: `title`, `body` and `summary` are pasted straight into a GitHub comment
+by a Japanese-speaking reviewer. English instructions, Japanese output.
 
-## 形式
+This file used to make reviewers record checked_ok / not_applicable for all 45
+items. The result was a 192-line report for 3 real findings, 104 lines of which
+said nothing was wrong. More than half the output was "no problem here". Hence
+the change.
 
-項目として解釈されるのは、次の形の行だけ:
+## Format
 
-    - [ID] 一行の問いかけ
+Only lines of this exact shape are parsed as items:
 
-ハイフンは行頭（0カラム目）に置くこと。`ID` は英大文字で始まり、英大文字・数字・
-`_`・`-` を含められる。見出し・空行・インデントされた行・この段落のような散文は
-すべて無視される。上の例がインデントしてあるのは、そのためにわざとそうしている。
+    - [ID] one-line question
 
-## プロジェクト固有の上書き
+The hyphen must be at column 0. `ID` starts with an uppercase letter and may
+contain uppercase letters, digits, `_` and `-`. Headings, blank lines, indented
+lines and prose like this paragraph are all ignored. The example above is
+indented deliberately, so that it is not parsed as an item.
 
-リポジトリ側に `.vet/checklist.md`（または `.review/checklist.md`）を置くと、
-このファイルの上にマージされる。同じ ID なら本文を差し替え、新しい ID なら末尾に
-追加される。ID を保っているのは、この上書きを効かせ続けるため。
+## Per-project overrides
 
-## 正しさ
+A repository may add `.vet/checklist.md` (or `.review/checklist.md`), which is
+merged on top of this file. The same ID replaces the text; a new ID is appended.
+IDs are stable so that these overrides keep working.
 
-- [COR-001] PR の説明どおりの動作を実際にしているか
-- [COR-002] 新ロジックの境界値（空・最大・境界）を扱えているか
-- [COR-003] 新コードが参照する値の null/nil/undefined を扱えているか
+## Correctness and local consistency
 
-## セキュリティ・認可
+- [COR-001] Does it actually do what the PR description says it does?
+- [COR-002] Does the new logic handle its boundary values (empty, maximum, edge)?
+- [COR-003] Does the new code handle null/nil/undefined in the values it reads?
+- [ARCH-001] Does a changed line follow the pattern the code around it already uses - same layer, same directory, neighbouring functions - or does it do the same job a different way for no stated reason? Point at the existing code it diverges from; no in-repo precedent means no finding.
 
-- [SEC-001] 新規/変更の全エンドポイント・ジョブで認可境界を検査しているか
-- [SEC-002] 新しいクエリ・パラメータ・ID から他テナント/他ユーザーのデータに到達できないか
-- [SEC-003] 外部入力を検証し明示的に許可リスト化しているか
-- [SEC-004] 新規の DB/シェル/SQL/テンプレート利用がインジェクションに耐えるか
+## Security and authorization
 
-## データ・マイグレーション
+- [SEC-001] Does every new/changed endpoint and job check the authorization boundary?
+- [SEC-002] Can a new query, parameter or ID reach another tenant's or user's data?
+- [SEC-003] Is external input validated and explicitly allow-listed?
+- [SEC-004] Do new DB/shell/SQL/template usages resist injection?
 
-- [DAT-002] マイグレーションが本番規模で危険なロックやダウンタイムなしに走るか
-- [DAT-003] DB 制約・スキーマ上限・アプリ側バリデーションが一致しているか
+## Data and migrations
 
-## エラー処理
+- [DAT-002] Does the migration run at production scale without a dangerous lock or downtime?
+- [DAT-003] Do the DB constraints, schema limits and application-side validation agree with each other?
 
-- [ERR-001] 新しい外部呼び出し・DB・キュー・FS 操作が失敗とタイムアウトに備えているか
+## Error handling
 
-## テスト
+- [ERR-001] Are new external calls, DB, queue and FS operations prepared for failure and timeout?
 
-- [TEST-001] 変更した振る舞いのバグを検出できるテストが欠けていないか
-- [TEST-002] 変更した振る舞いの境界・エラー経路に、テストが素通りするバグがないか
+## Tests
 
-## 互換性
+- [TEST-001] Is a test missing that would catch a bug in the behaviour this PR changed?
+- [TEST-002] Is there a bug in a changed behaviour's boundary or error path that the tests would walk straight past?
 
-- [COMPAT-001] 公開 API・レスポンス形・イベント・生成型の変更が後方互換か
+## Compatibility
 
-## パフォーマンス
+- [COMPAT-001] Are changes to public APIs, response shapes, events or generated types backward compatible?
 
-- [PERF-001] N+1 やループ内クエリを持ち込んでいないか
-- [PERF-002] 変更クエリがインデックスに乗り、大テーブルの全走査を避けているか
-- [PERF-003] 大量データでの LIMIT/OFFSET、重い集計、無制限ロードなど、本番規模で遅くなるパターンを持ち込んでいないか
+## Performance
 
-## 外した ID
+- [PERF-001] Does it introduce an N+1 or a query inside a loop?
+- [PERF-002] Do changed queries use an index and avoid a full scan of a large table?
+- [PERF-003] Does it introduce something that gets slow at production scale - LIMIT/OFFSET over large data, heavy aggregation, unbounded loading?
 
-外した観点は下に残しておく。ID は再利用しない。必要になったら
-プロジェクト側の `.vet/checklist.md` に同じ ID で書けば復活する。
-（この節の行はインデントしてあるので、項目としては解釈されない）
+## Retired IDs
 
-    INTEG-001 バックエンド・API・データ構造の変更が、それを消費する UI や
-              呼び出し側まで実際に配線されているか
-              → 外した。このチームでは PR がオーナー単位で分かれていて、
-                FE の配線が別 PR・別担当になるのは通常運転。この観点は
-                それを欠陥として読み違え、毎回ノイズを出す。
-                配線まで1つの PR で終える約束があるプロジェクトなら、
-                `.vet/checklist.md` に同じ ID で書けば復活する。
+Retired lenses are kept below. IDs are never reused. To bring one back, write it
+with the same ID in the project's own `.vet/checklist.md`.
+(The lines in this section are indented, so they are not parsed as items.)
 
-以下は元の 45 項目から外したもの。
+    INTEG-001 Is a backend/API/data-structure change actually wired through to
+              the UI and callers that consume it?
+              -> Retired. On this team PRs are split by owner, and the frontend
+                 wiring landing in a separate PR by a different person is normal.
+                 This lens misreads that as a defect and produces noise on every
+                 run. A project where one PR is expected to finish the wiring can
+                 revive it by ID.
 
-    COR-004  ループ/スライス/範囲/ページングの off-by-one
-    COR-006  並行・非同期の共有状態、競合・デッドロック・ロストアップデート
-    COR-007  タイムゾーン・クロックスキュー・日付演算
-    SEC-005  出力箇所ごとのエスケープ（HTML/JSON/CSV/ログ/シェル/リダイレクト）
-    SEC-006  秘密情報がソース・ログ・エラー・フィクスチャに混ざっていないか
-    SEC-007  新規依存やバージョン更新の出所とピン留め
-    DAT-001  マイグレーションのロールバック手段
-    DAT-004  既存データのバックフィル・デフォルト
-    DAT-005  同時に成功/失敗すべき操作のトランザクション
-    ERR-002  例外を握りつぶしていないか
-    ERR-003  エラーメッセージの情報量と内部情報の漏れ
-    ERR-004  リトライの上限・バックオフ・冪等性
-    TEST-003 実装の写経ではなく観測可能な振る舞いを検証しているか
-    TEST-004 テストの決定性（実時計・実ネットワーク・乱数・順序依存）
-    TEST-006 既存テストの削除・skip・弱体化
-    COMPAT-002 削除・改名の段階的な非推奨経路
-    COMPAT-003 ローリングデプロイ中の新旧同居
-    PERF-004 リクエストを塞がない処理のバックグラウンド化
-    OBS-001  ログ・メトリクス・トレースだけで本番の障害を診断できるか
-    OBS-002  ログの相関情報と機微情報の扱い
-    OBS-003  新しい失敗経路が監視に出るか
-    MNT-001  周辺コードのパターン・命名・構造との一貫性
-    MNT-002  名前が意図を表しているか
-    MNT-003  重複ロジックの括り出し
-    MNT-004  なぜを説明するコメント、陳腐化したコメント
-    MNT-005  デッドコード・デバッグ出力・コメントアウト・残骸
-    DOC-001  ドキュメントの追随
-    OPS-001  新しい設定値・環境変数の文書化とデフォルト
-    OPS-002  デプロイ順・マイグレーション順・手作業の手順
+The rest were dropped when the original 45 items were cut down.
+
+    COR-004  Off-by-one in loops, slices, ranges, paging
+    COR-006  Shared state across concurrency/async: races, deadlock, lost updates
+    COR-007  Timezones, clock skew, date arithmetic
+    SEC-005  Escaping per output context (HTML/JSON/CSV/log/shell/redirect)
+    SEC-006  Secrets leaking into source, logs, errors, fixtures
+    SEC-007  Provenance and pinning of new or updated dependencies
+    DAT-001  Migration rollback path
+    DAT-004  Backfill and defaults for existing rows
+    DAT-005  Transactions around operations that must succeed or fail together
+    ERR-002  Swallowed exceptions
+    ERR-003  Error message detail and internal information leakage
+    ERR-004  Retry limits, backoff, idempotency
+    TEST-003 Verifying observable behaviour rather than transcribing the implementation
+    TEST-004 Test determinism (wall clock, real network, randomness, ordering)
+    TEST-006 Deleted, skipped or weakened existing tests
+    COMPAT-002 Staged deprecation path for removals and renames
+    COMPAT-003 Old and new running side by side during a rolling deploy
+    PERF-004 Moving work off the request path into the background
+    OBS-001  Can a production failure be diagnosed from logs/metrics/traces alone?
+    OBS-002  Log correlation IDs and handling of sensitive values
+    OBS-003  Do new failure paths surface in monitoring?
+    MNT-001  Consistency with surrounding code patterns, naming and structure
+    MNT-002  Do names express intent?
+    MNT-003  Extracting duplicated logic
+    MNT-004  Comments explaining why; stale comments
+    MNT-005  Dead code, debug output, commented-out code, leftovers
+    DOC-001  Documentation keeping up
+    OPS-001  Documentation and defaults for new settings and environment variables
+    OPS-002  Deploy order, migration order, manual steps
