@@ -271,11 +271,47 @@ close_window() {
   ! window_exists "$window_id"
 }
 
+# THE INVARIANT: whenever the awaiting-PO marker's presence CHANGES, the tmux
+# window name is recomposed from the current base. No exceptions.
+#
+# tmux only repaints a window name when something calls rename-window, so
+# unlinking the marker file on its own leaves the [?] badge on screen with
+# nothing left that will ever repaint it - the file says "not waiting" while the
+# PO still sees "waiting", and they would believe the badge. Every clearing path
+# in squad therefore goes through await-po, which is the single place that does
+# both halves, rather than removing the file itself. Hand-rolling rename-window
+# here would give the composition a second implementation, and the column budget
+# would eventually drift between them.
+#
+# stderr is dropped because these are tidy-up paths: a window that is already
+# gone (the usual case when closing) cannot be renamed, and that is expected,
+# not a problem worth printing. The marker file removal is the durable half and
+# happens first inside the helper regardless.
+#
+# A run created before await-po existed has no helper to call. It also has no
+# marker and no badge, so removing the file directly is exactly right there.
+clear_awaiting_po() {
+  local squad_dir="${1:-$SQUAD_DIR}"
+  if [[ -x "$squad_dir/await-po" ]]; then
+    "$squad_dir/await-po" clear 2>/dev/null || true
+  else
+    rm -f "$squad_dir/awaiting-po.env"
+  fi
+}
+
 close_run() {
   local previous_status
   load_run "${1:-}" false
   previous_status="${RUN_STATUS:-running}"
   RUN_STATUS="closed"
+  # A closed squad is not waiting on anyone. Cleared here rather than after the
+  # kill because kill-window destroys this process when close is run from inside
+  # the squad's own window, and a marker left behind would outlive the run - a
+  # stuck badge is worse than no badge.
+  #
+  # This also covers the rollback path below: when the kill FAILS the window is
+  # still alive, so the badge has to come down on screen too, not just on disk.
+  clear_awaiting_po
   # Persisted BEFORE the kill on purpose: `squad close` is normally run from
   # inside the squad's own window, where kill-window destroys this very process
   # and nothing after it would ever run. The rollback below covers the opposite
@@ -629,46 +665,51 @@ HELPER
   } > "$SQUAD_DIR/send-to"
   chmod +x "$SQUAD_DIR/send-to"
 
-  # --- Dynamic title update ---------------------------------------------------
-
+  # --- Window display name ----------------------------------------------------
+  # The ONE place that knows how a tmux window name is composed and truncated.
+  #
+  # There are two different strings and confusing them is the bug this helper
+  # exists to prevent:
+  #
+  #   BASE    - what the run is about, chosen by the Manager and stored in
+  #             short-name.txt. Never contains the awaiting-PO marker.
+  #   DISPLAY - what tmux actually shows: the base, plus the marker while
+  #             $SQUAD_DIR/awaiting-po.env exists.
+  #
+  # Composing at display time (rather than storing the decorated name) is what
+  # lets the Manager retitle the run WHILE it is waiting: the marker survives a
+  # title change, and clearing it reveals the CURRENT base rather than whatever
+  # the base happened to be when the marker went up.
   {
     printf '#!/usr/bin/env bash\n'
     printf 'set -euo pipefail\n'
     printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    printf 'WINDOW_FALLBACK_NAME=%q\n' \
+      "${WINDOW_SHORT_NAME:-$(placeholder_window_name)}"
     cat <<'HELPER'
-TITLE_FILE="$1"
-NEW_TITLE_FILE="$2"
-# $3 is the window name to fall back to when the Manager has not supplied a
-# short one - the placeholder squad chose at launch.
-FALLBACK_SHORT_NAME="$3"
-
+# Usage:
+#   window-name display [base]   the name to hand to tmux rename-window
+#   window-name fit <text> [max] width-aware truncation
+#   window-name width <text>     display columns of a string
+#
 # How wide the tmux window name may be, in DISPLAY COLUMNS, not characters. A
 # window name sits in a list beside other windows, so this is a hard budget:
 # one Japanese character costs two columns, so 20 columns is about ten of them.
 SHORT_NAME_MAX_COLUMNS=20
 
-NEW_TITLE="$(
-  tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
-    sed -E \
-      -e 's/^[[:space:]]+//' \
-      -e 's/[[:space:]]+$//' \
-      -e 's/[[:space:]]+/ /g' |
-    cut -c 1-90
-)"
+# Shown while the Manager is waiting on PO. Deliberately ASCII: it costs exactly
+# four columns in every terminal, where an emoji's width depends on the font and
+# would make the budget below a guess. To change it, change this one line - the
+# marker is never stored in the base name, so nothing else needs to agree.
+AWAITING_PO_MARKER='[?] '
 
-if [[ -z "$NEW_TITLE" ]]; then
-  echo "Error: squad title must not be empty" >&2
-  exit 1
-fi
-
-printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
-
-# Truncate to a display-column budget. `cut -c` counts characters, so it would
-# let a ten-character Japanese name occupy twenty columns; jq is used because it
-# is already a hard dependency of squad and is Unicode-aware, where the awk on
-# macOS is not. Wide ranges are the East Asian Wide/Fullwidth blocks.
-fit_to_columns() {
-  jq -Rr --argjson max "$2" '
+# jq is used because it is already a hard dependency of squad and is
+# Unicode-aware, where the awk on macOS is not. `cut -c` counts CHARACTERS, so
+# it would let a ten-character Japanese name occupy twenty columns.
+#
+# $1 = mode (fit|width), $2 = text, $3 = max columns (fit only).
+measure() {
+  jq -Rr --arg mode "$1" --argjson max "${3:-0}" '
     # jq has NO hexadecimal literals, so these are decimal. The hex equivalent
     # is in the comment beside each range.
     def cw:
@@ -696,14 +737,206 @@ fit_to_columns() {
           end)
       | .out | implode;
     (explode | map(cw) | add // 0) as $width
-    | if $width <= $max then . else (fit($max - 2)) + ".." end
-  ' <<< "$1"
+    | if $mode == "width" then ($width | tostring)
+      elif $width <= $max then .
+      else (fit($max - 2)) + ".."
+      end
+  ' <<< "$2"
 }
 
-# The window name. The Manager writes a two-word description of what this run is
-# doing to new-short-name.txt at the same moment it writes the long title; the
-# long one goes to the Manager PANE, the short one to the WINDOW. When the
+case "${1:-}" in
+  fit)
+    if [[ $# -lt 2 ]]; then
+      printf 'Usage: window-name fit <text> [max-columns]\n' >&2
+      exit 2
+    fi
+    measure fit "$2" "${3:-$SHORT_NAME_MAX_COLUMNS}"
+    ;;
+  width)
+    if [[ $# -ne 2 ]]; then
+      printf 'Usage: window-name width <text>\n' >&2
+      exit 2
+    fi
+    measure width "$2"
+    ;;
+  display)
+    BASE="${2:-}"
+    # short-name.txt is the stored base. It is written by update-title on every
+    # title change and seeded at launch, so it is normally present; the baked-in
+    # placeholder covers a run whose first title update has not happened yet.
+    if [[ -z "$BASE" && -s "$SQUAD_DIR/short-name.txt" ]]; then
+      BASE="$(head -n 1 "$SQUAD_DIR/short-name.txt")"
+    fi
+    if [[ -z "$BASE" ]]; then
+      BASE="$WINDOW_FALLBACK_NAME"
+    fi
+    # PRESENCE of the marker file is the truth; its contents are detail only, so
+    # a half-written or hand-edited file still renders correctly.
+    if [[ -e "$SQUAD_DIR/awaiting-po.env" ]]; then
+      MARKER_COLUMNS="$(measure width "$AWAITING_PO_MARKER")"
+      # The marker spends part of the SAME budget, so the composed name still
+      # fits the window list. The base is re-fitted rather than pre-truncated,
+      # which is why clearing the marker restores the full stored base.
+      printf '%s%s\n' "$AWAITING_PO_MARKER" \
+        "$(measure fit "$BASE" "$((SHORT_NAME_MAX_COLUMNS - MARKER_COLUMNS))")"
+    else
+      measure fit "$BASE" "$SHORT_NAME_MAX_COLUMNS"
+    fi
+    ;;
+  *)
+    printf 'Usage: window-name <display|fit|width> [args]\n' >&2
+    exit 2
+    ;;
+esac
+HELPER
+  } > "$SQUAD_DIR/window-name"
+  chmod +x "$SQUAD_DIR/window-name"
+
+  # --- Awaiting-PO marker -------------------------------------------------------
+  # Records that the Manager has asked PO something and is waiting for an answer.
+  #
+  # WHY A FILE OF ITS OWN. Not RUN_STATUS: that feeds `squad list` and the
+  # closed/running lifecycle, and "running but waiting" is not a lifecycle state.
+  # Not a state.env key: write_state rewrites a fixed set of variables wholesale,
+  # so a key written by a helper while squad itself is mid-write would be lost.
+  # An independent file, replaced by rename, has neither problem and is readable
+  # by anything - including Squad Cockpit, with the app closed.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+# Usage:
+#   await-po mark [reason...]   about to ask PO something; raise the marker
+#   await-po clear              PO has been heard from; lower it
+#   await-po status             print the current state (debugging)
+#
+# Both mark and clear are IDEMPOTENT. The Manager runs `clear` at the start of
+# every turn without knowing whether a marker exists, so clearing nothing must
+# be silent and free.
+
+MARKER="$SQUAD_DIR/awaiting-po.env"
+
+# Re-apply the window name for the CURRENT marker state.
+#
+# Best effort on purpose. The marker file is the durable truth and it is already
+# written by the time this runs; a tmux window that cannot be renamed (no server,
+# a pane that has gone away, a squad resumed elsewhere) must not turn into a
+# failed command in the Manager's face, so this warns and returns success.
+apply_window_name() {
+  local display pane
+  if ! display="$("$SQUAD_DIR/window-name" display 2>/dev/null)"; then
+    printf 'Warning: could not compose the window name; it was left unchanged.\n' >&2
+    return 0
+  fi
+  # Resolved by ROLE, never from state.env's pane IDs, which tmux invalidates on
+  # every resume and which state.env itself documents as non-authoritative.
+  if ! pane="$("$SQUAD_DIR/squad-pane" manager 2>/dev/null)"; then
+    printf 'Warning: the Manager pane could not be resolved; the tmux window name\n' >&2
+    printf 'was left unchanged. The marker file itself is up to date.\n' >&2
+    return 0
+  fi
+  if ! tmux rename-window -t "$pane" "$display" 2>/dev/null; then
+    printf 'Warning: tmux rename-window failed; the window name was left unchanged.\n' >&2
+    return 0
+  fi
+  printf '%s\n' "$display"
+}
+
+# One safe line: no control characters (so the file stays parseable), no runaway
+# length, whitespace collapsed. The value is additionally written with %q below,
+# so quotes, $, backticks and the like are inert even when the file is sourced.
+sanitize_reason() {
+  printf '%s' "$1" |
+    tr '\n\r\t' '   ' |
+    sed -E 's/[[:cntrl:]]//g; s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' |
+    cut -c 1-120
+}
+
+case "${1:-}" in
+  mark)
+    shift
+    REASON="$(sanitize_reason "${*:-}")"
+    # Written to a temp file and RENAMED, so a reader (cockpit polling, or the
+    # window-name helper) never observes a half-written marker. $$ keeps two
+    # concurrent marks from sharing a temp path; rename is atomic within the
+    # directory, so the last writer simply wins.
+    TMP="$MARKER.tmp.$$"
+    {
+      printf 'AWAITING_PO=1\n'
+      printf 'AWAITING_PO_AT=%q\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+      if [[ -n "$REASON" ]]; then
+        printf 'AWAITING_PO_REASON=%q\n' "$REASON"
+      fi
+    } > "$TMP"
+    mv -f "$TMP" "$MARKER"
+    apply_window_name >/dev/null || true
+    if [[ -n "$REASON" ]]; then
+      printf 'Awaiting PO: %s\n' "$REASON"
+    else
+      printf 'Awaiting PO.\n'
+    fi
+    ;;
+  clear)
+    rm -f "$MARKER"
+    apply_window_name >/dev/null || true
+    ;;
+  status)
+    if [[ -e "$MARKER" ]]; then
+      printf 'awaiting-po: YES\n'
+      cat "$MARKER"
+    else
+      printf 'awaiting-po: no\n'
+    fi
+    printf 'window name would be: %s\n' \
+      "$("$SQUAD_DIR/window-name" display 2>/dev/null || printf '(unavailable)')"
+    ;;
+  *)
+    printf 'Usage: await-po <mark [reason...]|clear|status>\n' >&2
+    exit 2
+    ;;
+esac
+HELPER
+  } > "$SQUAD_DIR/await-po"
+  chmod +x "$SQUAD_DIR/await-po"
+
+  # --- Dynamic title update ---------------------------------------------------
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    cat <<'HELPER'
+TITLE_FILE="$1"
+NEW_TITLE_FILE="$2"
+# $3 is the window name to fall back to when the Manager has not supplied a
+# short one - the placeholder squad chose at launch.
+FALLBACK_SHORT_NAME="$3"
+
+NEW_TITLE="$(
+  tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
+    sed -E \
+      -e 's/^[[:space:]]+//' \
+      -e 's/[[:space:]]+$//' \
+      -e 's/[[:space:]]+/ /g' |
+    cut -c 1-90
+)"
+
+if [[ -z "$NEW_TITLE" ]]; then
+  echo "Error: squad title must not be empty" >&2
+  exit 1
+fi
+
+printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
+
+# The window BASE name. The Manager writes a two-word description of what this
+# run is doing to new-short-name.txt at the same moment it writes the long title;
+# the long one goes to the Manager PANE, the short one to the WINDOW. When the
 # Manager has not written one yet, the launch placeholder stands.
+#
+# This is the base ONLY. It never contains the awaiting-PO marker: the marker is
+# composed on top of it by window-name at display time, so a title update made
+# while the Manager is waiting keeps the marker visible instead of erasing it.
 SHORT_NAME=""
 if [[ -s "$SQUAD_DIR/new-short-name.txt" ]]; then
   SHORT_NAME="$(
@@ -715,7 +948,7 @@ if [[ -s "$SQUAD_DIR/new-short-name.txt" ]]; then
   )"
 fi
 if [[ -n "$SHORT_NAME" ]]; then
-  SHORT_NAME="$(fit_to_columns "$SHORT_NAME" "$SHORT_NAME_MAX_COLUMNS")"
+  SHORT_NAME="$("$SQUAD_DIR/window-name" fit "$SHORT_NAME")"
 fi
 # Keep the name we last applied rather than reverting to the launch placeholder.
 # Sliding a good window name back to squad:<timestamp> because one title update
@@ -729,6 +962,11 @@ fi
 # Persisted so `squad resume` can restore the name without the Manager having to
 # set it again, exactly as title.txt restores the pane title.
 printf '%s\n' "$SHORT_NAME" > "$SQUAD_DIR/short-name.txt"
+
+# What tmux is actually given: the base just stored, plus the awaiting-PO marker
+# when that marker is up. Computed AFTER the write above so it reflects the new
+# base, which is what makes "retitle while waiting" keep the marker.
+DISPLAY_NAME="$("$SQUAD_DIR/window-name" display "$SHORT_NAME")"
 
 retitle_agent() {
   local role="$1"
@@ -748,12 +986,12 @@ if ! MANAGER_PANE="$("$SQUAD_DIR/squad-pane" manager)"; then
   exit 1
 fi
 
-tmux rename-window -t "$MANAGER_PANE" "$SHORT_NAME"
+tmux rename-window -t "$MANAGER_PANE" "$DISPLAY_NAME"
 tmux select-pane -t "$MANAGER_PANE" -T "$NEW_TITLE"
 retitle_agent coder Coder
 retitle_agent advisor Advisor
 printf '[%s] Squad title updated: %s (window: %s)\n' \
-  "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE" "$SHORT_NAME"
+  "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE" "$DISPLAY_NAME"
 HELPER
   } > "$SQUAD_DIR/update-title"
   chmod +x "$SQUAD_DIR/update-title"
@@ -1421,6 +1659,17 @@ likewise takes a role, not a pane ID.
   executing it.
 - NEVER run tmux kill-session, kill-window, or kill-pane unless PO explicitly
   requests that exact tmux operation. This includes test cleanup commands.
+- At the VERY START of every turn, before anything else, run:
+  '$SQUAD_DIR/await-po' clear
+  It is free when nothing is marked. This is what takes the waiting badge down
+  once PO has answered, including when they answered directly in the tmux pane,
+  so it must run whether or not you think you were waiting.
+- BEFORE asking PO a question, or pausing for PO approval of anything, run:
+  '$SQUAD_DIR/await-po' mark '<short reason>'
+  Run it BEFORE you write the question, not after: once you have asked, you stop
+  and PO may not look at this window for hours. PO is often not watching this
+  window - sometimes not even this machine - and the marker is the only thing
+  that tells them you are blocked.
 - After each Coder run, ALWAYS run the RuboCop helper and require exit status 0.
   The helper runs RuboCop autocorrect and verification only on changed
   Rails/Ruby files, never the full repo.
@@ -1476,6 +1725,25 @@ Re-run this whole step whenever the work materially changes - when the plan
 lands, or when the squad moves on to something the current name no longer
 describes. Keep both files in step with each other; the window name going stale
 is how PO loses track of which window is which.
+
+### Tell PO you are waiting for them
+
+PO is not necessarily watching this window. Mark the run as waiting whenever you
+are about to hand control back to them for an answer or a decision:
+
+  '$SQUAD_DIR/await-po' mark 'plan approval'
+  '$SQUAD_DIR/await-po' clear
+  '$SQUAD_DIR/await-po' status
+
+mark adds a marker to the tmux WINDOW name, so PO can see it in the window list
+with this squad's window in the background, and it stays visible even if the
+squad is later resumed. The reason is one short line - "plan approval",
+"which API to use", "needs a production credential".
+
+Both commands are idempotent and safe to repeat. clear at the start of a turn is
+mandatory (see Critical rules); it is what lowers the marker after PO replies.
+Marking never changes the squad title, and updating the title while marked keeps
+the marker.
 
 ### Ask Advisor for an implementation plan
 
@@ -1551,9 +1819,12 @@ or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
 
 ## Workflow
 
+0. Run '$SQUAD_DIR/await-po' clear at the start of every turn, including this one.
 1. Inspect the linked ticket or task context and update the provisional title.
 2. Ask Advisor for a structured implementation plan.
-3. Show the plan to PO in Japanese and ask for approval.
+3. Run '$SQUAD_DIR/await-po' mark 'plan approval', then show the plan to PO in
+   Japanese and ask for approval. Waiting for plan approval is the most common
+   place this squad sits idle without PO knowing, so the mark is not optional.
 4. Ask Coder to implement the approved plan.
 5. Read Coder status and structured verification report.
 6. Run the mandatory RuboCop helper and require status 0.
@@ -1599,6 +1870,10 @@ unrelated pane.
 - The Coder and Advisor panes of this resumed window are fresh shells: no agent
   is mid-task, and the Coder resumes its own session only when you send
   run-coder with the resume mode.
+- A resume does NOT answer any question you had asked PO, so an awaiting-PO
+  marker deliberately survived into this window. Your first action is still
+  '$SQUAD_DIR/await-po' clear - run it, then look at whether PO has actually
+  replied, and mark again if you are still waiting.
 PROMPT
 }
 
@@ -1671,7 +1946,14 @@ resume_run() {
   generate_manager_prompt
   generate_resume_prompt
 
-  tmux rename-window -t "$WINDOW_ID" "$WINDOW_SHORT_NAME"
+  # PRESERVES an existing awaiting-PO marker: a resume does not answer the
+  # Manager's question, so the badge must come back with the window. The base is
+  # the one just restored above, and window-name re-composes the marker onto it.
+  WINDOW_DISPLAY_NAME="$(
+    "$SQUAD_DIR/window-name" display "$WINDOW_SHORT_NAME" 2>/dev/null ||
+      printf '%s' "$WINDOW_SHORT_NAME"
+  )"
+  tmux rename-window -t "$WINDOW_ID" "$WINDOW_DISPLAY_NAME"
   tmux select-pane -t "$MANAGER_PANE" -T "$SQUAD_TITLE"
   tmux select-pane -t "$CODER_PANE" -T "Coder"
   tmux select-pane -t "$ADVISOR_PANE" -T "Advisor"
@@ -2117,6 +2399,17 @@ CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude --dangerously-skip-permissions \
   "$TASK"
 MANAGER_STATUS=$?
 set -e
+
+# The Manager is gone, so nothing is waiting on PO any more. Without this a run
+# that ended while a question was outstanding would leave the marker up forever:
+# there is no Manager turn left to clear it, and cockpit would keep showing the
+# badge for a squad that is not running.
+#
+# This pane is still alive - claude exited, this script did not - so the window
+# is renameable and the badge really does come down on screen. Going through
+# clear_awaiting_po rather than rm is what guarantees that; see the invariant on
+# that function.
+clear_awaiting_po
 
 echo ""
 echo "Manager exited with status $MANAGER_STATUS."
