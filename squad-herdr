@@ -5,20 +5,26 @@ set -euo pipefail
 # squad-herdr - AI 3-agent team orchestration via Herdr agents
 # ==============================================================================
 #
-# TODO(deferred): the following exist in the tmux-based `squad` and are NOT
-# ported yet. Do not read this file as having parity with `squad`.
-#   * `squad-herdr resume` - restarting a run's agents and regenerating the
-#     helpers and Manager prompt for an existing run.
+# The review and verification pipeline is now at parity with the tmux-based
+# `squad`: two independent review lenses (correctness, then security), the
+# merged review checklist, the merge-reviews aggregate, the mandatory RuboCop
+# gate, the mandatory whole-application Brakeman gate, `resume`, and
+# SQUAD_BASE_COMMIT / SQUAD_BASE_REF recording.
+#
+# The two scripts still share NO code. Every generator here is a port, so a
+# change to squad's pipeline has to be made twice until they are unified; that
+# extraction is deliberately deferred until both have harness coverage.
+#
+# TODO(deferred): the following exist in `squad` and are still NOT ported.
 #   * `squad-herdr clean` - bulk removal of finished runs.
-#   * RuboCop verification (run-rubocop, rubocop-command.txt, the mandatory
-#     RuboCop step in the Manager workflow, and rubocop_status in
-#     coder-schema.json).
+#   * `squad-herdr base` - recording a different fork point after the fact.
 #   * close_run rollback hardening: RUN_STATUS is written before the workspace
 #     is closed, so a failed `herdr workspace close` leaves the state saying
 #     closed while the workspace is still live.
 #   * Full failed-launch cleanup parity: cleanup_failed_launch does not undo
 #     herdr workspaces, tabs, or agents created before the failure.
-#   * SQUAD_BASE_COMMIT / SQUAD_BASE_REF recording in state.env.
+#   * The awaiting-PO marker (await-po) and the window-name badge, which have no
+#     obvious Herdr equivalent.
 
 usage() {
   local status="${1:-1}"
@@ -31,6 +37,7 @@ usage() {
   cat <<EOF
 Usage: $name <task>
        $name list
+       $name resume <run-id>
        $name close <run-id>
        $name rm <run-id>...
        $name gen-helpers <dir>
@@ -57,6 +64,157 @@ SQUAD_RUN_ROOT="$SQUAD_STATE_ROOT/runs"
 SQUAD_WORKTREE_ROOT="${SQUAD_WORKTREE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/squad-herdr/worktrees}"
 mkdir -p "$SQUAD_RUN_ROOT" "$SQUAD_WORKTREE_ROOT"
 
+# Ported from squad. The PO runs this through a ~/.local/bin symlink, so the
+# bundled _vet/checklist.md has to be found relative to the resolved real path.
+script_real_path() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="$dir/$src"
+  done
+  printf '%s/%s\n' "$(cd -P "$(dirname "$src")" && pwd)" "$(basename "$src")"
+}
+SQUAD_SCRIPT_PATH="$(script_real_path)"
+SQUAD_SCRIPT_DIR="$(dirname "$SQUAD_SCRIPT_PATH")"
+
+# PREFLIGHT: a configured checklist path is authoritative, and must be readable,
+# not merely present. Checked before any worktree, workspace, tab or agent
+# exists, on both the launch and the resume path, so a typo cannot leave a
+# half-built Herdr layout behind.
+require_readable_checklist_config() {
+  local var value
+  for var in SQUAD_REVIEW_CHECKLIST VET_CHECKLIST; do
+    value="${!var:-}"
+    [[ -n "$value" ]] || continue
+    [[ -f "$value" && -r "$value" ]] || {
+      echo "Error: $var is set but is not a readable file: $value" >&2
+      exit 1
+    }
+    return 0
+  done
+}
+
+# --- Review checklist ---------------------------------------------------------
+# Ported from squad, which took the format and merge semantics from vet: same
+# lookup order, same "same ID replaces, new ID appends" merge, and the same
+# deliberate difference from vet - an EMPTY checklist is not a failure here.
+generate_review_checklist() {
+  mkdir -p "$SQUAD_DIR"
+
+  local common="" common_source="none"
+  local project="" project_source="none"
+
+  if [[ -n "${SQUAD_REVIEW_CHECKLIST:-}" ]]; then
+    [[ -f "$SQUAD_REVIEW_CHECKLIST" && -r "$SQUAD_REVIEW_CHECKLIST" ]] || {
+      echo "Error: SQUAD_REVIEW_CHECKLIST is set but is not a readable file: $SQUAD_REVIEW_CHECKLIST" >&2
+      exit 1
+    }
+    common="$SQUAD_REVIEW_CHECKLIST"
+    common_source="SQUAD_REVIEW_CHECKLIST"
+  elif [[ -n "${VET_CHECKLIST:-}" ]]; then
+    [[ -f "$VET_CHECKLIST" && -r "$VET_CHECKLIST" ]] || {
+      echo "Error: VET_CHECKLIST is set but is not a readable file: $VET_CHECKLIST" >&2
+      exit 1
+    }
+    common="$VET_CHECKLIST"
+    common_source="VET_CHECKLIST"
+  elif [[ -f "$HOME/.vet/checklist.md" ]]; then
+    common="$HOME/.vet/checklist.md"
+    common_source="$HOME/.vet/checklist.md"
+  elif [[ -f "$SQUAD_SCRIPT_DIR/_vet/checklist.md" ]]; then
+    common="$SQUAD_SCRIPT_DIR/_vet/checklist.md"
+    common_source="$SQUAD_SCRIPT_DIR/_vet/checklist.md"
+  fi
+
+  if [[ -f "${WORKDIR:-}/.vet/checklist.md" ]]; then
+    project="$WORKDIR/.vet/checklist.md"
+    project_source=".vet/checklist.md"
+  elif [[ -f "${WORKDIR:-}/.review/checklist.md" ]]; then
+    project="$WORKDIR/.review/checklist.md"
+    project_source=".review/checklist.md"
+  fi
+
+  if command -v perl >/dev/null 2>&1; then
+    perl -e '
+      use strict;
+      use warnings;
+      my ($common_file, $project_file) = @ARGV;
+      my (@order, %text, %source);
+      sub items {
+        my ($file, $kind) = @_;
+        my @found;
+        return @found unless defined $file && length $file && -f $file;
+        open my $fh, "<", $file or die "squad-herdr: cannot read $file: $!\n";
+        while (my $line = <$fh>) {
+          chomp $line;
+          next unless $line =~ /^-\s+\[([A-Z][A-Z0-9_-]*)\]\s+(\S.*?)\s*$/;
+          push @found, [$1, $2, $kind];
+        }
+        close $fh;
+        return @found;
+      }
+      for my $item (items($common_file, "common")) {
+        my ($id, $body) = @$item;
+        push @order, $id unless exists $text{$id};
+        $text{$id}   = $body;
+        $source{$id} = "common";
+      }
+      for my $item (items($project_file, "project")) {
+        my ($id, $body) = @$item;
+        if (exists $text{$id}) {
+          $source{$id} = ($source{$id} eq "common") ? "project-override" : $source{$id};
+        } else {
+          push @order, $id;
+          $source{$id} = "project";
+        }
+        $text{$id} = $body;
+      }
+      sub esc {
+        my $value = shift;
+        $value =~ s/\\/\\\\/g;
+        $value =~ s/"/\\"/g;
+        $value =~ s/[\x00-\x1f]/ /g;
+        return $value;
+      }
+      for my $id (@order) {
+        printf qq({"id":"%s","text":"%s","source":"%s"}\n),
+          esc($id), esc($text{$id}), esc($source{$id});
+      }
+    ' "$common" "$project" > "$SQUAD_DIR/checklist.jsonl"
+  else
+    echo "Warning: perl was not found, so the review checklist could not be parsed." >&2
+    : > "$SQUAD_DIR/checklist.jsonl"
+  fi
+
+  local count=0 overrides=0 added=0
+  if command -v jq >/dev/null 2>&1; then
+    jq -s --arg common "$common_source" --arg project "$project_source" \
+      '{common_checklist: $common, project_checklist: $project, items: .}' \
+      "$SQUAD_DIR/checklist.jsonl" > "$SQUAD_DIR/checklist.json"
+    count="$(jq -r '.items | length' "$SQUAD_DIR/checklist.json")"
+    overrides="$(jq -r '[.items[] | select(.source == "project-override")] | length' "$SQUAD_DIR/checklist.json")"
+    added="$(jq -r '[.items[] | select(.source == "project")] | length' "$SQUAD_DIR/checklist.json")"
+  else
+    echo "Warning: jq was not found, so checklist.json could not be written." >&2
+    printf '{"common_checklist":"%s","project_checklist":"%s","items":[]}\n' \
+      "$common_source" "$project_source" > "$SQUAD_DIR/checklist.json"
+  fi
+
+  {
+    printf '# Merged review checklist\n\n'
+    printf 'Common checklist:  %s\n' "$common_source"
+    printf 'Project checklist: %s\n' "$project_source"
+    printf 'Items: %s total (%s overridden by the project, %s added by the project)\n\n' \
+      "$count" "$overrides" "$added"
+    if [[ "$count" -eq 0 ]]; then
+      printf '(no checklist items)\n'
+    else
+      jq -r '.items[] | "- [\(.id)] \(.text)  <!-- source: \(.source) -->"' "$SQUAD_DIR/checklist.json"
+    fi
+  } > "$SQUAD_DIR/checklist.merged.md"
+}
+
 load_run() {
   local run_id="$1"
   local state_file="$SQUAD_RUN_ROOT/$run_id/state.env"
@@ -80,7 +238,17 @@ write_state() {
     printf 'REPO_ROOT=%q\n' "$REPO_ROOT"
     printf 'WORKDIR=%q\n' "$WORKDIR"
     printf 'BRANCH=%q\n' "$BRANCH"
+    # The EXACT fork point of this run's worktree, captured before the worktree
+    # was created. Resume re-emits whatever load_run sourced; it is never
+    # recomputed from a later HEAD.
+    printf 'SQUAD_BASE_COMMIT=%q\n' "${SQUAD_BASE_COMMIT:-}"
+    printf 'SQUAD_BASE_REF=%q\n' "${SQUAD_BASE_REF:-}"
     printf 'SQUAD_DIR=%q\n' "$SQUAD_DIR"
+    # Defaulted, so a run created before these keys existed still resumes under
+    # set -u. An empty verification command means "skip", never "block".
+    printf 'RUBOCOP_COMMAND=%q\n' "${RUBOCOP_COMMAND:-}"
+    printf 'BRAKEMAN_COMMAND=%q\n' "${BRAKEMAN_COMMAND:-}"
+    printf 'WAIT_TIMEOUT_SECONDS=%q\n' "${WAIT_TIMEOUT_SECONDS:-7200}"
     printf 'WORKSPACE_ID=%q\n' "${WORKSPACE_ID:-}"
     printf 'TAB_ID=%q\n' "${TAB_ID:-}"
     printf 'MANAGER_AGENT=%q\n' "$MANAGER_AGENT"
@@ -91,6 +259,83 @@ write_state() {
     printf 'WORKTREE_CREATED=%q\n' "${WORKTREE_CREATED:-false}"
   } > "$SQUAD_DIR/state.env"
   STATE_FILE="$SQUAD_DIR/state.env"
+}
+
+# Shared by the launch flow and by resume, so a resumed prompt describes the
+# worktree the same way the original one did.
+set_worktree_mode() {
+  if [[ "$WORKDIR" != "$REPO_ROOT" ]]; then
+    WORKTREE_MODE="isolated worktree"
+    WORKTREE_NOTE="All implementation work happens in the isolated squad-herdr worktree. Existing changes
+in the original worktree must remain untouched. The worktree is retained after
+completion so PO can inspect, commit, or merge the result."
+  else
+    WORKTREE_MODE="original repository (no commits yet, no isolated worktree)"
+    WORKTREE_NOTE="This repository has no commits yet, so git could not create an isolated
+worktree. All work happens DIRECTLY in the original repository: $REPO_ROOT."
+  fi
+}
+
+# --- Structured output schemas ------------------------------------------------
+# A function, not inline launch code, so `resume` and `gen-helpers` regenerate
+# exactly what a launch writes.
+generate_schemas() {
+  mkdir -p "$SQUAD_DIR"
+
+  cat > "$SQUAD_DIR/plan-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": { "type": "string" },
+    "scope": { "type": "array", "items": { "type": "string" } },
+    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+    "files_to_inspect": { "type": "array", "items": { "type": "string" } },
+    "implementation_steps": { "type": "array", "items": { "type": "string" } },
+    "tests": { "type": "array", "items": { "type": "string" } },
+    "risks": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["summary", "scope", "acceptance_criteria", "files_to_inspect", "implementation_steps", "tests", "risks"]
+}
+SCHEMA
+
+  # rubocop_status and brakeman_status are the Coder's SELF-REPORT. The
+  # authoritative results are the Manager's own run-rubocop / run-brakeman runs.
+  cat > "$SQUAD_DIR/coder-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": { "type": "string" },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "tests_run": { "type": "array", "items": { "type": "string" } },
+    "tests_not_run": { "type": "array", "items": { "type": "string" } },
+    "test_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+    "rubocop_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+    "brakeman_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+    "remaining_issues": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["summary", "changed_files", "tests_run", "tests_not_run", "test_status", "rubocop_status", "brakeman_status", "remaining_issues"]
+}
+SCHEMA
+
+  # UNCHANGED by the two-lens split: lens identity comes from the filenames and
+  # the prompt text, never from a schema field. merge-reviews emits an object
+  # that conforms to this same schema.
+  cat > "$SQUAD_DIR/review-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "type": "string", "enum": ["pass", "must_fix"] },
+    "summary": { "type": "string" },
+    "must_fix": { "type": "array", "items": { "type": "string" } },
+    "should_fix": { "type": "array", "items": { "type": "string" } },
+    "test_gaps": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["verdict", "summary", "must_fix", "should_fix", "test_gaps"]
+}
+SCHEMA
 }
 
 branch_exists() {
@@ -720,6 +965,10 @@ TASK_FILE="$1"
 RESULT_FILE="$2"
 STATUS_FILE="$3"
 SCHEMA_FILE="$4"
+# Which review lens this run is. Two INDEPENDENT lenses (correctness, then
+# security) run one after the other in the Advisor pane, so the log has to say
+# which one the PO is watching. Defaults for an older invocation.
+LENS="${5:-review}"
 STREAM_FILE="${RESULT_FILE%.json}.stream.jsonl"
 
 log() {
@@ -730,7 +979,7 @@ finish() {
   rc=$?
   trap - EXIT
   printf '%s\n' "$rc" > "$STATUS_FILE"
-  log ">>> Advisor review exited with status $rc."
+  log ">>> Advisor $LENS review exited with status $rc."
   exit "$rc"
 }
 trap finish EXIT
@@ -739,7 +988,7 @@ trap finish EXIT
 # still records a status.
 rm -f "$STATUS_FILE"
 
-log ">>> Advisor review prompt sent."
+log ">>> Advisor $LENS review prompt sent."
 # NOTE: codex `exec review` treats the scope flags (--uncommitted/--base/--commit)
 # as mutually exclusive with a custom [PROMPT]. We drive the review entirely from
 # the prompt (which instructs inspecting the uncommitted changes), so do NOT pass
@@ -761,287 +1010,548 @@ codex -a never -s read-only exec review \
   ' |
   while IFS= read -r line; do log "$line"; done
 cat "$RESULT_FILE" 2>/dev/null || true
-log ">>> Advisor review finished."
+log ">>> Advisor $LENS review finished."
 HELPER
   chmod +x "$SQUAD_DIR/run-review"
-}
 
-case "${1:-}" in
-  -h|--help|"")
-    usage 0
-    ;;
-  resume|clean|base)
-    # squad subcommands that squad-herdr does not implement yet. Without this
-    # arm they fall through to the new-run path below and get treated as a TASK
-    # DESCRIPTION, which silently creates a worktree and launches three agents.
-    # `squad` delegates every subcommand from inside a herdr pane, so `squad
-    # base` arriving here is a normal typo-level mistake, not an exotic one.
-    echo "Error: squad-herdr does not implement '$1' yet." >&2
-    echo "       Implemented: list, close, rm, gen-helpers, and <task>." >&2
-    echo "       Refusing to treat '$1' as a task description." >&2
-    exit 2
-    ;;
-  gen-helpers)
-    [[ -n "${2:-}" ]] || {
-      echo "Error: squad-herdr gen-helpers requires a target directory" >&2
-      exit 1
-    }
-    SQUAD_DIR="$2"
-    RUN_ID="${SQUAD_GEN_RUN_ID:-gen-helpers}"
-    MANAGER_AGENT="Manager-$RUN_ID"
-    CODER_AGENT="Coder-$RUN_ID"
-    ADVISOR_AGENT="Advisor-$RUN_ID"
-    generate_helper_scripts
-    printf 'Helper scripts written to %s\n' "$SQUAD_DIR"
-    exit 0
-    ;;
-  list)
-    list_runs
-    exit 0
-    ;;
-  close)
-    [[ -n "${2:-}" ]] || {
-      echo "Error: squad-herdr close requires a run-id" >&2
-      exit 1
-    }
-    close_run "$2"
-    exit 0
-    ;;
-  rm)
-    shift
-    [[ $# -gt 0 ]] || {
-      echo "Error: squad-herdr rm requires at least one run-id" >&2
-      exit 1
-    }
-    rm_status=0
-    for run_id in "$@"; do
-      remove_run "$run_id" || rm_status=1
-    done
-    exit "$rm_status"
-    ;;
-esac
-
-TASK="$*"
-if [[ "$TASK" =~ ([[:alnum:]_]+-[[:digit:]]+) ]]; then
-  TICKET_ID="${BASH_REMATCH[1]}"
-  SQUAD_TITLE="$TICKET_ID | チケット内容を確認中"
-else
-  TICKET_ID=""
-  SQUAD_TITLE="チケット内容を確認中"
-fi
-WAIT_TIMEOUT_SECONDS="${SQUAD_WAIT_TIMEOUT_SECONDS:-7200}"
-[[ "$WAIT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
-  echo "Error: SQUAD_WAIT_TIMEOUT_SECONDS must be a positive integer." >&2
-  exit 1
-}
-
-for cmd in claude codex git herdr jq uuidgen; do
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "Error: $cmd is not installed or not in PATH" >&2
-    exit 1
-  }
-done
-
-ORIGINAL_WORKDIR="$(pwd)"
-REPO_ROOT="$(git -C "$ORIGINAL_WORKDIR" rev-parse --show-toplevel 2>/dev/null)" || {
-  echo "Error: squad-herdr must be run inside a git repository" >&2
-  exit 1
-}
-
-HAS_COMMITS=true
-git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD >/dev/null || HAS_COMMITS=false
-
-RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
-STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
-REPO_NAME="$(basename "$REPO_ROOT")"
-SQUAD_DIR="$SQUAD_RUN_ROOT/$RUN_ID"
-MANAGER_AGENT="Manager-$RUN_ID"
-CODER_AGENT="Coder-$RUN_ID"
-ADVISOR_AGENT="Advisor-$RUN_ID"
-# Fixed up front so the Coder can be resumed into the SAME conversation for every
-# round of fixes. `claude -p --session-id` creates it on the first run.
-CODER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-WORKTREE_CREATED=false
-
-if [[ "$HAS_COMMITS" == "true" ]]; then
-  WORKDIR="$SQUAD_WORKTREE_ROOT/$REPO_NAME-$RUN_ID"
-  if [[ -n "$TICKET_ID" ]]; then
-    BRANCH="feat/$TICKET_ID"
-    if branch_exists "$BRANCH"; then
-      BRANCH="feat/$TICKET_ID-$RUN_ID"
-    fi
-  else
-    BRANCH="feat/squad-herdr-$RUN_ID"
-  fi
-else
-  WORKDIR="$REPO_ROOT"
-  BRANCH="$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || echo main)"
-fi
-
-cleanup_failed_launch() {
-  [[ -f "$SQUAD_DIR/state.env" ]] && return 0
-  rm -rf "$SQUAD_DIR"
-  if [[ "$WORKTREE_CREATED" == "true" && -d "$WORKDIR" ]]; then
-    git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1 || true
-    git -C "$REPO_ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup_failed_launch EXIT
-
-mkdir -p "$SQUAD_DIR" "$SQUAD_WORKTREE_ROOT"
-
-if [[ "$HAS_COMMITS" == "true" && -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
-  echo "Note: existing changes remain untouched in the original worktree:"
-  git -C "$REPO_ROOT" status --short
-  echo ""
-fi
-
-if [[ "$HAS_COMMITS" == "true" ]]; then
-  git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WORKDIR" HEAD
-  WORKTREE_CREATED=true
-  if [[ -f "$REPO_ROOT/.env" ]]; then
-    cp "$REPO_ROOT/.env" "$WORKDIR/.env"
-  fi
-  WORKTREE_MODE="isolated worktree"
-  WORKTREE_NOTE="All implementation work happens in the isolated squad-herdr worktree. Existing changes
-in the original worktree must remain untouched. The worktree is retained after
-completion so PO can inspect, commit, or merge the result."
-else
-  echo "Note: this repository has no commits yet, so no isolated worktree is created."
-  echo "The squad-herdr agents work directly in: $WORKDIR"
-  echo ""
-  WORKTREE_MODE="original repository (no commits yet, no isolated worktree)"
-  WORKTREE_NOTE="This repository has no commits yet, so git could not create an isolated
-worktree. All work happens DIRECTLY in the original repository: $REPO_ROOT."
-fi
-
-cat > "$SQUAD_DIR/run-info.txt" << INFO
-Squad title:       $SQUAD_TITLE
-Ticket ID:         ${TICKET_ID:-not detected}
-Started at:        $STARTED_AT
-Original worktree: $REPO_ROOT
-Squad worktree:    $WORKDIR
-Worktree mode:     $WORKTREE_MODE
-Squad branch:      $BRANCH
-Artifacts:         $SQUAD_DIR
-Manager agent:     $MANAGER_AGENT
-Coder agent:       $CODER_AGENT
-Advisor agent:     $ADVISOR_AGENT
-Coder session:     $CODER_SESSION_ID
-Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
-INFO
-
-printf '%s\n' "$SQUAD_TITLE" > "$SQUAD_DIR/title.txt"
-
-cat > "$SQUAD_DIR/update-title" <<'HELPER'
+  # merge-reviews folds the two independent lens results into the single
+  # review-result.json / review-status.txt pair, which is what any GUI reads.
+  # The Manager still DECIDES from the lens-specific files; this aggregate is a
+  # compatibility artifact, and it is deterministic on purpose - no agent, no
+  # run-wait, run synchronously in the Manager's own pane.
+  #
+  # Ported verbatim in behaviour from squad, including the "exactly one JSON
+  # value" rule: jq validates a stream by its LAST document while the merge
+  # reads the FIRST, so without it a bad first object could hide behind a good
+  # second one and still merge into a pass.
+  cat > "$SQUAD_DIR/merge-reviews" <<'HELPER'
 #!/usr/bin/env bash
 set -euo pipefail
-TITLE_FILE="$1"
-NEW_TITLE_FILE="$2"
-WORKSPACE_ID="$3"
-TAB_ID="$4"
 
-NEW_TITLE="$(
-  tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
-    sed -E \
-      -e 's/^[[:space:]]+//' \
-      -e 's/[[:space:]]+$//' \
-      -e 's/[[:space:]]+/ /g' |
-    cut -c 1-90
-)"
-
-if [[ -z "$NEW_TITLE" ]]; then
-  echo "Error: squad title must not be empty" >&2
-  exit 1
+if [[ $# -ne 6 ]]; then
+  printf 'Usage: merge-reviews <correctness-result> <correctness-status> <security-result> <security-status> <out-result> <out-status>\n' >&2
+  exit 2
 fi
 
-printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
-herdr workspace rename "$WORKSPACE_ID" "$NEW_TITLE"
-herdr tab rename "$TAB_ID" "$NEW_TITLE"
-printf '[%s] Squad title updated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE"
-HELPER
-chmod +x "$SQUAD_DIR/update-title"
+CORRECTNESS_RESULT="$1"
+CORRECTNESS_STATUS="$2"
+SECURITY_RESULT="$3"
+SECURITY_STATUS="$4"
+OUT_RESULT="$5"
+OUT_STATUS="$6"
 
-cat > "$SQUAD_DIR/plan-schema.json" <<'SCHEMA'
-{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "summary": { "type": "string" },
-    "scope": { "type": "array", "items": { "type": "string" } },
-    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
-    "files_to_inspect": { "type": "array", "items": { "type": "string" } },
-    "implementation_steps": { "type": "array", "items": { "type": "string" } },
-    "tests": { "type": "array", "items": { "type": "string" } },
-    "risks": { "type": "array", "items": { "type": "string" } }
-  },
-  "required": ["summary", "scope", "acceptance_criteria", "files_to_inspect", "implementation_steps", "tests", "risks"]
+MERGE_FAILURE_STATUS=65
+
+trap 'rc=$?; trap - EXIT; if [[ "$rc" -ne 0 && ! -s "$OUT_STATUS" ]]; then printf "%s\n" "$rc" > "$OUT_STATUS"; fi; exit "$rc"' EXIT
+
+rm -f "$OUT_RESULT" "$OUT_STATUS"
+
+fail() {
+  local message="$1"
+  printf 'merge-reviews: ERROR: %s\n' "$message" >&2
+  printf 'merge-reviews: refusing to emit a pass. Re-run the failed review lens.\n' >&2
+  jq -n --arg message "$message" '
+    {
+      verdict: "must_fix",
+      summary: ("merge-reviews failed: " + $message),
+      must_fix: [("[merge-reviews] " + $message)],
+      should_fix: [],
+      test_gaps: []
+    }' > "$OUT_RESULT" 2>/dev/null || printf '\n' > "$OUT_RESULT"
+  printf '%s\n' "$MERGE_FAILURE_STATUS" > "$OUT_STATUS"
+  exit "$MERGE_FAILURE_STATUS"
 }
-SCHEMA
 
-cat > "$SQUAD_DIR/coder-schema.json" <<'SCHEMA'
-{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "summary": { "type": "string" },
-    "changed_files": { "type": "array", "items": { "type": "string" } },
-    "tests_run": { "type": "array", "items": { "type": "string" } },
-    "tests_not_run": { "type": "array", "items": { "type": "string" } },
-    "test_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
-    "remaining_issues": { "type": "array", "items": { "type": "string" } }
-  },
-  "required": ["summary", "changed_files", "tests_run", "tests_not_run", "test_status", "remaining_issues"]
+command -v jq >/dev/null 2>&1 || {
+  printf 'merge-reviews: ERROR: jq is required.\n' >&2
+  printf '%s\n' "$MERGE_FAILURE_STATUS" > "$OUT_STATUS"
+  exit "$MERGE_FAILURE_STATUS"
 }
-SCHEMA
 
-cat > "$SQUAD_DIR/review-schema.json" <<'SCHEMA'
-{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "verdict": { "type": "string", "enum": ["pass", "must_fix"] },
-    "summary": { "type": "string" },
-    "must_fix": { "type": "array", "items": { "type": "string" } },
-    "should_fix": { "type": "array", "items": { "type": "string" } },
-    "test_gaps": { "type": "array", "items": { "type": "string" } }
-  },
-  "required": ["verdict", "summary", "must_fix", "should_fix", "test_gaps"]
+read_status() {
+  local lens="$1" file="$2" value
+  [[ -s "$file" ]] || fail "the $lens status file is missing or empty: $file"
+  value="$(head -n 1 "$file" | tr -d '[:space:]')"
+  [[ "$value" =~ ^[0-9]+$ ]] || fail "the $lens status file does not contain an exit code: $file"
+  printf '%s\n' "$value"
 }
-SCHEMA
 
-cat "$SQUAD_DIR/run-info.txt"
-echo ""
+check_result() {
+  local lens="$1" file="$2" count extra
+  [[ -s "$file" ]] || fail "the $lens result file is missing or empty: $file"
 
-if [[ "$HAS_COMMITS" == "true" ]]; then
-  herdr worktree open --cwd "$REPO_ROOT" --path "$WORKDIR" --label "$SQUAD_TITLE" --focus --json >/dev/null
-  WORKSPACE_ID="$(find_workspace_for_workdir "$WORKDIR")"
-else
-  herdr workspace create --cwd "$WORKDIR" --label "$SQUAD_TITLE" --focus >/dev/null
-  WORKSPACE_ID="$(
-    herdr api snapshot |
-      jq -r --arg label "$SQUAD_TITLE" '
-        .result.snapshot.workspaces[]?
-        | select(.label == $label)
-        | .workspace_id
-      ' |
-      tail -n 1
+  count="$(jq -s 'length' "$file" 2>/dev/null || true)"
+  [[ "$count" =~ ^[0-9]+$ ]] ||
+    fail "the $lens result file is not valid JSON: $file"
+  [[ "$count" -eq 1 ]] ||
+    fail "the $lens result file must contain exactly one JSON value, found $count: $file"
+
+  jq -s -e '.[0] | type == "object"' "$file" >/dev/null 2>&1 ||
+    fail "the $lens result file is not a JSON object: $file"
+  extra="$(
+    jq -s -r '.[0] | (keys) - ["verdict","summary","must_fix","should_fix","test_gaps"] | join(", ")' \
+      "$file" 2>/dev/null || true
   )"
+  [[ -z "$extra" ]] ||
+    fail "the $lens result file has top-level properties review-schema.json does not allow ($extra): $file"
+  jq -s -e '
+    .[0] |
+    ((keys) == ["must_fix","should_fix","summary","test_gaps","verdict"])
+    and (.verdict == "pass" or .verdict == "must_fix")
+    and (.summary | type == "string")
+    and (.must_fix | type == "array")
+    and (.should_fix | type == "array")
+    and (.test_gaps | type == "array")
+    and ([.must_fix[], .should_fix[], .test_gaps[]] | all(type == "string"))
+  ' "$file" >/dev/null 2>&1 ||
+    fail "the $lens result file is not a valid review-schema.json object (missing key, wrong type, or non-string finding): $file"
+}
+
+CORRECTNESS_RC="$(read_status correctness "$CORRECTNESS_STATUS")"
+SECURITY_RC="$(read_status security "$SECURITY_STATUS")"
+check_result correctness "$CORRECTNESS_RESULT"
+check_result security "$SECURITY_RESULT"
+
+if [[ "$CORRECTNESS_RC" -ne 0 ]]; then
+  AGGREGATE_RC="$CORRECTNESS_RC"
+elif [[ "$SECURITY_RC" -ne 0 ]]; then
+  AGGREGATE_RC="$SECURITY_RC"
+else
+  AGGREGATE_RC=0
 fi
 
-[[ -n "${WORKSPACE_ID:-}" ]] || {
-  echo "Error: failed to determine Herdr workspace ID" >&2
-  exit 1
-}
-TAB_ID="$(active_tab_for_workspace "$WORKSPACE_ID")"
-[[ -n "${TAB_ID:-}" ]] || {
-  echo "Error: failed to determine Herdr active tab ID" >&2
-  exit 1
+jq -n \
+  --slurpfile correctness "$CORRECTNESS_RESULT" \
+  --slurpfile security "$SECURITY_RESULT" '
+  ($correctness[0]) as $c |
+  ($security[0]) as $s |
+  {
+    verdict: (if $c.verdict == "must_fix" or $s.verdict == "must_fix" then "must_fix" else "pass" end),
+    summary: ("[correctness] " + $c.summary + "\n\n[security] " + $s.summary),
+    must_fix: (($c.must_fix | map("[correctness] " + .)) + ($s.must_fix | map("[security] " + .))),
+    should_fix: (($c.should_fix | map("[correctness] " + .)) + ($s.should_fix | map("[security] " + .))),
+    test_gaps: (($c.test_gaps | map("[correctness] " + .)) + ($s.test_gaps | map("[security] " + .)))
+  }' > "$OUT_RESULT" || fail "could not merge the two lens results"
+
+[[ -s "$OUT_RESULT" ]] || fail "the merged result came out empty"
+
+printf '%s\n' "$AGGREGATE_RC" > "$OUT_STATUS"
+printf 'merge-reviews: correctness status %s, security status %s -> aggregate status %s\n' \
+  "$CORRECTNESS_RC" "$SECURITY_RC" "$AGGREGATE_RC"
+printf 'merge-reviews: aggregate verdict %s\n' "$(jq -r '.verdict' "$OUT_RESULT")"
+HELPER
+  chmod +x "$SQUAD_DIR/merge-reviews"
+
+  # RuboCop gate. Ported from squad minus the tmux pane title and event signal,
+  # which have no Herdr equivalent: the status file is the whole protocol here.
+  cat > "$SQUAD_DIR/run-rubocop" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+COMMAND_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
-# Must precede the Manager prompt: the prompt hard-codes these helper paths.
-generate_helper_scripts
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  log ">>> RuboCop exited with status $rc."
+  exit "$rc"
+}
+trap finish EXIT
 
+# Cleared AFTER the trap is installed, so a failure from here on still records a
+# status and the next round can never read this round's leftover.
+rm -f "$STATUS_FILE"
+
+log ">>> RuboCop starting..."
+BASE_COMMAND="$(cat "$COMMAND_FILE")"
+if [[ -z "$BASE_COMMAND" ]]; then
+  {
+    log ">>> RuboCop skipped: not a Ruby project (no RuboCop command configured)."
+    printf 'RuboCop skipped: not a Ruby project.\n'
+  } | tee "$RESULT_FILE"
+  exit 0
+fi
+
+RUBOCOP_FILES=()
+while IFS= read -r file; do
+  case "$file" in
+    app/*|config/*|db/*|lib/*|spec/*|test/*|Gemfile|Rakefile|config.ru|*.rb|*.rake|*.gemspec|*.jbuilder|*.builder)
+      [[ -f "$file" ]] && RUBOCOP_FILES+=("$file")
+      ;;
+  esac
+done < <(
+  {
+    if git rev-parse --verify --quiet HEAD >/dev/null; then
+      git diff --name-only --diff-filter=ACMRT HEAD --
+    fi
+    git ls-files --others --exclude-standard
+  } | sort -u
+)
+
+if [[ "${#RUBOCOP_FILES[@]}" -eq 0 ]]; then
+  {
+    log ">>> RuboCop skipped: no changed Rails/Ruby files."
+    printf 'No changed Rails/Ruby files for RuboCop.\n'
+  } | tee "$RESULT_FILE"
+  exit 0
+fi
+
+{
+  printf 'RuboCop target files:\n'
+  printf '%s\n' "${RUBOCOP_FILES[@]}"
+} > "$RESULT_FILE"
+log ">>> RuboCop target files:"
+printf '%s\n' "${RUBOCOP_FILES[@]}" |
+  while IFS= read -r line; do log "  $line"; done
+
+AUTOCORRECT_LOG="${RESULT_FILE%.txt}.autocorrect.log"
+log ">>> RuboCop autocorrect starting..."
+{
+  printf '\nRuboCop autocorrect (-a):\n'
+  set +e
+  bash -lc "$BASE_COMMAND -a --cache true \"\$@\"" bash "${RUBOCOP_FILES[@]}"
+  autocorrect_status=$?
+  set -e
+  printf 'RuboCop autocorrect exit status: %s\n' "$autocorrect_status"
+} > "$AUTOCORRECT_LOG" 2>&1
+cat "$AUTOCORRECT_LOG" >> "$RESULT_FILE"
+while IFS= read -r line; do log "$line"; done < "$AUTOCORRECT_LOG"
+
+log ">>> RuboCop verification starting..."
+bash -lc "$BASE_COMMAND --cache true \"\$@\"" bash "${RUBOCOP_FILES[@]}" 2>&1 |
+  tee -a "$RESULT_FILE" |
+  while IFS= read -r line; do log "$line"; done
+log ">>> RuboCop autocorrect and verification finished for changed Rails/Ruby files."
+HELPER
+  chmod +x "$SQUAD_DIR/run-rubocop"
+
+  # Brakeman gate. A GATE, not a review lens: it never feeds merge-reviews.
+  # WHOLE-APPLICATION scan, because Brakeman is a dataflow analyser and a
+  # warning routinely surfaces in code the change never touched.
+  cat > "$SQUAD_DIR/run-brakeman" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+COMMAND_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+
+JSON_REPORT="${RESULT_FILE%.txt}.json"
+CONSOLE_LOG="${RESULT_FILE%.txt}.console.log"
+# RELATIVE on purpose: under the docker-compose branch the scan runs inside the
+# container, where $SQUAD_DIR is not mounted but the app directory is. Moved
+# into $SQUAD_DIR and deleted from the worktree before this helper exits, so it
+# never shows up as an uncommitted change in the review that follows.
+REPORT_BASENAME=".squad-brakeman-report.json"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  rm -f "$REPORT_BASENAME"
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  log ">>> Brakeman exited with status $rc."
+  exit "$rc"
+}
+trap finish EXIT
+
+rm -f "$STATUS_FILE"
+
+log ">>> Brakeman starting..."
+
+skip() {
+  {
+    log ">>> Brakeman skipped: $1"
+    printf 'Brakeman skipped: %s\n' "$1"
+  } | tee "$RESULT_FILE"
+  exit 0
+}
+
+fail() {
+  {
+    log ">>> Brakeman FAILED: $1"
+    printf 'Brakeman failed: %s\n' "$1"
+  } | tee -a "$RESULT_FILE"
+  exit "${2:-1}"
+}
+
+BASE_COMMAND="$(cat "$COMMAND_FILE")"
+if [[ -z "$BASE_COMMAND" ]]; then
+  skip "no Brakeman command configured (not a Ruby project, or Brakeman is not installed)."
+fi
+
+# Proof that BRAKEMAN ITSELF is absent - not that something else went wrong.
+#
+# Every pattern must NAME brakeman on the SAME LINE as an "this executable does
+# not exist" phrase. That pairing is the entire point. A bare "Could not find
+# ..." naming some other gem means the BUNDLE is broken, and a broken toolchain
+# has to FAIL this gate, not quietly switch it off.
+#
+# When a failure cannot be classified, it is a FAILURE. The asymmetry is not
+# close: a false failure costs one confused round and is immediately visible,
+# while a false skip hides every security warning in the change set and still
+# reports green.
+#
+# Deliberately NOT treated as proof of absence:
+#   * "Could not find <gem>-<version> in locally installed gems", even when the
+#     gem named IS brakeman. Detection already ran brakeman successfully at
+#     launch, so that message means the environment regressed afterwards - and a
+#     project that declares brakeman must not have its security gate disabled by
+#     a stale bundle.
+#   * Any docker daemon or container error.
+#   * Any unrecognised output.
+#
+# KEEP IDENTICAL to squad's copy: the duplication is a deferred-dedupe decision,
+# not licence for the two gates to drift.
+brakeman_absent() {
+  printf '%s' "$1" | grep -qiE \
+    -e 'command not found:[[:space:]]*brakeman' \
+    -e 'brakeman:[[:space:]]*command not found' \
+    -e 'cannot load such file --[[:space:]]*brakeman' \
+    -e 'brakeman.*no such file or directory' \
+    -e 'no such file or directory.*brakeman'
+}
+
+log ">>> Verifying Brakeman is runnable: $BASE_COMMAND --version"
+set +e
+VERSION_OUTPUT="$(bash -lc "$BASE_COMMAND --version" 2>&1)"
+VERSION_STATUS=$?
+set -e
+if [[ "$VERSION_STATUS" -ne 0 ]]; then
+  printf '%s\n' "$VERSION_OUTPUT" | while IFS= read -r line; do log "  $line"; done
+  if brakeman_absent "$VERSION_OUTPUT"; then
+    skip "Brakeman itself is not installed for this project (probe exit $VERSION_STATUS)."
+  fi
+  {
+    printf 'Brakeman probe command: %s --version\n' "$BASE_COMMAND"
+    printf 'Brakeman probe exit status: %s\n' "$VERSION_STATUS"
+    printf '%s\n' "$VERSION_OUTPUT"
+  } > "$RESULT_FILE"
+  fail "the Brakeman probe failed for a reason that does NOT prove Brakeman is absent - a broken bundle, a docker or runtime failure, or an unrecognised error (see $RESULT_FILE). This is NOT treated as a skip." "$VERSION_STATUS"
+fi
+log ">>> Brakeman version: $(printf '%s' "$VERSION_OUTPUT" | head -n 1)"
+
+rm -f "$REPORT_BASENAME" "$JSON_REPORT"
+
+log ">>> Brakeman scanning the whole application..."
+set +e
+bash -lc "$BASE_COMMAND -q --no-pager --exit-on-warn -o \"\$1\" ." bash "$REPORT_BASENAME" \
+  > "$CONSOLE_LOG" 2>&1
+SCAN_STATUS=$?
+set -e
+while IFS= read -r line; do log "$line"; done < "$CONSOLE_LOG"
+
+if [[ -f "$REPORT_BASENAME" ]]; then
+  mv "$REPORT_BASENAME" "$JSON_REPORT"
+fi
+
+{
+  printf 'Brakeman command: %s\n' "$BASE_COMMAND"
+  printf 'Brakeman exit status: %s\n' "$SCAN_STATUS"
+  printf '\nBrakeman console output:\n'
+  cat "$CONSOLE_LOG"
+} > "$RESULT_FILE"
+
+# Summarised BEFORE the pass/fail decision: the failing path is exactly where
+# the warning list matters, since it is what the Manager quotes to the Coder.
+WARNING_COUNT=""
+ERROR_COUNT=""
+REPORT_USABLE=false
+if [[ -s "$JSON_REPORT" ]] && command -v jq >/dev/null 2>&1; then
+  if jq -e 'type == "object" and (.warnings | type == "array")' "$JSON_REPORT" >/dev/null 2>&1; then
+    REPORT_USABLE=true
+    WARNING_COUNT="$(jq -r '.warnings | length' "$JSON_REPORT")"
+    ERROR_COUNT="$(jq -r '(.errors // []) | length' "$JSON_REPORT")"
+    {
+      printf '\nBrakeman summary: %s warnings, %s scan errors.\n' "$WARNING_COUNT" "$ERROR_COUNT"
+      if [[ "$WARNING_COUNT" -gt 0 ]]; then
+        jq -r '.warnings[] | "- [\(.confidence // "?")] \(.warning_type // "?"): \(.message // "") (\(.file // "?"):\(.line // "?"))"' \
+          "$JSON_REPORT"
+      fi
+    } >> "$RESULT_FILE"
+    log ">>> Brakeman summary: $WARNING_COUNT warnings, $ERROR_COUNT scan errors."
+  fi
+fi
+
+if [[ "$SCAN_STATUS" -eq 4 ]]; then
+  if grep -qiE 'please supply the path to a rails application|no rails application|not a rails application' \
+    "$CONSOLE_LOG"; then
+    skip "no Rails application was detected in this repository (Brakeman exit 4)."
+  fi
+  fail "Brakeman exited 4 but did not report a missing Rails application, so this is not a skip." "$SCAN_STATUS"
+fi
+
+if [[ "$SCAN_STATUS" -ne 0 ]]; then
+  fail "Brakeman exited $SCAN_STATUS. With --exit-on-warn this means warnings were found, or the scan itself errored. Read $RESULT_FILE and $JSON_REPORT." "$SCAN_STATUS"
+fi
+
+if [[ ! -s "$JSON_REPORT" ]]; then
+  fail "Brakeman exited 0 but wrote no JSON report to $JSON_REPORT, so the scan cannot be confirmed." 1
+fi
+
+if command -v jq >/dev/null 2>&1; then
+  if [[ "$REPORT_USABLE" != "true" ]]; then
+    fail "the Brakeman JSON report at $JSON_REPORT is malformed or has no warnings array." 1
+  fi
+  if [[ "$WARNING_COUNT" -gt 0 ]]; then
+    fail "Brakeman exited 0 but the report contains $WARNING_COUNT warnings." 1
+  fi
+  if [[ "$ERROR_COUNT" -gt 0 ]]; then
+    fail "Brakeman reported $ERROR_COUNT scan errors, so the scan is not trustworthy." 1
+  fi
+else
+  printf '\n(jq is unavailable, so no summary was extracted from %s)\n' "$JSON_REPORT" >> "$RESULT_FILE"
+fi
+
+log ">>> Brakeman passed with 0 warnings (whole-application scan)."
+HELPER
+  chmod +x "$SQUAD_DIR/run-brakeman"
+}
+
+# --- Resume -------------------------------------------------------------------
+# Restart a run's agents and regenerate every generated artifact from THIS
+# version of the script, so a run created by an older squad-herdr is migrated
+# the moment it is resumed.
+#
+# NO PANE ID IS INVOLVED, at any point. Agents are created by NAME
+# (`herdr agent start <name>`) and resolved by name through squad-agent, and the
+# names are in state.env, so a resume can ask "does this role resolve?" and
+# either reuse the live agent or start a new one under the same name. The
+# workspace is rediscovered from the worktree checkout path rather than trusted
+# from state.env, and the Coder's claude session UUID is persisted, so the
+# Coder resumes its exact conversation.
+resume_run() {
+  local run_id="${1:-}"
+  [[ -n "$run_id" ]] || {
+    echo "Error: squad-herdr resume requires a run-id (see: squad-herdr list)" >&2
+    exit 1
+  }
+
+  # Environment validation BEFORE anything is created or restarted.
+  require_readable_checklist_config
+
+  load_run "$run_id"
+
+  [[ -d "$WORKDIR" ]] || {
+    echo "Error: squad-herdr worktree no longer exists: $WORKDIR" >&2
+    exit 1
+  }
+
+  # The workspace is authoritative from the CHECKOUT PATH, not from state.env:
+  # the PO may have closed and reopened it, which changes the ID.
+  local workspace tab
+  workspace="$(find_workspace_for_workdir "$WORKDIR")"
+  if [[ -z "$workspace" ]]; then
+    if [[ "$WORKTREE_CREATED" == "true" ]]; then
+      herdr worktree open --cwd "$REPO_ROOT" --path "$WORKDIR" --label "$(cat "$SQUAD_DIR/title.txt" 2>/dev/null || printf 'squad-herdr')" --focus --json >/dev/null
+    else
+      herdr workspace create --cwd "$WORKDIR" --label "$(cat "$SQUAD_DIR/title.txt" 2>/dev/null || printf 'squad-herdr')" --focus >/dev/null
+    fi
+    workspace="$(find_workspace_for_workdir "$WORKDIR")"
+  fi
+  [[ -n "$workspace" ]] || {
+    echo "Error: failed to determine a Herdr workspace for $WORKDIR" >&2
+    exit 1
+  }
+  WORKSPACE_ID="$workspace"
+
+  tab="$(active_tab_for_workspace "$WORKSPACE_ID")"
+  [[ -n "$tab" ]] || {
+    echo "Error: failed to determine the active Herdr tab for workspace $WORKSPACE_ID" >&2
+    exit 1
+  }
+  TAB_ID="$tab"
+
+  SQUAD_TITLE="$(cat "$SQUAD_DIR/title.txt" 2>/dev/null || printf 'squad-herdr')"
+  set_worktree_mode
+  RUN_STATUS="running"
+  write_state
+
+  # Regenerated from the CURRENT script, in the same order as a launch.
+  printf '%s\n' "${RUBOCOP_COMMAND:-}" > "$SQUAD_DIR/rubocop-command.txt"
+  printf '%s\n' "${BRAKEMAN_COMMAND:-}" > "$SQUAD_DIR/brakeman-command.txt"
+  generate_schemas
+  generate_review_checklist
+  generate_helper_scripts
+  generate_manager_prompt
+  generate_resume_prompt
+
+  # Per role: reuse the agent if it still resolves, otherwise start a NEW one
+  # under the SAME name. Starting a duplicate while the old one is alive would
+  # make squad-agent refuse to guess between two identically named agents and
+  # break every later dispatch, so the resolve check is not optional.
+  local role agent_name split
+  for role in manager coder advisor; do
+    case "$role" in
+      manager) agent_name="$MANAGER_AGENT"; split="" ;;
+      coder) agent_name="$CODER_AGENT"; split="right" ;;
+      advisor) agent_name="$ADVISOR_AGENT"; split="down" ;;
+    esac
+    if "$SQUAD_DIR/squad-agent" "$role" >/dev/null 2>&1; then
+      printf 'Reusing live agent for %s (%s)\n' "$role" "$agent_name"
+      continue
+    fi
+    printf 'Restarting agent for %s (%s)\n' "$role" "$agent_name"
+    if [[ -n "$split" ]]; then
+      herdr agent start "$agent_name" --cwd "$WORKDIR" --workspace "$WORKSPACE_ID" --tab "$TAB_ID" --split "$split" --no-focus -- \
+        bash -l
+    else
+      herdr agent start "$agent_name" --cwd "$WORKDIR" --workspace "$WORKSPACE_ID" --tab "$TAB_ID" --no-focus -- \
+        bash -l
+    fi
+  done
+
+  local resume_ready_timeout=20 waited unresolved=""
+  for role in manager coder advisor; do
+    waited=0
+    until "$SQUAD_DIR/squad-agent" "$role" >/dev/null 2>&1; do
+      if ((waited >= resume_ready_timeout)); then
+        unresolved="$unresolved $role"
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+  done
+  if [[ -n "$unresolved" ]]; then
+    echo "Error: these squad roles are not addressable after the resume:$unresolved" >&2
+    echo "The agents that DID start were left running and untouched." >&2
+    echo "To tear the run down: squad-herdr close $RUN_ID" >&2
+    exit 1
+  fi
+
+  # The Manager keeps its own transcript only if the PO kept the pane; a resumed
+  # Manager is a fresh claude either way, so it gets the resume prompt.
+  rm -f "$SQUAD_DIR/manager-started.txt"
+  local dispatch
+  printf -v dispatch '%q %q %q %q %q' \
+    "$SQUAD_DIR/run-manager" \
+    "$WORKDIR" \
+    "$SQUAD_DIR/manager-resume-prompt.md" \
+    "$SQUAD_DIR/manager-task.txt" \
+    "$SQUAD_DIR/manager-started.txt"
+  "$SQUAD_DIR/send-to" manager "$dispatch"
+
+  herdr agent focus "$MANAGER_AGENT" || true
+  printf 'Squad-herdr resumed: %s\n' "$RUN_ID"
+  printf 'Workspace: %s\n' "$WORKSPACE_ID"
+  printf 'Tab:       %s\n' "$TAB_ID"
+  printf 'Worktree:  %s\n' "$WORKDIR"
+  printf 'Artifacts: %s\n' "$SQUAD_DIR"
+}
+
+# --- Manager system prompt ----------------------------------------------------
+# A function so `resume` regenerates it verbatim from the CURRENT script.
+# Contains NO herdr pane ID: every agent is addressed by role.
+generate_manager_prompt() {
 cat > "$SQUAD_DIR/manager-prompt.md" << PROMPT
 # You are a Development Manager
 
@@ -1125,6 +1635,27 @@ failure send-to sends nothing and exits non-zero.
   executing it.
 - The Coder MUST run relevant automated tests for the task. If tests cannot run,
   report the exact blocker to PO and do not claim completion.
+- After each Coder run, ALWAYS run the RuboCop helper and require exit status 0.
+  It checks only the changed Rails/Ruby files, and skips with 0 when the project
+  is not a Ruby project.
+- After RuboCop and BEFORE the review lenses, ALWAYS run the Brakeman helper and
+  require exit status 0. It scans the WHOLE application, not the changed files,
+  because Brakeman is a dataflow scanner and a warning often surfaces in code
+  this change never touched. It skips with 0 when the project has no Brakeman,
+  so a non-zero status always means a real finding or a real failure.
+- Brakeman is a GATE, not a third review lens. Never pass its files to
+  merge-reviews and never treat it as a review verdict.
+- RuboCop and Brakeman success are required independently of the Coder's report.
+- The review is TWO INDEPENDENT LENSES: correctness first, then security. NEVER
+  include, quote, summarize, or point at the correctness result in the security
+  task text, and never the other way round. A lens that is told what the other
+  found stops looking for what the other missed, which is the entire reason
+  there are two of them.
+- ALWAYS run BOTH lenses in every review round, even when the first returns
+  must_fix. The only exception is a helper failure so severe that the diff
+  cannot be reviewed at all; report that to PO instead of guessing.
+- After BOTH lenses finish, ALWAYS run merge-reviews. Your own decisions still
+  come from the two lens files.
 - NEVER commit, push, force-push, merge, rebase, or create a pull request unless
   PO explicitly asks for that Git operation. Editing files is allowed.
 - NEVER create additional git worktrees, including Claude Code default locations
@@ -1180,8 +1711,10 @@ identify relevant tests, and call out risks. Then run:
 
 Write an English request to $SQUAD_DIR/coder-task.txt. Include the approved plan
 and acceptance criteria. Require Coder to inspect project rules, implement the
-change, run relevant automated tests, and return the structured verification
-report. For broad or uncertain changes, require Coder to use built-in Explore
+change, run relevant automated tests, run RuboCop and Brakeman, and return the
+structured verification report. Its rubocop_status and brakeman_status fields
+are self-reports: the authoritative results are the helper runs you do yourself
+in the steps below. For broad or uncertain changes, require Coder to use Explore
 subagents to investigate independent areas in parallel before editing. Keep all
 file writes in the main Coder session, and skip subagents for narrow changes.
 Explicitly prohibit commit, push, force-push, merge, rebase, and pull-request
@@ -1201,22 +1734,118 @@ workspace or pane running and report the cleanup command instead. Then run:
   cat '$SQUAD_DIR/coder-status.txt'
   cat '$SQUAD_DIR/coder-result.json'
 
-### Ask Advisor to review
+### Run mandatory RuboCop verification
 
-Write an English request to $SQUAD_DIR/review-task.txt. Tell Advisor to inspect
-all uncommitted changes, verify behavior against the approved acceptance
-criteria, check the Coder's test report, and return must_fix findings. A pass
-verdict is allowed only when relevant tests actually ran. Then run:
+Always run this after Coder implementation and after each fix:
 
-  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-task.txt $SQUAD_DIR/review-result.json $SQUAD_DIR/review-status.txt $SQUAD_DIR/review-schema.json'
-  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/review-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor review'
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/rubocop-status.txt' coder '$SQUAD_DIR/run-rubocop $SQUAD_DIR/rubocop-command.txt $SQUAD_DIR/rubocop-result.txt $SQUAD_DIR/rubocop-status.txt'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/rubocop-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'RuboCop'
+  cat '$SQUAD_DIR/rubocop-status.txt'
+  cat '$SQUAD_DIR/rubocop-result.txt'
+
+RuboCop status must be 0. The helper autocorrects and then verifies the changed
+Rails/Ruby files. If there are no changed Rails/Ruby files, or the project is not
+a Ruby project, it records that and returns 0.
+
+### Run mandatory Brakeman verification
+
+Always run this after RuboCop and BEFORE the review lenses, and again after each
+fix:
+
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/brakeman-status.txt' coder '$SQUAD_DIR/run-brakeman $SQUAD_DIR/brakeman-command.txt $SQUAD_DIR/brakeman-result.txt $SQUAD_DIR/brakeman-status.txt'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/brakeman-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Brakeman'
+  cat '$SQUAD_DIR/brakeman-status.txt'
+  cat '$SQUAD_DIR/brakeman-result.txt'
+
+Brakeman status must be 0. The scan covers the WHOLE application and requires
+ZERO warnings; a project's curated config/brakeman.ignore is what carries any
+accepted pre-existing warnings. The helper returns 0 when the project is not a
+Ruby project, has no Brakeman installed, or contains no Rails application, so a
+non-zero status is always a real finding or a real failure. Never work around a
+failure by narrowing the scan; either fix the warning or ask PO about the ignore
+file.
+
+### The review checklist (used by BOTH review lenses)
+
+Before writing either review task, read the merged checklist:
+
+  cat '$SQUAD_DIR/checklist.merged.md'
+
+It is a list of LENSES to look through, not boxes to tick. Paste its contents
+into each review task file under a "Review checklist" heading, and tell Advisor
+to report only what it finds wrong - no coverage table, no "this lens was fine".
+review-schema.json findings are flat strings, so tell Advisor to put the
+checklist ID at the FRONT of the finding text, for example:
+
+  [SEC-001] Missing tenant boundary check in app/controllers/reports_controller.rb
+
+If the file says "(no checklist items)", this project has no checklist. Say so
+in the task text and let the review run unstructured; that is not an error and
+never a reason to skip a lens.
+
+### Ask Advisor for a CORRECTNESS review
+
+The first of two independent lenses. Write an English request to
+$SQUAD_DIR/review-correctness-task.txt. Tell Advisor to inspect all uncommitted
+changes against the approved acceptance criteria, the Coder's test report, and
+the mandatory RuboCop and Brakeman results, and to cover correctness, data
+integrity, tests, compatibility, performance, and the project's own conventions.
+Report findings only. A pass verdict is allowed only when relevant tests ran and
+both the RuboCop and Brakeman statuses are 0. Then run:
+
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-correctness-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-correctness-task.txt $SQUAD_DIR/review-correctness-result.json $SQUAD_DIR/review-correctness-status.txt $SQUAD_DIR/review-schema.json correctness'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/review-correctness-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor correctness review'
+  cat '$SQUAD_DIR/review-correctness-status.txt'
+  cat '$SQUAD_DIR/review-correctness-result.json'
+
+### Ask Advisor for a SECURITY review
+
+The second lens, and it runs even when the correctness lens returned must_fix.
+Write an English request to $SQUAD_DIR/review-security-task.txt. Tell Advisor to
+inspect the same uncommitted diff INDEPENDENTLY for authorization, tenant and
+user isolation, input validation, injection, information disclosure, secret
+handling, and filesystem, shell and database risks. Report findings only.
+
+Tell it to READ $SQUAD_DIR/brakeman-result.txt and, when present,
+$SQUAD_DIR/brakeman-result.json as evidence - a passing Brakeman scan is a
+starting point, not a conclusion, since Brakeman cannot see authorization or
+tenant-isolation logic.
+
+This task text must NOT mention, quote, summarize or point at the CORRECTNESS
+result in any way. Write it as if the correctness lens had never run. The
+Brakeman gate is shared evidence and is not a lens, so referencing it does not
+break the independence of the two lenses. Then run:
+
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-security-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-security-task.txt $SQUAD_DIR/review-security-result.json $SQUAD_DIR/review-security-status.txt $SQUAD_DIR/review-schema.json security'
+  '$SQUAD_DIR/run-wait' '$SQUAD_DIR/review-security-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor security review'
+  cat '$SQUAD_DIR/review-security-status.txt'
+  cat '$SQUAD_DIR/review-security-result.json'
+
+### Merge the two reviews (mandatory)
+
+Run this after BOTH lenses have finished, before you decide anything:
+
+  '$SQUAD_DIR/merge-reviews' '$SQUAD_DIR/review-correctness-result.json' '$SQUAD_DIR/review-correctness-status.txt' '$SQUAD_DIR/review-security-result.json' '$SQUAD_DIR/review-security-status.txt' '$SQUAD_DIR/review-result.json' '$SQUAD_DIR/review-status.txt'
   cat '$SQUAD_DIR/review-status.txt'
   cat '$SQUAD_DIR/review-result.json'
 
+Run it in YOUR OWN pane, not through send-to: it is a deterministic local merge,
+not agent work, so it needs no run-wait. It writes the aggregate a GUI reads:
+status 0 only when both lens statuses are 0, verdict must_fix when either lens
+says must_fix, findings unioned and tagged with the lens that raised them.
+
+If merge-reviews fails it says so loudly and writes a must_fix aggregate. That
+means a lens result is missing or malformed: re-run that lens, and report it to
+PO if it keeps failing. Never hand-write the aggregate files to work around it.
+
 ### Ask Coder to fix review findings
 
-Write an English request to $SQUAD_DIR/coder-task.txt. Include all must_fix
-findings and require updated tests. Reiterate that Coder must not create
+Write an English request to $SQUAD_DIR/coder-task.txt. Include the UNION of the
+must_fix findings from BOTH lens result files, saying which lens raised each
+one, plus any RuboCop or Brakeman failure, and require updated tests, RuboCop
+and Brakeman. When Brakeman failed, quote the offending warnings from
+$SQUAD_DIR/brakeman-result.txt and require a real fix - never a narrowed scan.
+Reiterate that Coder must not create
 additional git worktrees and must keep all work in $WORKDIR. Reiterate that
 Coder must not close, stop, delete, or hand off any herdr workspace, tab, pane,
 session, worktree, or server, and must not rename or release any agent,
@@ -1235,9 +1864,25 @@ Each runner enforces a JSON schema, so the result file is structured JSON:
 - $SQUAD_DIR/advisor-result.json follows plan-schema.json: summary, scope,
   acceptance_criteria, files_to_inspect, implementation_steps, tests, risks.
 - $SQUAD_DIR/coder-result.json follows coder-schema.json: summary,
-  changed_files, tests_run, tests_not_run, test_status, remaining_issues.
-- $SQUAD_DIR/review-result.json follows review-schema.json: verdict, summary,
-  must_fix, should_fix, test_gaps.
+  changed_files, tests_run, tests_not_run, test_status, rubocop_status,
+  brakeman_status, remaining_issues.
+- $SQUAD_DIR/review-correctness-result.json - correctness lens findings.
+- $SQUAD_DIR/review-security-result.json - security lens findings.
+  Both follow review-schema.json: verdict, summary, must_fix, should_fix,
+  test_gaps.
+- $SQUAD_DIR/review-result.json - the AGGREGATE of the two lenses, written by
+  merge-reviews, alongside $SQUAD_DIR/review-status.txt. It exists for any GUI
+  reading this run. Never write it by hand, and never base a decision on it
+  alone.
+- $SQUAD_DIR/rubocop-result.txt - RuboCop autocorrect and verification output.
+- $SQUAD_DIR/brakeman-result.txt and brakeman-result.json - the Brakeman gate
+  result. Both lenses may cite it; the SECURITY lens must read it. It is a GATE
+  result, not a review verdict, and never an input to merge-reviews.
+
+EITHER lens may return must_fix, and they see different things: a pass from the
+correctness lens says nothing about the security lens. When you ask Coder to
+fix, take the UNION of must_fix from BOTH lens result files, and say which lens
+raised each finding.
 
 The raw agent stream for each step is kept alongside as *.stream.jsonl, and the
 Coder's stderr as coder-result.stderr.log. Read those only when a step failed
@@ -1250,12 +1895,367 @@ and the result file is missing or unusable.
 3. Show the plan to PO in Japanese and ask for approval.
 4. Ask Coder to implement the approved plan.
 5. Read Coder status and structured verification report.
-6. Ask Advisor to review the uncommitted changes and verification evidence.
-7. If review verdict is must_fix, ask Coder to fix the issues.
-8. After every fix, repeat from step 5.
-9. Report completion to PO in Japanese. Include the squad worktree path, branch,
-   and test commands and results.
+6. Run the mandatory RuboCop helper and require status 0.
+7. Run the mandatory Brakeman helper and require status 0.
+8. Ask Advisor for the CORRECTNESS review of the uncommitted changes and the
+   verification evidence.
+9. Ask Advisor for the SECURITY review of the same diff, independently. This
+   runs even when the correctness lens returned must_fix.
+10. Run merge-reviews to write the aggregate files.
+11. If either lens status is non-zero, either lens verdict is must_fix, or
+   RuboCop or Brakeman failed, ask Coder to fix the issues. Pass the union of
+   the findings from both lenses.
+12. After every fix, repeat from step 5.
+13. Report completion to PO in Japanese. Include the squad worktree path, branch,
+   test commands and results, and the mandatory RuboCop and Brakeman results.
 PROMPT
+}
+
+# A resumed Manager is a fresh claude process, so it has no memory of the run.
+# The resume prompt is the whole Manager prompt plus what changed underneath it.
+generate_resume_prompt() {
+  cat "$SQUAD_DIR/manager-prompt.md" > "$SQUAD_DIR/manager-resume-prompt.md"
+  cat >> "$SQUAD_DIR/manager-resume-prompt.md" << PROMPT
+
+## MIGRATION: this squad was resumed (read this before any command)
+
+This run was resumed. Every herdr pane ID from before the resume is stale, and
+the agents may have been restarted underneath you.
+
+- Any literal herdr pane ID (such as w1:p2) that appears anywhere in earlier
+  context is DEAD. Never reuse one. Address agents by role only, through
+  '$SQUAD_DIR/squad-agent' and '$SQUAD_DIR/send-to'.
+- The helper scripts, the JSON schemas, the review checklist and this prompt
+  were all regenerated from the current squad-herdr, so they may differ from
+  what an earlier version of this run used. The commands in this file are the
+  authoritative ones.
+- The Coder pane is a fresh login shell, but the Coder's claude SESSION is
+  preserved: the fix command's trailing 'resume' argument continues the same
+  conversation, with session ID $CODER_SESSION_ID.
+- Read $SQUAD_DIR/coder-status.txt, $SQUAD_DIR/rubocop-status.txt,
+  $SQUAD_DIR/brakeman-status.txt and the two review lens status files to work
+  out where the run had got to before deciding what to do next. A status file
+  from before the resume describes the round that ran BEFORE the interruption.
+- Tell PO in Japanese that the squad was resumed, say which step it had reached,
+  and confirm the next step before running it.
+PROMPT
+}
+
+case "${1:-}" in
+  -h|--help|"")
+    usage 0
+    ;;
+  resume)
+    resume_run "${2:-}"
+    exit 0
+    ;;
+  clean|base)
+    # squad subcommands that squad-herdr does not implement yet. Without this
+    # arm they fall through to the new-run path below and get treated as a TASK
+    # DESCRIPTION, which silently creates a worktree and launches three agents.
+    # `squad` delegates every subcommand from inside a herdr pane, so `squad
+    # base` arriving here is a normal typo-level mistake, not an exotic one.
+    echo "Error: squad-herdr does not implement '$1' yet." >&2
+    echo "       Implemented: list, resume, close, rm, gen-helpers, and <task>." >&2
+    echo "       Refusing to treat '$1' as a task description." >&2
+    exit 2
+    ;;
+  gen-helpers)
+    [[ -n "${2:-}" ]] || {
+      echo "Error: squad-herdr gen-helpers requires a target directory" >&2
+      exit 1
+    }
+    # Writes the WHOLE generated surface - helpers, schemas, checklist and the
+    # Manager prompts - so all of it can be inspected or tested without
+    # starting a worktree, a workspace, a tab or a single agent. The placeholder
+    # values below only ever reach the generated text.
+    SQUAD_DIR="$2"
+    RUN_ID="${SQUAD_GEN_RUN_ID:-gen-helpers}"
+    MANAGER_AGENT="Manager-$RUN_ID"
+    CODER_AGENT="Coder-$RUN_ID"
+    ADVISOR_AGENT="Advisor-$RUN_ID"
+    REPO_ROOT="${SQUAD_GEN_REPO_ROOT:-$(pwd)}"
+    WORKDIR="${SQUAD_GEN_WORKDIR:-$REPO_ROOT}"
+    BRANCH="${SQUAD_GEN_BRANCH:-feat/squad-herdr-$RUN_ID}"
+    SQUAD_TITLE="${SQUAD_GEN_TITLE:-gen-helpers}"
+    TICKET_ID="${SQUAD_GEN_TICKET_ID:-}"
+    CODER_SESSION_ID="${SQUAD_GEN_CODER_SESSION_ID:-00000000-0000-0000-0000-000000000000}"
+    WAIT_TIMEOUT_SECONDS="${SQUAD_WAIT_TIMEOUT_SECONDS:-7200}"
+    WORKSPACE_ID="${SQUAD_GEN_WORKSPACE_ID:-}"
+    TAB_ID="${SQUAD_GEN_TAB_ID:-}"
+    set_worktree_mode
+    generate_schemas
+    generate_review_checklist
+    generate_helper_scripts
+    generate_manager_prompt
+    generate_resume_prompt
+    printf 'Generated helpers, schemas, checklist and prompts in %s\n' "$SQUAD_DIR"
+    exit 0
+    ;;
+  list)
+    list_runs
+    exit 0
+    ;;
+  close)
+    [[ -n "${2:-}" ]] || {
+      echo "Error: squad-herdr close requires a run-id" >&2
+      exit 1
+    }
+    close_run "$2"
+    exit 0
+    ;;
+  rm)
+    shift
+    [[ $# -gt 0 ]] || {
+      echo "Error: squad-herdr rm requires at least one run-id" >&2
+      exit 1
+    }
+    rm_status=0
+    for run_id in "$@"; do
+      remove_run "$run_id" || rm_status=1
+    done
+    exit "$rm_status"
+    ;;
+esac
+
+TASK="$*"
+if [[ "$TASK" =~ ([[:alnum:]_]+-[[:digit:]]+) ]]; then
+  TICKET_ID="${BASH_REMATCH[1]}"
+  SQUAD_TITLE="$TICKET_ID | チケット内容を確認中"
+else
+  TICKET_ID=""
+  SQUAD_TITLE="チケット内容を確認中"
+fi
+WAIT_TIMEOUT_SECONDS="${SQUAD_WAIT_TIMEOUT_SECONDS:-7200}"
+[[ "$WAIT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "Error: SQUAD_WAIT_TIMEOUT_SECONDS must be a positive integer." >&2
+  exit 1
+}
+
+for cmd in claude codex git herdr jq uuidgen; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Error: $cmd is not installed or not in PATH" >&2
+    exit 1
+  }
+done
+
+# Before the worktree, the workspace, the tab and the agents below.
+require_readable_checklist_config
+
+ORIGINAL_WORKDIR="$(pwd)"
+REPO_ROOT="$(git -C "$ORIGINAL_WORKDIR" rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Error: squad-herdr must be run inside a git repository" >&2
+  exit 1
+}
+
+HAS_COMMITS=true
+git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD >/dev/null || HAS_COMMITS=false
+
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
+STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+REPO_NAME="$(basename "$REPO_ROOT")"
+# Used by the docker-compose verification commands, same derivation as squad.
+COMPOSE_PROJECT_NAME_SAFE="$(
+  printf '%s' "$REPO_NAME" |
+    tr '[:upper:]' '[:lower:]' |
+    sed -E 's/[^a-z0-9_-]+/-/g; s/^-+//; s/-+$//'
+)"
+COMPOSE_PROJECT_NAME_SAFE="${COMPOSE_PROJECT_NAME_SAFE:-squad}"
+SQUAD_DIR="$SQUAD_RUN_ROOT/$RUN_ID"
+MANAGER_AGENT="Manager-$RUN_ID"
+CODER_AGENT="Coder-$RUN_ID"
+ADVISOR_AGENT="Advisor-$RUN_ID"
+# Fixed up front so the Coder can be resumed into the SAME conversation for every
+# round of fixes. `claude -p --session-id` creates it on the first run.
+CODER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+WORKTREE_CREATED=false
+
+if [[ "$HAS_COMMITS" == "true" ]]; then
+  WORKDIR="$SQUAD_WORKTREE_ROOT/$REPO_NAME-$RUN_ID"
+  if [[ -n "$TICKET_ID" ]]; then
+    BRANCH="feat/$TICKET_ID"
+    if branch_exists "$BRANCH"; then
+      BRANCH="feat/$TICKET_ID-$RUN_ID"
+    fi
+  else
+    BRANCH="feat/squad-herdr-$RUN_ID"
+  fi
+else
+  WORKDIR="$REPO_ROOT"
+  BRANCH="$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || echo main)"
+fi
+
+cleanup_failed_launch() {
+  [[ -f "$SQUAD_DIR/state.env" ]] && return 0
+  rm -rf "$SQUAD_DIR"
+  if [[ "$WORKTREE_CREATED" == "true" && -d "$WORKDIR" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$WORKDIR" >/dev/null 2>&1 || true
+    git -C "$REPO_ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_failed_launch EXIT
+
+mkdir -p "$SQUAD_DIR" "$SQUAD_WORKTREE_ROOT"
+
+if [[ "$HAS_COMMITS" == "true" && -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+  echo "Note: existing changes remain untouched in the original worktree:"
+  git -C "$REPO_ROOT" status --short
+  echo ""
+fi
+
+if [[ "$HAS_COMMITS" == "true" ]]; then
+  # Record the fork point BEFORE creating the worktree, exactly as squad does.
+  # `worktree add ... HEAD` branches from this commit, so it IS the base of every
+  # diff for this run, and resume needs it to stay stable.
+  SQUAD_BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify "HEAD^{commit}")"
+  SQUAD_BASE_REF="$(
+    git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null ||
+      git -C "$REPO_ROOT" describe --tags --exact-match HEAD 2>/dev/null ||
+      git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null ||
+      printf ''
+  )"
+  git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WORKDIR" HEAD
+  WORKTREE_CREATED=true
+  if [[ -f "$REPO_ROOT/.env" ]]; then
+    cp "$REPO_ROOT/.env" "$WORKDIR/.env"
+  fi
+else
+  # Unborn HEAD: there is no fork point that could exist yet, so both keys stay
+  # EMPTY rather than recording a fiction.
+  SQUAD_BASE_COMMIT=""
+  SQUAD_BASE_REF=""
+  echo "Note: this repository has no commits yet, so no isolated worktree is created."
+  echo "The squad-herdr agents work directly in: $WORKDIR"
+  echo ""
+fi
+
+set_worktree_mode
+
+# Verification command detection. Same shape and ordering as squad, including
+# the deliberate asymmetry: RuboCop hard-fails when a Ruby project has no
+# detectable command, Brakeman never does - a missing scanner skips, a scanner
+# that runs and finds something blocks.
+if [[ -n "${SQUAD_RUBOCOP_COMMAND:-}" ]]; then
+  RUBOCOP_COMMAND="$SQUAD_RUBOCOP_COMMAND"
+elif [[ ! -f "$REPO_ROOT/Gemfile" ]]; then
+  RUBOCOP_COMMAND=""
+elif [[ -f "$REPO_ROOT/compose.yml" ]] && command -v docker >/dev/null 2>&1; then
+  RUBOCOP_COMMAND="COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME_SAFE docker compose run --no-deps --rm --entrypoint '' app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
+elif [[ -f "$REPO_ROOT/compose.ci.yml" ]] && command -v docker >/dev/null 2>&1; then
+  RUBOCOP_COMMAND="COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME_SAFE docker compose -f compose.ci.yml run --no-deps --rm --entrypoint '' app bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
+elif command -v bundle >/dev/null 2>&1; then
+  RUBOCOP_COMMAND="bundle exec rubocop --force-exclusion --fail-level W --display-only-fail-level-offenses"
+else
+  echo "Error: no RuboCop command could be detected for this Ruby project." >&2
+  echo "Set SQUAD_RUBOCOP_COMMAND to the project-specific command." >&2
+  exit 1
+fi
+
+if [[ -n "${SQUAD_BRAKEMAN_COMMAND:-}" ]]; then
+  BRAKEMAN_COMMAND="$SQUAD_BRAKEMAN_COMMAND"
+elif [[ ! -f "$REPO_ROOT/Gemfile" ]]; then
+  BRAKEMAN_COMMAND=""
+elif [[ -f "$REPO_ROOT/compose.yml" ]] && command -v docker >/dev/null 2>&1; then
+  BRAKEMAN_COMMAND="COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME_SAFE docker compose run --no-deps --rm --entrypoint '' app bundle exec brakeman"
+elif [[ -f "$REPO_ROOT/compose.ci.yml" ]] && command -v docker >/dev/null 2>&1; then
+  BRAKEMAN_COMMAND="COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME_SAFE docker compose -f compose.ci.yml run --no-deps --rm --entrypoint '' app bundle exec brakeman"
+elif command -v bundle >/dev/null 2>&1 &&
+  (cd "$REPO_ROOT" && bundle exec brakeman --version >/dev/null 2>&1); then
+  BRAKEMAN_COMMAND="bundle exec brakeman"
+else
+  BRAKEMAN_COMMAND=""
+fi
+
+printf '%s\n' "$RUBOCOP_COMMAND" > "$SQUAD_DIR/rubocop-command.txt"
+printf '%s\n' "$BRAKEMAN_COMMAND" > "$SQUAD_DIR/brakeman-command.txt"
+
+cat > "$SQUAD_DIR/run-info.txt" << INFO
+Squad title:       $SQUAD_TITLE
+Ticket ID:         ${TICKET_ID:-not detected}
+Started at:        $STARTED_AT
+Original worktree: $REPO_ROOT
+Squad worktree:    $WORKDIR
+Worktree mode:     $WORKTREE_MODE
+Squad branch:      $BRANCH
+Artifacts:         $SQUAD_DIR
+Manager agent:     $MANAGER_AGENT
+Coder agent:       $CODER_AGENT
+Advisor agent:     $ADVISOR_AGENT
+Coder session:     $CODER_SESSION_ID
+RuboCop command:   ${RUBOCOP_COMMAND:-(none: not a Ruby project, RuboCop step is skipped)}
+Brakeman command:  ${BRAKEMAN_COMMAND:-(none: not a Ruby project or Brakeman not installed, Brakeman step is skipped)}
+Base commit:       ${SQUAD_BASE_COMMIT:-(none: repository has no commits)}
+Base ref:          ${SQUAD_BASE_REF:-(none)}
+Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
+INFO
+
+printf '%s\n' "$SQUAD_TITLE" > "$SQUAD_DIR/title.txt"
+
+cat > "$SQUAD_DIR/update-title" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+TITLE_FILE="$1"
+NEW_TITLE_FILE="$2"
+WORKSPACE_ID="$3"
+TAB_ID="$4"
+
+NEW_TITLE="$(
+  tr '\n\r\t' '   ' < "$NEW_TITLE_FILE" |
+    sed -E \
+      -e 's/^[[:space:]]+//' \
+      -e 's/[[:space:]]+$//' \
+      -e 's/[[:space:]]+/ /g' |
+    cut -c 1-90
+)"
+
+if [[ -z "$NEW_TITLE" ]]; then
+  echo "Error: squad title must not be empty" >&2
+  exit 1
+fi
+
+printf '%s\n' "$NEW_TITLE" > "$TITLE_FILE"
+herdr workspace rename "$WORKSPACE_ID" "$NEW_TITLE"
+herdr tab rename "$TAB_ID" "$NEW_TITLE"
+printf '[%s] Squad title updated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$NEW_TITLE"
+HELPER
+chmod +x "$SQUAD_DIR/update-title"
+
+generate_schemas
+
+cat "$SQUAD_DIR/run-info.txt"
+echo ""
+
+if [[ "$HAS_COMMITS" == "true" ]]; then
+  herdr worktree open --cwd "$REPO_ROOT" --path "$WORKDIR" --label "$SQUAD_TITLE" --focus --json >/dev/null
+  WORKSPACE_ID="$(find_workspace_for_workdir "$WORKDIR")"
+else
+  herdr workspace create --cwd "$WORKDIR" --label "$SQUAD_TITLE" --focus >/dev/null
+  WORKSPACE_ID="$(
+    herdr api snapshot |
+      jq -r --arg label "$SQUAD_TITLE" '
+        .result.snapshot.workspaces[]?
+        | select(.label == $label)
+        | .workspace_id
+      ' |
+      tail -n 1
+  )"
+fi
+
+[[ -n "${WORKSPACE_ID:-}" ]] || {
+  echo "Error: failed to determine Herdr workspace ID" >&2
+  exit 1
+}
+TAB_ID="$(active_tab_for_workspace "$WORKSPACE_ID")"
+[[ -n "${TAB_ID:-}" ]] || {
+  echo "Error: failed to determine Herdr active tab ID" >&2
+  exit 1
+}
+
+# Must precede the Manager prompt: the prompt hard-codes these helper paths.
+generate_review_checklist
+generate_helper_scripts
+generate_manager_prompt
+
 
 RUN_STATUS="running"
 write_state
