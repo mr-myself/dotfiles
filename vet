@@ -765,6 +765,52 @@ window_exists() {
     awk -v target="$target_window_id" '$0 == target { found = 1 } END { exit !found }'
 }
 
+pane_exists() {
+  local target_pane_id="${1:-}"
+  [[ -n "$target_pane_id" ]] || return 1
+  tmux list-panes -a -F '#{pane_id}' 2>/dev/null |
+    awk -v target="$target_pane_id" '$0 == target { found = 1 } END { exit !found }'
+}
+
+# True when a pane's foreground process is a plain shell, i.e. nothing is
+# running in it.
+#
+# This is the anti-race guard for reviewer-pane cleanup. Reviewers are NOT
+# children of the Manager: run-step starts them with `tmux send-keys` into
+# their own panes, so quitting the Manager does not stop a reviewer that is
+# still working. Completion is the status file and never the tmux event (see
+# run-wait), but the status file cannot help here: it is ABSENT both while a
+# cycle runs and before it ever ran, so it cannot tell "busy" from "never
+# started". The pane's own foreground command can.
+pane_is_idle() {
+  local target_pane_id="${1:-}" current
+  [[ -n "$target_pane_id" ]] || return 1
+  current="$(tmux display-message -p -t "$target_pane_id" '#{pane_current_command}' 2>/dev/null)" || return 1
+  # pane_current_command is a basename; tolerate a path or a login-shell dash.
+  current="${current##*/}"
+  current="${current#-}"
+  case "$current" in
+    sh|bash|zsh|fish|dash|ksh|csh|tcsh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Is this run still going?
+#
+# A live window alone is NOT enough. On the normal path vet does not create a
+# window: it adopts the pane it was started in as the Manager pane and splits
+# that (see the launch block), so WINDOW_ID is the PO's OWN working window and
+# long outlives the review. Once a run has been marked closed, that window says
+# nothing about it, and treating it as "running" would make the run
+# un-resumable and un-removable forever.
+#
+# The reverse inference is kept: a run still recorded as `running` whose window
+# is gone crashed or was closed from elsewhere, and reads as closed.
+run_is_live() {
+  [[ "${RUN_STATUS:-}" != "closed" ]] || return 1
+  window_exists "${WINDOW_ID:-}"
+}
+
 list_runs() {
   local state_file title status
   printf '%-24s  %-9s  %-10s  %s\n' "RUN ID" "STATUS" "PR" "TITLE"
@@ -776,13 +822,52 @@ list_runs() {
       source "$state_file"
       title="$(cat "$VET_DIR/title.txt" 2>/dev/null || printf '%s' "${PR_TITLE:-unknown}")"
       status="${RUN_STATUS:-unknown}"
-      if window_exists "${WINDOW_ID:-}"; then
+      # A stored `closed` wins over a live window: a run that auto-closed on
+      # completion leaves WINDOW_ID pointing at the PO's own still-open window.
+      if [[ "$status" != "closed" ]] && window_exists "${WINDOW_ID:-}"; then
         status="running"
       elif [[ "$status" == "running" ]]; then
         status="closed"
       fi
       printf '%-24s  %-9s  %-10s  %s\n' "$RUN_ID" "$status" "#${PR_NUMBER:-?}" "$title"
     done
+}
+
+# Mark a finished run closed and tidy up after it.
+#
+# Called ONLY from the success path of a real run: a consolidated JSON that
+# passed schema validation AND a report.html that is current for it. A run with
+# no consolidated JSON, a validation failure, or a failed render is left
+# `running` so `vet resume <run-id>` still picks it up.
+#
+# It deliberately does NOT reuse close_run. close_run ends in
+# `tmux kill-window "$WINDOW_ID"`, and on the normal path WINDOW_ID is the
+# window the PO is sitting in - killing it would destroy their shell at the end
+# of every review. Only the two reviewer panes are removed, and only when they
+# are not the Manager pane and are idle.
+finish_run() {
+  # Belt and braces: never record `closed` unless the report really is on disk
+  # and current for the consolidated JSON behind it.
+  report_is_current "${REPORT_PATH:-}" "${CONSOLIDATED_PATH:-}" || return 0
+
+  RUN_STATUS="closed"
+  write_state
+
+  local pane
+  for pane in "${REVIEWER_A_PANE:-}" "${REVIEWER_B_PANE:-}"; do
+    [[ -n "$pane" ]] || continue
+    # Never touch the Manager pane: on the normal path it is the PO's own pane.
+    [[ "$pane" != "${MANAGER_PANE:-}" ]] || continue
+    pane_exists "$pane" || continue
+    # A reviewer still working keeps its own command in its pane; leave it be
+    # rather than killing it mid-write.
+    pane_is_idle "$pane" || continue
+    tmux kill-pane -t "$pane" 2>/dev/null || true
+  done
+
+  echo ""
+  printf 'vet run closed: %s\n' "$RUN_ID"
+  printf 'Resume with: vet resume %s\n' "$RUN_ID"
 }
 
 close_run() {
@@ -806,7 +891,7 @@ remove_run() {
   unset RUN_ID RUN_STATUS VET_DIR WINDOW_ID WORKDIR REPO_ROOT
   # shellcheck source=/dev/null
   source "$state_file"
-  if window_exists "${WINDOW_ID:-}"; then
+  if run_is_live; then
     echo "Skip $RUN_ID: still running. Close it first: vet close $RUN_ID" >&2
     return 1
   fi
@@ -828,7 +913,7 @@ clean_runs() {
     unset RUN_ID RUN_STATUS WINDOW_ID
     # shellcheck source=/dev/null
     source "$state_file"
-    window_exists "${WINDOW_ID:-}" || removable+=("$state_file")
+    run_is_live || removable+=("$state_file")
   done < <(
     find "$VET_RUN_ROOT" -mindepth 2 -maxdepth 2 -name state.env -type f 2>/dev/null | sort
   )
@@ -883,7 +968,7 @@ resume_run() {
     exit 1
   }
 
-  if window_exists "${WINDOW_ID:-}"; then
+  if run_is_live; then
     echo "Error: vet is already running in window $WINDOW_ID" >&2
     exit 1
   fi
@@ -3271,6 +3356,9 @@ if [[ -f "$CONSOLIDATED_PATH" ]]; then
     if [[ "$OPEN_REPORT" == "true" ]] && command -v open >/dev/null 2>&1; then
       open "$REPORT_PATH"
     fi
+    # The Manager rendering the report itself is the NORMAL success path, not a
+    # shortcut - so this branch closes the run just like the render below.
+    finish_run
     exit "$MANAGER_STATUS"
   fi
   render_report_html "$CONSOLIDATED_PATH" "$REPORT_PATH"
@@ -3291,6 +3379,7 @@ if [[ -f "$CONSOLIDATED_PATH" ]]; then
       echo "Note: --open needs the macOS 'open' command, which is not available."
     fi
   fi
+  finish_run
 else
   echo ""
   echo "The Manager wrote no consolidated JSON at: $CONSOLIDATED_PATH"
