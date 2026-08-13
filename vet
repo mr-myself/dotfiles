@@ -464,6 +464,12 @@ write_state() {
     printf 'PR_IS_DRAFT=%q\n' "${PR_IS_DRAFT:-false}"
     printf 'REPO_SPEC=%q\n' "${REPO_SPEC:-}"
     printf 'BASE_REF=%q\n' "${BASE_REF:-}"
+    # The base branch OID at launch and again after the Manager exits. BOTH ARE
+    # OPTIONAL: they are empty when the base could not be resolved, and absent
+    # entirely from any run directory written before vet recorded them, so every
+    # reader must use ${BASE_START_OID:-} rather than a bare expansion.
+    printf 'BASE_START_OID=%q\n' "${BASE_START_OID:-}"
+    printf 'BASE_END_OID=%q\n' "${BASE_END_OID:-}"
     printf 'HEAD_REF=%q\n' "${HEAD_REF:-}"
     printf 'HEAD_OID=%q\n' "${HEAD_OID:-}"
     printf 'IS_CROSS_REPOSITORY=%q\n' "${IS_CROSS_REPOSITORY:-false}"
@@ -539,6 +545,8 @@ REVIEWER_A_SESSION_ID=$(printf '%q' "${REVIEWER_A_SESSION_ID:-}")
 WORKDIR=$(printf '%q' "$WORKDIR")
 WINDOW_SHORT_NAME=$(printf '%q' "${WINDOW_SHORT_NAME:-vet}")
 WAIT_TIMEOUT_SECONDS=$(printf '%q' "${WAIT_TIMEOUT_SECONDS:-7200}")
+# Not the event itself any more: the PREFIX each launch extends, and the
+# fallback a wait uses when no launch has recorded one (see mint_event).
 EVENT_A=$(printf '%q' "vet-$RUN_ID-reviewer-a")
 EVENT_B=$(printf '%q' "vet-$RUN_ID-reviewer-b")
 VET_BIN=$(printf '%q' "$VET_SCRIPT_PATH")
@@ -589,17 +597,98 @@ clear_status() {
   rm -f "\$1"
 }
 
+# ONE LAUNCH, ONE WAIT CHANNEL.
+#
+# The event name used to be static per run and reviewer, so every RETRY reused
+# the channel the previous launch had already signalled. A tmux signal on a
+# channel with no waiter LATCHES, so the retry's wait returned instantly on the
+# PREVIOUS cycle's signal. run-wait survives that - it treats the status file as
+# authoritative, discards the stale latch and re-arms - but the cleanest fix is
+# to stop reusing the channel at all. Each launch mints its own name and records
+# it for the matching wait; the discard logic stays as defence in depth.
+#
+# The name is written to a file rather than baked in, because the launch and the
+# wait are two separate run-step processes and this file is the only thing they
+# share. Only [0-9a-zA-Z-] gets appended, so the result is still safe to
+# interpolate into the send-keys command line below.
+mint_event() {
+  local base="\$1" file="\$2" event
+  event="\$base-\$(date +%s)-\$\$-\$RANDOM"
+  printf '%s\n' "\$event" > "\$file"
+  printf '%s' "\$event"
+}
+
+# The event the last launch recorded. Falls back to the old static name for a
+# run created before per-launch events existed, or one recovered by hand: those
+# behave exactly as they did before.
+event_for() {
+  local file="\$1" fallback="\$2" event=""
+  if [[ -r "\$file" ]]; then
+    IFS= read -r event < "\$file" || true
+  fi
+  printf '%s' "\${event:-\$fallback}"
+}
+
+# Build a send-keys payload that the DESTINATION shell parses back into exactly
+# the arguments given here, one argv element each.
+#
+# send-keys does not take an argv. It types ONE STRING into the pane, and the
+# pane's own shell re-parses it - so every value has to cross that boundary
+# intact. A run directory under "~/Library/Application Support/..." would
+# otherwise split into two arguments, and a path containing \$( ) would be
+# executed by the receiving shell rather than passed along.
+#
+# THE ESCAPING BELONGS HERE, AT RUN TIME, NOT AT GENERATION TIME. These values
+# are ordinary shell values in this script - some baked by vet, some computed a
+# few lines up (the event, the mode, the session id) - and what needs protecting
+# is the one hop into the pane. Escaping them when run-step was written would
+# double-escape the baked ones and could not reach the computed ones at all: the
+# pane would show visibly backslashed text that does not run.
+#
+# printf %q leaves a string with no metacharacters completely untouched, so for
+# an ordinary path the payload is byte-for-byte what it has always been, and what
+# the PO sees echoed in the pane stays readable.
+send_keys_payload() {
+  local out="" arg
+  for arg in "\$@"; do
+    [[ -z "\$out" ]] || out="\$out "
+    out="\$out\$(printf '%q' "\$arg")"
+  done
+  printf '%s' "\$out"
+}
+
 send_reviewer_a() {
+  local event payload
   clear_status "\$RUN_DIR/reviewer-a-status.txt"
-  tmux send-keys -t "\$REVIEWER_A_PANE" \\
-    "\$RUN_DIR/run-reviewer-a \$RUN_DIR/reviewer-a-task.md \$RUN_DIR/reviewer-a-result.json \$RUN_DIR/reviewer-a-status.txt \$EVENT_A \$REVIEWER_A_SESSION_ID \$RUN_DIR/reviewer-schema.json \$1 \$RUN_DIR" Enter
+  event="\$(mint_event "\$EVENT_A" "\$RUN_DIR/reviewer-a-event.txt")"
+  payload="\$(send_keys_payload \\
+    "\$RUN_DIR/run-reviewer-a" \\
+    "\$RUN_DIR/reviewer-a-task.md" \\
+    "\$RUN_DIR/reviewer-a-result.json" \\
+    "\$RUN_DIR/reviewer-a-status.txt" \\
+    "\$event" \\
+    "\$REVIEWER_A_SESSION_ID" \\
+    "\$RUN_DIR/reviewer-schema.json" \\
+    "\$1" \\
+    "\$RUN_DIR")"
+  tmux send-keys -t "\$REVIEWER_A_PANE" "\$payload" Enter
   printf 'run-step: Reviewer A started (%s session).\n' "\$1"
 }
 
 send_reviewer_b() {
+  local event payload
   clear_status "\$RUN_DIR/reviewer-b-status.txt"
-  tmux send-keys -t "\$REVIEWER_B_PANE" \\
-    "\$RUN_DIR/run-reviewer-b \$RUN_DIR/reviewer-b-task.md \$RUN_DIR/reviewer-b-result.json \$RUN_DIR/reviewer-b-status.txt \$EVENT_B \$RUN_DIR/reviewer-schema.json \$WORKDIR \$RUN_DIR" Enter
+  event="\$(mint_event "\$EVENT_B" "\$RUN_DIR/reviewer-b-event.txt")"
+  payload="\$(send_keys_payload \\
+    "\$RUN_DIR/run-reviewer-b" \\
+    "\$RUN_DIR/reviewer-b-task.md" \\
+    "\$RUN_DIR/reviewer-b-result.json" \\
+    "\$RUN_DIR/reviewer-b-status.txt" \\
+    "\$event" \\
+    "\$RUN_DIR/reviewer-schema.json" \\
+    "\$WORKDIR" \\
+    "\$RUN_DIR")"
+  tmux send-keys -t "\$REVIEWER_B_PANE" "\$payload" Enter
   printf 'run-step: Reviewer B started.\n'
 }
 
@@ -608,11 +697,15 @@ case "\$1" in
   reviewer-a-resume) send_reviewer_a resume ;;
   reviewer-b)        send_reviewer_b ;;
   wait-a)
-    exec "\$RUN_DIR/run-wait" "\$EVENT_A" "\$RUN_DIR/reviewer-a-status.txt" \\
+    exec "\$RUN_DIR/run-wait" \\
+      "\$(event_for "\$RUN_DIR/reviewer-a-event.txt" "\$EVENT_A")" \\
+      "\$RUN_DIR/reviewer-a-status.txt" \\
       "\$REVIEWER_A_PANE" "\$WAIT_TIMEOUT_SECONDS" 'Reviewer A'
     ;;
   wait-b)
-    exec "\$RUN_DIR/run-wait" "\$EVENT_B" "\$RUN_DIR/reviewer-b-status.txt" \\
+    exec "\$RUN_DIR/run-wait" \\
+      "\$(event_for "\$RUN_DIR/reviewer-b-event.txt" "\$EVENT_B")" \\
+      "\$RUN_DIR/reviewer-b-status.txt" \\
       "\$REVIEWER_B_PANE" "\$WAIT_TIMEOUT_SECONDS" 'Reviewer B'
     ;;
   title)
@@ -833,6 +926,286 @@ list_runs() {
     done
 }
 
+# --- Did the base branch move under us? ---------------------------------------
+#
+# vet reviews a PR head against a base it never pins. If the base gains commits
+# while the review is running - a dependency bump, a refactor, or another PR
+# solving the very same issue - every finding was still computed against the old
+# base, and nobody learns otherwise until a conflict shows up days later.
+#
+# So: record the base OID at launch, read it again at the end, and say so when it
+# changed. Both halves are BEST EFFORT. A review is read-only and must still run
+# with no network, so a base we cannot resolve is a warning and never a failure.
+
+# Where vet parks its own copy of the base branch: private, per run, per reading.
+#
+# EXPLICITLY NOT refs/remotes/*. Two independent reasons, either one sufficient:
+#
+#   1. A review is READ-ONLY. vet never checks out, stashes or cleans the PO's
+#      worktree, and it must not quietly advance their origin/main either.
+#      Fetching the base into the PO's remote-tracking branch would make merely
+#      reviewing a PR mutate the repository they work in.
+#   2. A pre-existing refs/remotes/<remote>/<base> makes a FAILED fetch look
+#      like a successful one. Offline, the fetch fails, rev-parse cheerfully
+#      resolves the stale ref, and BASE_START_OID records whenever that ref was
+#      last updated. A later successful fetch then reports a move that happened
+#      BEFORE the review ever started - the exact false alarm this whole feature
+#      exists to prevent.
+#
+# Nothing pre-existing can be resolved out of this namespace, and the ref is
+# deleted before every fetch, so "the fetch failed" and "the ref does not
+# resolve" are one observable state: empty.
+base_tracking_ref() {
+  printf 'refs/vet/%s/%s' "$1" "$2"
+}
+
+# The base branch as the remote has it right now. Empty means "could not tell",
+# which is a normal answer here and never an error.
+base_ref_oid() {
+  local repo_root="$1" remote="$2" base_ref="$3" tracking_ref="$4"
+  [[ -n "$repo_root" && -n "$remote" && -n "$base_ref" && -n "$tracking_ref" ]] || return 0
+
+  # $base_ref comes from `gh pr view`, so it is chosen by whoever opened the PR
+  # and is interpolated into a refspec. Validate it before it reaches git:
+  # ':' or '*' would rewrite the refspec into a different one, and a leading '-'
+  # could be read as an option. check-ref-format catches the first class but
+  # MEASURABLY ACCEPTS a leading dash (`check-ref-format refs/heads/-x` exits 0),
+  # so that one is rejected explicitly rather than assumed.
+  case "$base_ref" in -*) return 0 ;; esac
+  git -C "$repo_root" check-ref-format "refs/heads/$base_ref" 2>/dev/null || return 0
+
+  # Start from nothing, so a fetch that fails cannot leave an earlier reading
+  # behind to be mistaken for a fresh one.
+  git -C "$repo_root" update-ref -d "$tracking_ref" 2>/dev/null || true
+  # --refmap= AND --no-tags ARE BOTH LOAD-BEARING. An explicit refspec alone is
+  # NOT enough to keep out of the PO's refs: git ALSO performs an opportunistic
+  # update of the remote-tracking branch from the configured remote.<n>.fetch
+  # refspec, and by default fetches tags pointing into the fetched history.
+  # Measured on git 2.54.0: with the explicit refspec alone, fetching a base
+  # that had moved advanced the PO's refs/remotes/origin/master to the new
+  # commit; with `--refmap=` it stayed put while our own ref still updated.
+  # Empty --refmap= means "use only the refspecs given on the command line".
+  git -C "$repo_root" fetch --no-tags --refmap= --quiet "$remote" \
+    "+refs/heads/$base_ref:$tracking_ref" 2>/dev/null || return 0
+  # --verify --quiet is load-bearing: a plain `rev-parse <ref>` ECHOES ITS
+  # ARGUMENT on stdout when the ref does not resolve, so the caller would get
+  # the ref name back and treat that string as an OID.
+  git -C "$repo_root" rev-parse --verify --quiet \
+    "$tracking_ref^{commit}" 2>/dev/null || true
+}
+
+# Drop the private refs a run created.
+#
+# Lifecycle: they are born at launch and die with the run directory, in
+# remove_run (`vet rm` / `vet clean`) and in the failed-launch trap. They
+# deliberately outlive the review itself, because they are what keeps the base
+# commits reachable so a resumed run can still list what landed on the base.
+#
+# Leaving one behind is inert and cannot break anything: it is not a branch and
+# not a remote-tracking ref, so no git workflow consults it, and run ids are
+# unique so no later run collides with it. The only cost is that it pins a few
+# objects from garbage collection, which is exactly why it is cleaned up here.
+clear_base_tracking_refs() {
+  local repo_root="$1" run_id="$2" slot
+  [[ -n "$repo_root" && -n "$run_id" && -d "$repo_root" ]] || return 0
+  for slot in base-start base-end; do
+    git -C "$repo_root" update-ref -d "$(base_tracking_ref "$run_id" "$slot")" \
+      2>/dev/null || true
+  done
+  return 0
+}
+
+# Compare the two OIDs and, if they differ, write base-movement.txt and warn.
+# RUN_STATUS IS DELIBERATELY NOT TOUCHED: a moved base is something the PO needs
+# to know, not a different kind of run. Returns 0 either way so a `set -e` caller
+# cannot be killed by a warning.
+report_base_movement() {
+  local repo_root="$1" remote="$2" base_ref="$3"
+  local start_oid="$4" end_oid="$5" out_file="$6"
+
+  # THE VERDICT OF THIS COMPARISON, for the caller to act on. It is published
+  # here rather than inferred from whether $out_file exists, because that file
+  # survives from earlier checks: its presence says "some check once saw
+  # movement", which is a different question from "did THIS check see movement".
+  BASE_MOVEMENT_VERDICT="unknown"
+
+  # An UNKNOWN base is not a MOVED base, so this never warns about movement -
+  # but it does not stay quiet either. Silently reporting nothing would read
+  # exactly like "the base held still", and the PO would draw a conclusion vet
+  # never actually reached.
+  if [[ -z "$start_oid" || -z "$end_oid" ]]; then
+    echo ""
+    echo "Note: vet could not compare the base branch $remote/$base_ref."
+    if [[ -z "$start_oid" ]]; then
+      echo "      Its state at launch was never recorded."
+    else
+      echo "      It could not be read now (offline, or the branch is gone)."
+    fi
+    echo "      A base that moved during this review would NOT have been noticed."
+    return 0
+  fi
+  if [[ "$start_oid" == "$end_oid" ]]; then
+    BASE_MOVEMENT_VERDICT="unchanged"
+    return 0
+  fi
+  BASE_MOVEMENT_VERDICT="moved"
+
+  {
+    printf 'The base branch moved while this review was running.\n'
+    printf '\n'
+    printf 'Base ref:  %s/%s\n' "$remote" "$base_ref"
+    printf 'At launch: %s\n' "$start_oid"
+    printf 'At finish: %s\n' "$end_oid"
+    printf '\n'
+    printf 'Commits added to the base since this review started:\n'
+    # The two OIDs, not a ref name: both objects are local (each was just
+    # fetched into vet's own namespace), and naming them directly keeps this
+    # range honest even if the branch moves again while the file is written.
+    git -C "$repo_root" log --oneline "$start_oid..$end_oid" 2>/dev/null || true
+  } > "$out_file"
+
+  echo ""
+  echo "WARNING: the base branch $remote/$base_ref moved during this review."
+  echo "         Every finding was computed against $start_oid."
+  echo "         What landed on the base meanwhile:"
+  printf '           %s\n' "$out_file"
+  return 0
+}
+
+# The whole post-Manager base check, in ONE place.
+#
+# Both the launch path and a resumed Manager run this, so "re-check after the
+# Manager exits" means the same thing either way. Expects the run's variables to
+# be in scope (either from the launch itself or from load_run).
+# Exactly a git object id, as `git rev-parse --verify` emits them: 40 lowercase
+# hex digits for SHA-1, 64 for SHA-256. Nothing else - not an abbreviation, not a
+# ref name, not a commit subject that happens to look hex-ish.
+is_oid() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ || "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# Put run-info.txt's single `Base moved:` line into the state the caller decided:
+# exactly the line given, or NO such line at all when the line is empty. Every
+# other line keeps its content and its position.
+#
+# The file ends up with exactly one `Base moved:` line or none - never two. That
+# holds even if it somehow arrives with duplicates already in it, because only
+# the first match is replaced and the rest are dropped.
+set_run_info_moved_line() {
+  local info="$1" line="$2" tmp=""
+  [[ -n "$info" ]] || return 0
+
+  # Nothing to rewrite: either the file is not there yet or it has no such line.
+  if [[ ! -f "$info" ]] || ! grep -q '^Base moved:' "$info" 2>/dev/null; then
+    if [[ -n "$line" ]]; then
+      printf '%s\n' "$line" >> "$info" 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  # A UNIQUE temp name per invocation, in the run directory.
+  #
+  # A fixed `run-info.tmp` was shared by every concurrent writer of this run -
+  # the launch path, a resumed Manager, and a hand-run `vet check-base` - so two
+  # overlapping rewrites could interleave in the same file and the newer
+  # `Base moved:` line could be lost. Same directory keeps the rename atomic.
+  # `sed -i` is deliberately avoided: its in-place syntax differs between GNU and
+  # BSD sed, and this runs on macOS.
+  tmp="$(mktemp "$info.XXXXXX" 2>/dev/null)" || return 0
+  # Passed through the environment, not `awk -v`, which would interpret
+  # backslash escapes in the value.
+  VET_BASE_MOVED_LINE="$line"
+  export VET_BASE_MOVED_LINE
+  if awk '/^Base moved:/ { if (!seen++ && length(ENVIRON["VET_BASE_MOVED_LINE"])) print ENVIRON["VET_BASE_MOVED_LINE"]
+                           next }
+          { print }' "$info" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$info" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    # Never leave a half-written temp file behind on failure.
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  unset VET_BASE_MOVED_LINE
+  return 0
+}
+
+# The whole post-Manager base check, in ONE place.
+#
+# Both the launch path and a resumed Manager run this, so "re-check after the
+# Manager exits" means the same thing either way. Expects the run's variables to
+# be in scope (either from the launch itself or from load_run).
+check_base_after_manager() {
+  local moved_line="" hist_start="" hist_end=""
+
+  BASE_END_OID="$(base_ref_oid "$REPO_ROOT" "${GIT_REMOTE:-}" "${BASE_REF:-}" \
+    "$(base_tracking_ref "$RUN_ID" base-end)")"
+  report_base_movement "$REPO_ROOT" "${GIT_REMOTE:-}" "${BASE_REF:-}" \
+    "${BASE_START_OID:-}" "$BASE_END_OID" "$VET_DIR/base-movement.txt"
+
+  # WHAT GOES IN run-info.txt IS DECIDED BY THIS CHECK'S VERDICT.
+  #
+  # Not by whether base-movement.txt exists: that file outlives the check that
+  # wrote it, so keying off it meant a later check that was INCONCLUSIVE (the
+  # fetch failed, the branch is gone) or that saw NO movement (the base was reset
+  # back) still wrote a line - `<start> -> ` with an empty end, or
+  # `<start> -> <start>`. Both contradict report_base_movement's own verdict, and
+  # cockpit renders this file verbatim, so the PO was shown a warning vet had not
+  # actually concluded.
+  case "${BASE_MOVEMENT_VERDICT:-unknown}" in
+    moved)
+      moved_line="$(printf 'Base moved:        %s -> %s (see base-movement.txt)' \
+        "${BASE_START_OID:-}" "$BASE_END_OID")"
+      ;;
+    *)
+      # Not moved, or could not tell. A movement an EARLIER check really did
+      # observe is history and is KEPT - the review's findings genuinely were
+      # computed against a base that moved, and that stays true even if the
+      # remote is unreachable now or the base has since been reset back. Erasing
+      # it would lose a real signal. But it must not read as the CURRENT state,
+      # so it is marked superseded and keeps pointing at the artifact it came
+      # from, which is where the detail lives.
+      #
+      # The OIDs come from base-movement.txt rather than from state.env, because
+      # that file is the durable record: it is only ever rewritten when movement
+      # IS detected, whereas BASE_END_OID is overwritten by every check and would
+      # be empty after this one, so the history would decay away on the next
+      # inconclusive re-check.
+      #
+      # The `-f` guard and the `|| true` are both needed: vet runs under
+      # `set -o pipefail`, so a sed against a file that is not there fails the
+      # whole pipeline and `set -e` would take the run down at its very last step.
+      if [[ -f "$VET_DIR/base-movement.txt" ]]; then
+        hist_start="$(sed -n 's/^At launch: //p' "$VET_DIR/base-movement.txt" 2>/dev/null | head -n 1 || true)"
+        hist_end="$(sed -n 's/^At finish: //p' "$VET_DIR/base-movement.txt" 2>/dev/null | head -n 1 || true)"
+      fi
+      # PARSED TEXT IS NOT TRUSTED, IT IS VALIDATED.
+      #
+      # base-movement.txt is written by vet, but it is user-visible, editable, and
+      # read back on a later run - and cockpit renders run-info.txt verbatim, so
+      # anything copied out of a truncated or hand-edited artifact lands on the
+      # PO's screen as if vet had concluded it. "Non-empty and different" is not
+      # enough: `At launch: garbage` would satisfy it. Only a real object id gets
+      # through.
+      if is_oid "$hist_start" && is_oid "$hist_end" && [[ "$hist_start" != "$hist_end" ]]; then
+        moved_line="$(printf 'Base moved:        %s -> %s (see base-movement.txt; superseded by a later check)' \
+          "$hist_start" "$hist_end")"
+      elif [[ -f "$VET_DIR/base-movement.txt" ]]; then
+        # NO LINE AT ALL is the honest outcome. A "could not be read" line would
+        # still be a `Base moved:` line - which is exactly what cockpit and the PO
+        # read as a movement record - and saying so in the OID slots would break
+        # the line format cockpit renders. Silence in run-info.txt plus a note
+        # here says only what vet actually knows, and the artifact is untouched.
+        echo ""
+        echo "Note: $VET_DIR/base-movement.txt does not parse as a movement record."
+        echo "      No movement line was written to run-info.txt; read that file directly."
+      fi
+      ;;
+  esac
+
+  set_run_info_moved_line "$VET_DIR/run-info.txt" "$moved_line"
+  # Persist the new field. RUN_STATUS is untouched: a moved base is a warning.
+  write_state
+}
+
 # Mark a finished run closed and tidy up after it.
 #
 # Called ONLY from the success path of a real run: a consolidated JSON that
@@ -902,6 +1275,10 @@ remove_run() {
     else
       rm -rf "$WORKDIR"
     fi
+  fi
+  # The private base refs live exactly as long as the run does.
+  if [[ -n "${REPO_ROOT:-}" && -d "${REPO_ROOT:-}" ]]; then
+    clear_base_tracking_refs "$REPO_ROOT" "$RUN_ID"
   fi
   rm -rf "$VET_DIR"
   printf 'vet run removed: %s\n' "$RUN_ID"
@@ -1019,7 +1396,17 @@ resume_run() {
   tmux set-option -w -t "$WINDOW_ID" pane-border-format " #{pane_title} "
   tmux set-option -w -t "$WINDOW_ID" @vet_run_id "$RUN_ID"
   tmux set-option -w -t "$WINDOW_ID" @vet_state_file "$STATE_FILE"
-  tmux send-keys -t "$MANAGER_PANE" "$VET_DIR/run-manager-resume '$WORKDIR' '$VET_DIR/manager-resume-prompt.md' '$MANAGER_SESSION_ID'" Enter
+  # Same boundary as run-step's reviewer launches: send-keys types ONE STRING
+  # that the Manager pane's shell re-parses, so every value is escaped for that
+  # shell. The single quotes this replaces covered a space in the three
+  # arguments but left the command word itself bare, and any value containing a
+  # single quote would have closed them and run the rest as commands.
+  resume_payload="$(printf '%q %q %q %q' \
+    "$VET_DIR/run-manager-resume" \
+    "$WORKDIR" \
+    "$VET_DIR/manager-resume-prompt.md" \
+    "$MANAGER_SESSION_ID")"
+  tmux send-keys -t "$MANAGER_PANE" "$resume_payload" Enter
   tmux select-window -t "$WINDOW_ID"
   printf 'vet run resumed: %s\n' "$RUN_ID"
 }
@@ -1066,6 +1453,16 @@ case "$1" in
     else
       render_run "${2:-}"
     fi
+    exit 0
+    ;;
+  check-base)
+    # vet's own post-Manager step, like `render --if-stale`, and deliberately
+    # not advertised in usage. The launch path calls check_base_after_manager
+    # directly; a resumed Manager cannot, because resume hands the pane over to
+    # run-manager-resume and returns immediately - so the helper calls back in
+    # here and a resumed review re-checks the base exactly like a launched one.
+    load_run "${2:-}" false
+    check_base_after_manager
     exit 0
     ;;
   resume)
@@ -1277,6 +1674,10 @@ cleanup_failed_launch() {
     rm -rf "$VET_DIR"
     echo "vet: removed run directory $VET_DIR" >&2
   fi
+  # A launch that got as far as reading the base leaves a private ref behind.
+  # Nothing else will ever remove it, because there is no run directory left for
+  # `vet rm` to find.
+  clear_base_tracking_refs "${REPO_ROOT:-}" "${RUN_ID:-}"
   exit "$rc"
 }
 trap cleanup_failed_launch EXIT
@@ -1374,6 +1775,16 @@ else
     echo "Note: PR head $HEAD_OID is not available after fetch; using fetched head $FETCHED_OID."
     echo "      The PR head may have moved between the API read and the fetch."
     HEAD_OID="$FETCHED_OID"
+  fi
+
+  # Where the base stood when this review began. Read again after the Manager
+  # exits, so a base that moved under the review can be reported. Best effort:
+  # this must never fail a launch.
+  BASE_START_OID="$(base_ref_oid "$REPO_ROOT" "$GIT_REMOTE" "$BASE_REF" \
+    "$(base_tracking_ref "$RUN_ID" base-start)")"
+  if [[ -z "$BASE_START_OID" ]]; then
+    echo "Note: could not resolve $GIT_REMOTE/$BASE_REF; a base that moves during"
+    echo "      this review will not be reported. The review itself is unaffected."
   fi
 fi
 
@@ -2209,7 +2620,15 @@ set -euo pipefail
 WORKDIR="\$1"
 PROMPT_FILE="\$2"
 SESSION_ID="\$3"
-RUN_DIR="$VET_DIR"
+# EVERY baked value goes through printf %q, exactly as run-step does it. An
+# install path or run directory containing a space, a quote or a \$ would
+# otherwise split into several words - or, for a value used as a command, be
+# read as a command to run.
+RUN_DIR=$(printf '%q' "$VET_DIR")
+VET_BIN=$(printf '%q' "$VET_SCRIPT_PATH")
+VET_RUN_ID=$(printf '%q' "$RUN_ID")
+MANAGER_TOOLS=$(printf '%q' "$MANAGER_TOOLS")
+MANAGER_DISALLOWED_TOOLS=$(printf '%q' "$MANAGER_DISALLOWED_TOOLS")
 # Baked, not inherited - same reason as run-step: the render below resolves the
 # run through VET_STATE_ROOT and must not depend on the pane's environment.
 VET_STATE_ROOT_BAKED=$(printf '%q' "$VET_STATE_ROOT")
@@ -2235,9 +2654,9 @@ CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude \\
   --setting-sources "" \\
   --strict-mcp-config \\
   --add-dir "\$RUN_DIR" \\
-  --tools "$MANAGER_TOOLS" \\
+  --tools "\$MANAGER_TOOLS" \\
   --allowedTools "\$(cat "\$RUN_DIR/manager-allowed-tools.txt")" \\
-  --disallowedTools "$MANAGER_DISALLOWED_TOOLS" \\
+  --disallowedTools "\$MANAGER_DISALLOWED_TOOLS" \\
   --append-system-prompt "\$(cat "\$PROMPT_FILE")" \\
   --resume "\$SESSION_ID"
 MANAGER_STATUS=\$?
@@ -2245,14 +2664,18 @@ set -e
 
 echo ""
 echo "Manager exited with status \$MANAGER_STATUS."
+# The base may have moved while this resumed review was running, exactly as it
+# may during a launched one. vet does the check; the same code path, same files.
+# Best effort, and never allowed to take the resume down with it.
+VET_STATE_ROOT="\$VET_STATE_ROOT_BAKED" "\$VET_BIN" check-base "\$VET_RUN_ID" || true
 # Rendering is vet's job, not the Manager's, so hand it back to vet. This both
 # validates and renders, and prints the report path or the exact reason it could
 # not.
-if ! VET_STATE_ROOT="\$VET_STATE_ROOT_BAKED" $VET_SCRIPT_PATH render --if-stale "$RUN_ID"; then
+if ! VET_STATE_ROOT="\$VET_STATE_ROOT_BAKED" "\$VET_BIN" render --if-stale "\$VET_RUN_ID"; then
   echo "" >&2
   echo "The report was not rendered. Fix the JSON and re-run:" >&2
-  echo "  $VET_SCRIPT_PATH render $RUN_ID" >&2
-  echo "or resume the Manager again: $VET_SCRIPT_PATH resume $RUN_ID" >&2
+  printf '  %s render %s\n' "\$VET_BIN" "\$VET_RUN_ID" >&2
+  printf 'or resume the Manager again: %s resume %s\n' "\$VET_BIN" "\$VET_RUN_ID" >&2
 fi
 exit "\$MANAGER_STATUS"
 HELPER
@@ -2568,6 +2991,38 @@ chmod +x "$VET_DIR/run-reviewer-b"
 # are referenced by absolute path instead of inlined - a large PR would
 # otherwise abort with E2BIG.
 
+# THE OUTPUT CONTRACT GOES FIRST IN THE TASK, NOT LAST.
+#
+# Measured on the sibling tool: a reviewer that finds NOTHING is the case that
+# breaks. Handed a schema and a clean PR, it answers "No issues found." in prose
+# instead of the schema object - and moving the schema text to the END of the
+# task did not fix it. Stating the contract BEFORE the reviewer knows what it is
+# reviewing did, and the lens that spelled out "return JSON even when there are
+# no findings" got it right first time.
+#
+# Both helpers already validate the result and exit 65 when it does not match
+# (run-reviewer-a, run-reviewer-b), so prose costs a whole reviewer run rather
+# than corrupting the report. This makes that outcome less likely; it never
+# makes it acceptable.
+REVIEWER_OUTPUT_CONTRACT="$(cat <<CONTRACT
+## Output contract - read this before anything else
+
+Return ONLY the JSON object required by your output schema. No prose, no
+markdown fence, no preamble, no closing remark: the first character you emit is
+"{" and the last is "}".
+
+A clean PR is NOT a sentence. If you find nothing, that is still the schema
+object, with "findings": [] - never "No issues found." and never an empty
+answer. Every other required field is still filled in.
+
+Empty collections are [], never null and never omitted.
+
+Your output schema file is authoritative for the exact field names, the required
+keys and the enum values. This section tells you the FORM to answer in; the
+schema tells you the FIELDS.
+CONTRACT
+)"
+
 REVIEWER_PROHIBITIONS="$(cat <<PROHIBIT
 ## Absolute prohibitions (this is a READ-ONLY review)
 
@@ -2598,6 +3053,8 @@ build_reviewer_task() {
   local extra_guidance="$4"
 
   cat > "$out_file" <<TASK
+$REVIEWER_OUTPUT_CONTRACT
+
 You are $reviewer_label, one of two INDEPENDENT reviewers of a GitHub pull
 request. Another reviewer is reviewing the same PR at the same time; you must
 not coordinate with them. A Manager will reconcile both reports afterwards.
@@ -2773,6 +3230,8 @@ $REVIEWER_PROHIBITIONS
 ## Output
 
 Return the structured JSON object required by your output schema. Nothing else.
+This is the output contract from the top of this task: JSON only, and a review
+that found nothing is still that object, with "findings": [].
 TASK
 }
 
@@ -3309,6 +3768,11 @@ echo ""
 echo "Manager exited with status $MANAGER_STATUS."
 echo "PR worktree retained at: $WORKDIR"
 echo "Artifacts retained at:   $VET_DIR"
+
+# Checked here rather than at either exit below, so it is reported on every
+# post-Manager path - including the one where the consolidated JSON fails its
+# schema and vet exits without a report.
+check_base_after_manager
 
 if [[ -f "$CONSOLIDATED_PATH" ]]; then
   if ! validate_against_schema "$CONSOLIDATED_PATH" "$VET_DIR/consolidated-schema.json" 2>/tmp/vet-validation.$$; then

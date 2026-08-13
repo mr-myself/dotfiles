@@ -47,8 +47,15 @@ extract_fn() {
   ' "$VET"
 }
 
-ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vet-autoclose-test.XXXXXX")"
-trap 'rm -rf "$ROOT"' EXIT
+# This script runs without `set -e`, so mktemp is checked explicitly. An empty
+# ROOT would turn every "$ROOT/bin" below into an absolute /bin, and the EXIT
+# trap into an `rm -rf` of something that is not ours.
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vet-autoclose-test.XXXXXX")" || exit 1
+[[ -n "$ROOT" && -d "$ROOT" ]] || {
+  echo "cannot create a temporary directory; refusing to run" >&2
+  exit 1
+}
+trap 'rm -rf "${ROOT:?}"' EXIT
 
 mkdir -p "$ROOT/bin"
 
