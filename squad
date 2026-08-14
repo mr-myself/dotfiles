@@ -1647,12 +1647,14 @@ rm -f "$STATUS_FILE"
 
 set_title "review:$LENS since $(date '+%H:%M:%S')"
 log ">>> Advisor $LENS review prompt sent."
-# NOTE: codex `exec review` treats the scope flags (--uncommitted/--base/--commit)
-# as mutually exclusive with a custom [PROMPT]. We drive the review entirely from
-# the prompt (which instructs inspecting the uncommitted changes), so do NOT pass
-# --uncommitted here, or codex 0.137+ aborts with:
-#   error: the argument '--uncommitted' cannot be used with '[PROMPT]'
-codex -a never -s read-only exec review \
+# Plain `codex exec`, not `codex exec review`. Two reasons:
+#   1. `exec review` is built around a scope flag (--uncommitted / --base /
+#      --commit) that cannot be combined with a custom [PROMPT], and this
+#      review is driven entirely from the prompt.
+#   2. `exec review` silently ignores --output-schema (codex-cli 0.147.0): it
+#      writes prose into the -o file, which merge-reviews then rejects as not
+#      valid JSON. Plain `exec` honours the schema, as run-advisor does.
+codex -a never -s read-only exec \
   --json \
   --output-schema "$SCHEMA_FILE" \
   -o "$RESULT_FILE" \
