@@ -1767,6 +1767,24 @@ non-zero status is always a real finding or a real failure. Never work around a
 failure by narrowing the scan; either fix the warning or ask PO about the ignore
 file.
 
+### The output contract (put it FIRST in every review task file)
+
+Both review task files must OPEN with this contract, before the task
+description. The end of the file demonstrably does not work: the schema alone
+does not reliably stop a lens from answering in prose, and a prose result costs
+a full re-run of that lens because merge-reviews refuses to merge it.
+
+Tell Advisor its FINAL message must be a single raw JSON object conforming to
+review-schema.json and nothing else - no prose before or after, no markdown code
+fences - carrying exactly these five top-level keys and no others: verdict,
+summary, must_fix, should_fix, test_gaps. merge-reviews enforces the schema's
+additionalProperties:false, so an extra key is as fatal as prose.
+
+A lens that finds NOTHING still answers with the object: verdict "pass" with
+empty arrays. A sentence saying the change looks fine is a FAILED lens run, not
+a pass. verdict is "must_fix" when the must_fix array is non-empty, otherwise
+"pass".
+
 ### The review checklist (used by BOTH review lenses)
 
 Before writing either review task, read the merged checklist:
@@ -1793,7 +1811,8 @@ changes against the approved acceptance criteria, the Coder's test report, and
 the mandatory RuboCop and Brakeman results, and to cover correctness, data
 integrity, tests, compatibility, performance, and the project's own conventions.
 Report findings only. A pass verdict is allowed only when relevant tests ran and
-both the RuboCop and Brakeman statuses are 0. Then run:
+both the RuboCop and Brakeman statuses are 0. Open this task file with the
+output contract above. Then run:
 
   '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-correctness-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-correctness-task.txt $SQUAD_DIR/review-correctness-result.json $SQUAD_DIR/review-correctness-status.txt $SQUAD_DIR/review-schema.json correctness'
   '$SQUAD_DIR/run-wait' '$SQUAD_DIR/review-correctness-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor correctness review'
@@ -1816,7 +1835,8 @@ tenant-isolation logic.
 This task text must NOT mention, quote, summarize or point at the CORRECTNESS
 result in any way. Write it as if the correctness lens had never run. The
 Brakeman gate is shared evidence and is not a lens, so referencing it does not
-break the independence of the two lenses. Then run:
+break the independence of the two lenses. Open this task file with the output
+contract above. Then run:
 
   '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-security-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-security-task.txt $SQUAD_DIR/review-security-result.json $SQUAD_DIR/review-security-status.txt $SQUAD_DIR/review-schema.json security'
   '$SQUAD_DIR/run-wait' '$SQUAD_DIR/review-security-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor security review'
