@@ -208,10 +208,26 @@ check_absent "the prompt does not tell the Manager to cat the merged checklist" 
 
 # What must be there instead. The full-diff rule is the one the PO explicitly
 # refused to trade away for cheaper rounds.
-check_contains "the prompt states the delta-free full-diff review" \
-  "$PROMPT" "Every review reviews the FULL uncommitted diff. There is no delta review and"
-check_contains "the prompt says there is no review baseline" \
-  "$PROMPT" "no review baseline"
+# Round 1 is still the full diff. What changed is that LATER rounds may narrow
+# to the delta - and every failure around that narrowing widens back to full.
+check_contains "the prompt keeps round 1 on the full uncommitted diff" \
+  "$PROMPT" "Round 1 reviews the FULL uncommitted diff."
+check_contains "the prompt states the round-2+ delta rule" \
+  "$PROMPT" "Round 2 and later review only what"
+check_contains "the prompt makes every delta failure fall back to full" \
+  "$PROMPT" "EVERY failure around the delta falls back to the FULL diff"
+check_contains "the prompt forbids narrowing a full round by hand" \
+  "$PROMPT" "never decide it yourself, and never narrow a full round by hand"
+check_contains "the prompt says the delta is the primary scope, not a blindfold" \
+  "$PROMPT" "the delta is the PRIMARY"
+check_contains "the prompt tells the lens it may read beyond the delta" \
+  "$PROMPT" "MAY and SHOULD read the surrounding"
+check_contains "the prompt keeps the skip decision on the full change" \
+  "$PROMPT" "always computed on the FULL change, never on the"
+check_contains "the prompt orders the baseline captured AFTER the review" \
+  "$PROMPT" "Run it AFTER the review, never before."
+check_contains "the prompt hands each lens only its OWN previous findings" \
+  "$PROMPT" "Never the other lens's findings"
 check_contains "the prompt states the skip rule in one sentence" \
   "$PROMPT" "A review lens is skipped ONLY when every path the change touches - both"
 check_contains "the skip rule sentence names the unknown-means-run part" \
@@ -369,6 +385,17 @@ echo ""
 echo "classify-diff (docs and media skip; anything else, known or not, runs)"
 
 CLASSIFY="$GEN/classify-diff"
+CAPTURE="$GEN/capture-review-baseline"
+
+# classify-diff takes seven paths. Wrapping it keeps every call site below
+# readable and makes the next arity change one edit instead of thirteen. The
+# baseline, delta and changed-file paths are derived from the scope path, so
+# each case stays isolated from every other; a test that drives delta rounds
+# passes its own baseline path explicitly.
+classify() {
+  local repo="$1" scope="$2" round="$3" max="$4" baseline="${5:-$2.baseline}"
+  "$CLASSIFY" "$repo" "$scope" "$round" "$max" "$baseline" "$scope.delta" "$scope.changed"
+}
 
 # Each case gets its own repository so the path list is exactly the files named.
 # The scope and round files live OUTSIDE it, or they would be untracked files in
@@ -387,7 +414,7 @@ classify_case() {
     mkdir -p "$case_dir/repo/$(dirname "$target")"
     printf 'content\n' > "$case_dir/repo/$target"
   done
-  if ! "$CLASSIFY" "$case_dir/repo" "$scope" "$round" 3 >/dev/null 2>&1; then
+  if ! classify "$case_dir/repo" "$scope" "$round" 3 >/dev/null 2>&1; then
     no "$label" "classify-diff exited non-zero"
     return
   fi
@@ -425,7 +452,7 @@ doc_content_case() {
   git_quiet -C "$case_dir/repo" add -A 2>/dev/null
   git_quiet -C "$case_dir/repo" commit -qm init 2>/dev/null
   printf '%s' "$*" > "$case_dir/repo/$name"
-  "$CLASSIFY" "$case_dir/repo" "$case_dir.scope" "$case_dir.round" 3 >/dev/null 2>&1
+  classify "$case_dir/repo" "$case_dir.scope" "$case_dir.round" 3 >/dev/null 2>&1
   SNIFF_SCOPE="$(sed -n 's/^scope=//p' "$case_dir.scope")"
   SNIFF_SECURITY="$(sed -n 's/^security=//p' "$case_dir.scope")"
   SNIFF_DIR="$case_dir"
@@ -508,31 +535,31 @@ inert_doc "an extensionless README" README 'Project readme, plain prose.'
 # one run in five, which would make this test flaky rather than wrong.
 doc_content_case "binary content" doc.md 'placeholder'
 printf '\211PNG\r\n\032\n\000\000\000\015IHDR\000\000\001\000' > "$SNIFF_DIR/repo/doc.md"
-"$CLASSIFY" "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
+classify "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
 check_eq "a binary file with a docs extension is code" \
   "run" "$(sed -n 's/^security=//p' "$SNIFF_DIR.scope2")"
 
 doc_content_case "NUL byte" doc.md 'placeholder'
 printf 'a\000b\n' > "$SNIFF_DIR/repo/doc.md"
-"$CLASSIFY" "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
+classify "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
 check_eq "a NUL byte in a docs file makes it code" \
   "run" "$(sed -n 's/^security=//p' "$SNIFF_DIR.scope2")"
 
 doc_content_case "oversized" doc.md 'placeholder'
 head -c 1200000 /dev/zero | tr '\0' 'a' > "$SNIFF_DIR/repo/doc.md"
-"$CLASSIFY" "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
+classify "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
 check_eq "a docs file past the sniff bound is code" \
   "run" "$(sed -n 's/^security=//p' "$SNIFF_DIR.scope2")"
 
 doc_content_case "under the bound" doc.md 'placeholder'
 head -c 900000 /dev/zero | tr '\0' 'a' > "$SNIFF_DIR/repo/doc.md"
-"$CLASSIFY" "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
+classify "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
 check_eq "a large but readable docs file is still documentation" \
   "skip" "$(sed -n 's/^security=//p' "$SNIFF_DIR.scope2")"
 
 doc_content_case "unreadable" doc.md 'plain prose'
 chmod 000 "$SNIFF_DIR/repo/doc.md"
-"$CLASSIFY" "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
+classify "$SNIFF_DIR/repo" "$SNIFF_DIR.scope2" "$SNIFF_DIR.round2" 3 >/dev/null 2>&1
 check_eq "an unreadable docs file is code" \
   "run" "$(sed -n 's/^security=//p' "$SNIFF_DIR.scope2")"
 chmod 644 "$SNIFF_DIR/repo/doc.md"
@@ -581,7 +608,7 @@ git_quiet -C "$STAGED_DIR/repo" commit -q --allow-empty -m init 2>/dev/null
 printf 'x\n' > "$STAGED_DIR/repo/app.rb"
 git_quiet -C "$STAGED_DIR/repo" add app.rb 2>/dev/null
 printf 'x\n' > "$STAGED_DIR/repo/README.md"
-"$CLASSIFY" "$STAGED_DIR/repo" "$STAGED_DIR/scope" "$STAGED_DIR/round" 3 >/dev/null 2>&1
+classify "$STAGED_DIR/repo" "$STAGED_DIR/scope" "$STAGED_DIR/round" 3 >/dev/null 2>&1
 check_eq "a staged code file is not hidden by an unstaged docs edit" \
   "run" "$(sed -n 's/^security=//p' "$STAGED_DIR/scope")"
 
@@ -605,7 +632,7 @@ tracked_case() {
 }
 
 classify_repo() {
-  "$CLASSIFY" "$CASE_REPO" "$CASE_DIR/scope" "$CASE_DIR/round" 3 >/dev/null 2>&1
+  classify "$CASE_REPO" "$CASE_DIR/scope" "$CASE_DIR/round" 3 >/dev/null 2>&1
   CLASSIFY_SCOPE="$(sed -n 's/^scope=//p' "$CASE_DIR/scope")"
   CLASSIFY_SECURITY="$(sed -n 's/^security=//p' "$CASE_DIR/scope")"
   CLASSIFY_FIRST_CODE="$(sed -n 's/^first_code_path=//p' "$CASE_DIR/scope")"
@@ -686,7 +713,7 @@ check_eq "a plain docs edit still skips the security lens" "skip" "$CLASSIFY_SEC
 # A path list that cannot be computed is an error, never an empty list.
 NOTREPO="$ROOT/not-a-repo"
 mkdir -p "$NOTREPO"
-"$CLASSIFY" "$NOTREPO" "$ROOT/nope.scope" "$ROOT/nope.round" 3 >/dev/null 2>&1
+classify "$NOTREPO" "$ROOT/nope.scope" "$ROOT/nope.round" 3 >/dev/null 2>&1
 check_ne "a diff that cannot be listed is an error" "0" "$?"
 if [[ ! -e "$ROOT/nope.scope" ]]; then
   ok "a failed classification writes no scope file"
@@ -711,7 +738,7 @@ paths=1
 docs_paths=1
 first_code_path=
 STALE
-"$CLASSIFY" "$NOTREPO" "$STALE_SCOPE" "$ROOT/stale.round" 3 >/dev/null 2>&1
+classify "$NOTREPO" "$STALE_SCOPE" "$ROOT/stale.round" 3 >/dev/null 2>&1
 check_ne "a failed classification over an existing scope file still errors" "0" "$?"
 if [[ ! -e "$STALE_SCOPE" ]]; then
   ok "a failed classification removes the PREVIOUS round's scope file"
@@ -721,9 +748,253 @@ else
 fi
 
 # The successful write is atomic, so no leftover temp file is left behind for
-# something to mistake for a scope file.
-LEFTOVER="$(find "$STAGED_DIR" -maxdepth 1 -name 'scope.*' 2>/dev/null | head -n 1 || true)"
+# something to mistake for a scope file. mktemp names it scope.XXXXXX with six
+# random characters; the .delta, .changed and .baseline siblings are real
+# outputs of this helper and are excluded by name rather than by pattern, so a
+# genuine leftover cannot hide behind a loose glob.
+LEFTOVER="$(
+  find "$STAGED_DIR" -maxdepth 1 -name 'scope.*' \
+    ! -name 'scope.delta' ! -name 'scope.changed' ! -name 'scope.baseline' \
+    2>/dev/null | head -n 1 || true
+)"
 check_eq "a successful classification leaves no temp scope file" "" "${LEFTOVER:-}"
+
+echo ""
+
+# ========================================================== delta review scope ==
+#
+# Round 1 is the real review and always reads the full uncommitted diff. Later
+# rounds exist to confirm that findings were fixed and that the fix broke
+# nothing, so they read only what changed since the state the previous round
+# reviewed. One lens run costs roughly 360k input tokens, nearly all of it the
+# lens reading the diff and exploring the repo, so this is where the money is.
+#
+# Every assertion below is really about ONE property: no path through this code
+# reviews LESS than the whole change unless a real delta was computed. Each
+# fallback is checked separately because each one is a separate way to lose a
+# review without anyone noticing.
+echo "delta review scope (round 1 full, round 2+ delta, every failure widens)"
+
+# delta_repo <dir> - a repository with a committed baseline and uncommitted work
+# on top, which is the state every review round actually runs against.
+delta_repo() {
+  DELTA_DIR="$(mktemp -d "$ROOT/delta.XXXXXX")"
+  DELTA_REPO="$DELTA_DIR/repo"
+  mkdir -p "$DELTA_REPO"
+  git_quiet init -q "$DELTA_REPO" 2>/dev/null
+  printf 'v1\n' > "$DELTA_REPO/app.rb"
+  printf 'docs\n' > "$DELTA_REPO/README.md"
+  git_quiet -C "$DELTA_REPO" add -A 2>/dev/null
+  git_quiet -C "$DELTA_REPO" commit -qm init 2>/dev/null
+  printf 'v2 with a bug\n' > "$DELTA_REPO/app.rb"
+}
+
+delta_classify() {
+  classify "$DELTA_REPO" "$DELTA_DIR/scope" "$DELTA_DIR/round" 3 "$DELTA_DIR/baseline" \
+    >/dev/null 2>&1
+  DELTA_MODE="$(sed -n 's/^review_mode=//p' "$DELTA_DIR/scope")"
+  DELTA_WHY="$(sed -n 's/^review_scope_reason=//p' "$DELTA_DIR/scope")"
+}
+
+# --- round 1 is always full, even with a stale baseline file lying around ---
+delta_repo
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$DELTA_DIR/baseline"
+delta_classify
+check_eq "round 1 reviews the full diff" "full" "$DELTA_MODE"
+check_contains "round 1 says why it is full" "$DELTA_WHY" "the first review of a run"
+
+# The case above cannot tell "round 1 is forced full" apart from "the corrupt
+# baseline fell back to full", because both end at full. So repeat it with a
+# GENUINELY USABLE baseline: round 1 must still refuse to delta, and must say it
+# is because it is round 1 rather than because anything failed.
+delta_repo
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v9 changed since that baseline\n' > "$DELTA_REPO/app.rb"
+delta_classify
+check_eq "round 1 ignores even a VALID baseline" "full" "$DELTA_MODE"
+check_contains "round 1 is full because it is round 1, not because of a failure" \
+  "$DELTA_WHY" "the first review of a run"
+if [[ ! -e "$DELTA_DIR/scope.delta" ]]; then
+  ok "round 1 writes no delta file"
+else
+  no "round 1 writes no delta file" "it wrote one"
+fi
+
+# --- round 2 reviews the delta since round 1's baseline ---
+delta_repo
+delta_classify                                     # round 1
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+check_eq "capture-review-baseline succeeds" "0" "$?"
+check_file "the baseline file is written" "$DELTA_DIR/baseline"
+printf 'v3 fixed\n' > "$DELTA_REPO/app.rb"          # the Coder's fix
+delta_classify                                     # round 2
+check_eq "round 2 reviews only the delta" "delta" "$DELTA_MODE"
+check_file "round 2 writes a delta file" "$DELTA_DIR/scope.delta"
+DELTA_BODY="$(cat "$DELTA_DIR/scope.delta")"
+check_contains "the delta carries the fix" "$DELTA_BODY" "+v3 fixed"
+check_contains "the delta carries what the fix replaced" "$DELTA_BODY" "-v2 with a bug"
+check_absent "the delta does NOT re-send the already-reviewed original" \
+  "$DELTA_BODY" "-v1"
+
+# --- the full changed-file NAME list reaches the lens even in a delta round ---
+check_file "a delta round still writes the changed-file list" "$DELTA_DIR/scope.changed"
+CHANGED_BODY="$(cat "$DELTA_DIR/scope.changed")"
+check_contains "the name list covers the whole change, not just the delta" \
+  "$CHANGED_BODY" "app.rb"
+check_contains "the scope file points the Manager at the name list" \
+  "$(cat "$DELTA_DIR/scope")" "changed_files_file="
+check_contains "the scope file points the Manager at the delta" \
+  "$(cat "$DELTA_DIR/scope")" "delta_file="
+
+# --- a brand new UNTRACKED file must not vanish from a delta round ---
+#
+# git stash create does not record untracked files, so `git diff <baseline>`
+# alone would not show one. This is the single most dangerous detail in the
+# feature: a new source file the Coder just wrote would be invisible.
+delta_repo
+delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3\n' > "$DELTA_REPO/app.rb"
+printf 'brand new secret handling\n' > "$DELTA_REPO/newly_added.rb"
+delta_classify
+check_eq "a round with a new untracked file still deltas" "delta" "$DELTA_MODE"
+check_contains "a brand new untracked file IS in the delta" \
+  "$(cat "$DELTA_DIR/scope.delta")" "newly_added.rb"
+check_contains "the new untracked file is in the changed-file list too" \
+  "$(cat "$DELTA_DIR/scope.changed")" "newly_added.rb"
+
+# --- every fallback widens back to the full diff ---
+delta_fallback() {
+  local label="$1"
+  delta_classify
+  check_eq "$label falls back to the full diff" "full" "$DELTA_MODE"
+}
+
+delta_repo; delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3\n' > "$DELTA_REPO/app.rb"
+rm -f "$DELTA_DIR/baseline"
+delta_fallback "a MISSING baseline"
+
+delta_repo; delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3\n' > "$DELTA_REPO/app.rb"
+: > "$DELTA_DIR/baseline"
+delta_fallback "an EMPTY baseline file"
+
+delta_repo; delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3\n' > "$DELTA_REPO/app.rb"
+printf 'not-a-sha-at-all\n' > "$DELTA_DIR/baseline"
+delta_fallback "a CORRUPT baseline"
+
+delta_repo; delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3\n' > "$DELTA_REPO/app.rb"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$DELTA_DIR/baseline"
+delta_fallback "a baseline that is NOT AN OBJECT in this repo"
+check_contains "the non-object fallback says why" "$DELTA_WHY" "is not a commit in this repository"
+
+# An EMPTY delta means no fix landed where the baseline can see it. Silence is
+# not a pass: re-read everything.
+delta_repo; delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+delta_fallback "an EMPTY delta (the Coder changed nothing)"
+check_contains "the empty-delta fallback says why" "$DELTA_WHY" "came back EMPTY"
+
+# The emptiness test must survive untracked padding. Untracked files are
+# appended to every delta, so testing emptiness AFTER appending them would mean
+# the signal never fires.
+delta_repo
+printf 'stray\n' > "$DELTA_REPO/untracked_stays.rb"
+delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+delta_fallback "an empty delta with an untracked file present"
+
+# A change that creates ONLY a new untracked file leaves the tracked diff empty.
+# Re-reading the full diff is the safe answer there too.
+delta_repo; delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'new\n' > "$DELTA_REPO/only_new.rb"
+delta_fallback "a round where ONLY a new untracked file appeared"
+
+# --- the skip decision is still computed on the FULL change ---
+#
+# A documentation-only delta sitting on top of a code change must still run the
+# security lens. This is deliberately the expensive direction.
+delta_repo; delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'more docs\n' >> "$DELTA_REPO/README.md"
+delta_classify
+check_eq "a docs-only delta still deltas" "delta" "$DELTA_MODE"
+check_eq "a docs-only delta on top of a code change still runs security" \
+  "run" "$(sed -n 's/^security=//p' "$DELTA_DIR/scope")"
+check_eq "the skip decision still sees the whole change as code" \
+  "code" "$(sed -n 's/^scope=//p' "$DELTA_DIR/scope")"
+
+# --- capturing a baseline must not disturb live agent work ---
+#
+# This runs while Coder has edits in flight, so it must not touch the working
+# tree, what is staged, or the stash list. git DOES rewrite the .git/index file
+# to refresh its cached stat data; what must not change is the index CONTENT,
+# which is what these three assertions measure.
+delta_repo
+printf 'staged\n' > "$DELTA_REPO/staged.rb"
+git_quiet -C "$DELTA_REPO" add staged.rb 2>/dev/null
+printf 'untracked\n' > "$DELTA_REPO/untracked.rb"
+git_quiet -C "$DELTA_REPO" status --porcelain >/dev/null 2>&1
+ST_BEFORE="$(git_quiet -C "$DELTA_REPO" status --porcelain 2>/dev/null)"
+LS_BEFORE="$(git_quiet -C "$DELTA_REPO" ls-files -s 2>/dev/null)"
+CACHED_BEFORE="$(git_quiet -C "$DELTA_REPO" diff --cached 2>/dev/null)"
+UNSTAGED_BEFORE="$(git_quiet -C "$DELTA_REPO" diff 2>/dev/null)"
+STASH_BEFORE="$(git_quiet -C "$DELTA_REPO" stash list 2>/dev/null | wc -l | tr -d '[:space:]')"
+APP_BEFORE="$(cat "$DELTA_REPO/app.rb")"
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+check_eq "capturing a baseline leaves the working tree status untouched" \
+  "$ST_BEFORE" "$(git_quiet -C "$DELTA_REPO" status --porcelain 2>/dev/null)"
+check_eq "capturing a baseline leaves the index CONTENT untouched" \
+  "$LS_BEFORE" "$(git_quiet -C "$DELTA_REPO" ls-files -s 2>/dev/null)"
+check_eq "capturing a baseline leaves the staged diff untouched" \
+  "$CACHED_BEFORE" "$(git_quiet -C "$DELTA_REPO" diff --cached 2>/dev/null)"
+check_eq "capturing a baseline leaves the unstaged diff untouched" \
+  "$UNSTAGED_BEFORE" "$(git_quiet -C "$DELTA_REPO" diff 2>/dev/null)"
+check_eq "capturing a baseline leaves the stash list untouched" \
+  "$STASH_BEFORE" "$(git_quiet -C "$DELTA_REPO" stash list 2>/dev/null | wc -l | tr -d '[:space:]')"
+check_eq "capturing a baseline leaves file contents untouched" \
+  "$APP_BEFORE" "$(cat "$DELTA_REPO/app.rb")"
+
+# A failed capture must leave NO baseline behind, so the next round reads full
+# rather than deltaing against a stale sha.
+delta_repo
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+check_file "a good capture writes a baseline" "$DELTA_DIR/baseline"
+NOTREPO_CAP="$ROOT/capture-not-a-repo"
+mkdir -p "$NOTREPO_CAP"
+"$CAPTURE" "$NOTREPO_CAP" "$DELTA_DIR/baseline" 2 >/dev/null 2>&1
+check_ne "capturing outside a repository fails" "0" "$?"
+if [[ ! -e "$DELTA_DIR/baseline" ]]; then
+  ok "a failed capture removes the previous baseline"
+else
+  no "a failed capture removes the previous baseline" "a stale baseline survived"
+fi
+
+# --- a resume forces the next review back to full ---
+#
+# squad resume deletes the baseline outright. A resumed Manager has lost the
+# conversation it built its judgement in, so handing it a small delta plus
+# "the findings from last round" it can no longer see is where a delta review is
+# weakest. The rule is enforced by construction, not by luck.
+check_contains "squad resume drops the review baseline" \
+  "$(grep -A 2 'Drop the review baseline' "$SQUAD" | head -20)" "review baseline"
+# shellcheck disable=SC2016  # matching squad's literal source text, not expanding it.
+RESUME_DROP="$(grep -c 'rm -f "\$SQUAD_DIR/review-baseline.txt"' "$SQUAD")"
+check_eq "squad deletes the baseline file on resume" "1" "$RESUME_DROP"
+# ...and with no baseline present, the next classification is full, whatever
+# round number the resumed run is on.
+delta_repo
+delta_classify; delta_classify          # advance to round 2 with no baseline
+check_eq "after a resume with no baseline the next review is full" "full" "$DELTA_MODE"
+check_contains "the resumed round says why it is full" "$DELTA_WHY" "no review baseline was recorded"
 
 echo ""
 
@@ -735,14 +1006,14 @@ git_quiet init -q "$CAP_DIR/repo" 2>/dev/null
 git_quiet -C "$CAP_DIR/repo" commit -q --allow-empty -m init 2>/dev/null
 printf 'x\n' > "$CAP_DIR/repo/app.rb"
 for want_round in 1 2 3; do
-  "$CLASSIFY" "$CAP_DIR/repo" "$CAP_DIR/scope" "$CAP_DIR/round" 3 >/dev/null 2>&1
+  classify "$CAP_DIR/repo" "$CAP_DIR/scope" "$CAP_DIR/round" 3 >/dev/null 2>&1
   check_eq "classify-diff counts review round $want_round" \
     "$want_round" "$(sed -n 's/^round=//p' "$CAP_DIR/scope")"
 done
 check_eq "the third of three rounds is the final one" \
   "yes" "$(sed -n 's/^final_round=//p' "$CAP_DIR/scope")"
 
-CAP_OUT="$("$CLASSIFY" "$CAP_DIR/repo" "$CAP_DIR/scope" "$CAP_DIR/round" 3 2>&1)"
+CAP_OUT="$(classify "$CAP_DIR/repo" "$CAP_DIR/scope" "$CAP_DIR/round" 3 2>&1)"
 check_contains "the final round says so on the pane" "$CAP_OUT" "LAST review round allowed"
 
 # SQUAD_REVIEW_MAX_ROUNDS is validated in the same idiom, with the same message
@@ -1007,8 +1278,14 @@ else
     "$HPROMPT" "Paste its contents"
   check_absent "squad-herdr no longer commands running both lenses every round" \
     "$HPROMPT" "ALWAYS run BOTH lenses"
-  check_contains "squad-herdr states the delta-free full-diff review" \
-    "$HPROMPT" "Every review reviews the FULL uncommitted diff"
+  check_contains "squad-herdr keeps round 1 on the full diff" \
+    "$HPROMPT" "Round 1 reviews the FULL uncommitted diff."
+  check_contains "squad-herdr states the round-2+ delta rule" \
+    "$HPROMPT" "Round 2 and later review only what"
+  check_contains "squad-herdr falls back to full on any delta failure" \
+    "$HPROMPT" "EVERY failure around the delta falls back to the FULL diff"
+  check_contains "squad-herdr keeps the skip decision on the full change" \
+    "$HPROMPT" "always computed on the FULL change, never on the"
   check_contains "squad-herdr states the skip rule sentence" "$HPROMPT" "$RULE"
   check_contains "squad-herdr states the carry-forward rule" \
     "$HPROMPT" "Carry-forward is the narrow exception,"

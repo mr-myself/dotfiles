@@ -1930,8 +1930,8 @@ set -euo pipefail
 # generated runtime artifacts, symlinks and submodules, and any extension the
 # classifier does not recognise - runs it.
 
-if [[ $# -ne 4 ]]; then
-  printf 'Usage: classify-diff <workdir> <scope-file> <round-file> <max-rounds>\n' >&2
+if [[ $# -ne 7 ]]; then
+  printf 'Usage: classify-diff <workdir> <scope-file> <round-file> <max-rounds> <baseline-file> <delta-file> <changed-files-file>\n' >&2
   exit 2
 fi
 
@@ -1939,6 +1939,9 @@ WORKDIR="$1"
 SCOPE_FILE="$2"
 ROUND_FILE="$3"
 MAX_ROUNDS="$4"
+BASELINE_FILE="$5"
+DELTA_FILE="$6"
+CHANGED_FILES_FILE="$7"
 
 [[ "$MAX_ROUNDS" =~ ^[1-9][0-9]*$ ]] || {
   printf 'classify-diff: ERROR: max-rounds must be a positive integer: %s\n' "$MAX_ROUNDS" >&2
@@ -1958,7 +1961,7 @@ MAX_ROUNDS="$4"
 # managed to classify into one that looks like a decided skip - the same
 # unreviewed-change-looks-reviewed failure as before, reached through the error
 # path instead of the happy one.
-rm -f "$SCOPE_FILE"
+rm -f "$SCOPE_FILE" "$DELTA_FILE" "$CHANGED_FILES_FILE"
 
 # The path list is EVIDENCE, so a git failure stops here with a non-zero status
 # and no scope file.
@@ -2234,6 +2237,106 @@ else
   FINAL_ROUND="no"
 fi
 
+# The FULL changed-file name list, always, in every round including delta ones.
+#
+# It is a few hundred bytes and it is what lets a lens notice that the delta
+# touches something it ought to read more of. A delta without it is a blindfold:
+# the reviewer cannot tell whether the three lines it was handed sit in a file
+# the earlier change rewrote completely.
+printf '%s\n' "$ALL_PATHS" | sed '/^[[:space:]]*$/d' | sort -u > "$CHANGED_FILES_FILE"
+
+# --- Review scope: full diff, or only the delta since the last review? --------
+#
+# Round 1 is ALWAYS the full uncommitted diff. Later rounds exist to confirm that
+# specific findings were fixed and that the fix broke nothing, so they read the
+# delta since the state round N-1 actually reviewed.
+#
+# EVERY failure here falls back to the FULL diff. There is no path that reviews
+# less than the full change unless a delta was computed successfully and came
+# back non-empty. That single rule is the whole safety argument, so each branch
+# below records WHY, and the reason travels to the Manager in the scope file.
+REVIEW_MODE="full"
+DELTA_REASON="round 1: the first review of a run always reads the full uncommitted diff"
+BASELINE=""
+
+if [[ "$ROUND" -gt 1 ]]; then
+  REVIEW_MODE="full"
+  DELTA_REASON="no usable review baseline was found, so this round re-reads the full diff"
+  if [[ -s "$BASELINE_FILE" ]]; then
+    BASELINE="$(head -n 1 "$BASELINE_FILE" | tr -d '[:space:]')"
+  fi
+
+  if [[ -z "$BASELINE" ]]; then
+    DELTA_REASON="no review baseline was recorded for the previous round (a fresh run, a resume, or a failed capture), so this round reads the full diff"
+  elif ! [[ "$BASELINE" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+    DELTA_REASON="the recorded review baseline is not a git object id, so this round reads the full diff"
+  elif ! git -C "$WORKDIR" cat-file -e "${BASELINE}^{commit}" 2>/dev/null; then
+    DELTA_REASON="the recorded review baseline $BASELINE is not a commit in this repository, so this round reads the full diff"
+  else
+    # Two halves, and the second one matters more than it looks.
+    #
+    # `git diff <baseline> --` covers TRACKED changes only. `git stash create`
+    # does not record untracked files, so a file that is untracked now appears
+    # in NEITHER the baseline NOR that diff - a brand new source file the Coder
+    # just wrote would be invisible to a delta review. So every currently
+    # untracked file is appended as a full addition.
+    #
+    # DOCUMENTED CONSEQUENCE: an untracked file that stays untracked reappears
+    # in full in EVERY delta, round after round. That is deliberate. It is the
+    # fail-safe direction - reviewed again rather than missed - and the
+    # alternative would need the index touched, which is forbidden here.
+    # The TRACKED half is computed first and ON ITS OWN, because it is the only
+    # honest answer to "did any new work land since the last review?".
+    #
+    # The emptiness test MUST be made here, before untracked files are appended.
+    # Untracked files reappear in every delta by construction, so a delta that
+    # has already been padded with them is never empty and the "nothing changed"
+    # signal would never fire - measured, not assumed.
+    DELTA_TMP="$(mktemp "${DELTA_FILE}.XXXXXX")"
+    DELTA_OK=true
+    if ! git -c core.quotePath=false -C "$WORKDIR" diff "$BASELINE" -- > "$DELTA_TMP" 2>/dev/null; then
+      DELTA_OK=false
+    fi
+
+    if [[ "$DELTA_OK" != "true" ]]; then
+      rm -f "$DELTA_TMP"
+      DELTA_REASON="the delta since baseline $BASELINE could not be computed, so this round reads the full diff"
+    elif [[ ! -s "$DELTA_TMP" ]]; then
+      # No tracked file changed since the state the last review read. Whatever
+      # the Coder reported, no fix landed anywhere this baseline can see, and
+      # silence is not a pass. A change that created ONLY a new untracked file
+      # also lands here, and re-reading the full diff is the safe answer.
+      rm -f "$DELTA_TMP"
+      DELTA_REASON="the delta since baseline $BASELINE came back EMPTY - no tracked file changed since the last review - so this round reads the full diff"
+    else
+      # Only now append the untracked files, so they enrich a real delta rather
+      # than manufacture one.
+      while IFS= read -r untracked_path; do
+        [[ -n "$untracked_path" ]] || continue
+        # --no-index exits 0 when the files match and 1 when they differ; only
+        # 2 and above are real errors.
+        set +e
+        git -c core.quotePath=false -C "$WORKDIR" diff --no-index -- /dev/null "$untracked_path" >> "$DELTA_TMP" 2>/dev/null
+        untracked_rc=$?
+        set -e
+        if [[ "$untracked_rc" -gt 1 ]]; then
+          DELTA_OK=false
+          break
+        fi
+      done <<< "$UNTRACKED"
+
+      if [[ "$DELTA_OK" != "true" ]]; then
+        rm -f "$DELTA_TMP"
+        DELTA_REASON="an untracked file could not be added to the delta since baseline $BASELINE, so this round reads the full diff"
+      else
+        mv "$DELTA_TMP" "$DELTA_FILE"
+        REVIEW_MODE="delta"
+        DELTA_REASON="reviewing only what changed since the state round $((ROUND - 1)) reviewed (baseline $BASELINE)"
+      fi
+    fi
+  fi
+fi
+
 # Written to a temp file and renamed into place, so the Manager can only ever
 # read a COMPLETE scope file. A half-written one - a full disk, a killed pane -
 # could be missing the very line that says a lens must run.
@@ -2249,6 +2352,14 @@ trap 'rm -f "$SCOPE_TMP"' EXIT
   printf 'paths=%s\n' "$TOTAL"
   printf 'docs_paths=%s\n' "$DOCS"
   printf 'first_code_path=%s\n' "$FIRST_CODE_PATH"
+  # scope/correctness/security above are computed on the FULL change and are
+  # NEVER recomputed on the delta: a documentation-only delta sitting on top of
+  # a code change must still run the security lens.
+  printf 'review_mode=%s\n' "$REVIEW_MODE"
+  printf 'review_baseline=%s\n' "$BASELINE"
+  printf 'delta_file=%s\n' "$([[ "$REVIEW_MODE" == "delta" ]] && printf '%s' "$DELTA_FILE")"
+  printf 'changed_files_file=%s\n' "$CHANGED_FILES_FILE"
+  printf 'review_scope_reason=%s\n' "$DELTA_REASON"
 } > "$SCOPE_TMP"
 mv "$SCOPE_TMP" "$SCOPE_FILE"
 trap - EXIT
@@ -2269,12 +2380,105 @@ case "$SCOPE" in
       "$ROUND" "$MAX_ROUNDS" "$TOTAL" "$DOCS" "$FIRST_CODE_PATH"
     ;;
 esac
+if [[ "$REVIEW_MODE" == "delta" ]]; then
+  printf 'classify-diff: review scope DELTA - %s.\n' "$DELTA_REASON"
+else
+  printf 'classify-diff: review scope FULL - %s.\n' "$DELTA_REASON"
+fi
 if [[ "$FINAL_ROUND" == "yes" ]]; then
   printf 'classify-diff: this is the LAST review round allowed by SQUAD_REVIEW_MAX_ROUNDS (%s). Report to PO instead of starting another fix round.\n' \
     "$MAX_ROUNDS"
 fi
 HELPER
   chmod +x "$SQUAD_DIR/classify-diff"
+
+  # capture-review-baseline records the working state a review just finished
+  # looking at, so the NEXT round can review only what changed since. One Advisor
+  # lens run costs roughly 360k input tokens, almost none of it the task text -
+  # it is the lens reading the whole diff and exploring the repo from scratch,
+  # every round. Only round 1 needs to do that.
+  #
+  # `git stash create` is the mechanism. It writes a commit object for the
+  # current working state and prints its sha, WITHOUT touching the working tree,
+  # the stash list, or what the index actually holds. This runs in the middle of
+  # live agent work, so corrupting a Coder's in-progress edit would be far worse
+  # than any token saving, and there are tests for all of it.
+  #
+  # Measured caveat, stated because "does not touch the index" is too strong a
+  # claim: git DOES rewrite the .git/index FILE, refreshing its cached stat
+  # data. The index CONTENT is untouched - `git ls-files -s`, `git diff` and
+  # `git diff --cached` are all byte-identical before and after, which is what
+  # the test asserts. Nothing staged is added, removed or altered.
+  #
+  # It is deliberately run AFTER a review completes, not before. If it ran inside
+  # classify-diff, a Manager that re-ran classify-diff without reviewing would
+  # advance the baseline past work no lens ever read, and the next delta would
+  # SHRINK to exclude it. Capturing afterwards inverts every failure mode: a
+  # forgotten or failed capture leaves the OLD baseline (next delta is bigger) or
+  # no baseline at all (next review is full). Both directions review more, never
+  # less.
+  cat > "$SQUAD_DIR/capture-review-baseline" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  printf 'Usage: capture-review-baseline <workdir> <baseline-file> <round>\n' >&2
+  exit 2
+fi
+
+WORKDIR="$1"
+BASELINE_FILE="$2"
+ROUND="$3"
+
+[[ -d "$WORKDIR" ]] || {
+  printf 'capture-review-baseline: ERROR: not a directory: %s\n' "$WORKDIR" >&2
+  exit 2
+}
+[[ "$ROUND" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'capture-review-baseline: ERROR: round must be a positive integer: %s\n' "$ROUND" >&2
+  exit 2
+}
+
+# Clear first. A baseline that could not be captured must leave NO file behind:
+# classify-diff reads an absent baseline as "review the full diff", which is the
+# safe answer. A stale sha from an earlier round would instead produce a delta
+# that silently omits everything reviewed between then and now.
+rm -f "$BASELINE_FILE"
+
+# `git stash create` on a clean tree prints nothing and exits 0. That is not a
+# failure, but it is also not a usable baseline, so it is treated the same as
+# any other failure: no file, next review is full.
+BASELINE=""
+if ! BASELINE="$(git -C "$WORKDIR" stash create 2>/dev/null)"; then
+  printf 'capture-review-baseline: could not capture a baseline; the next review will read the FULL diff.\n' >&2
+  exit 70
+fi
+BASELINE="${BASELINE//[[:space:]]/}"
+if [[ -z "$BASELINE" ]]; then
+  printf 'capture-review-baseline: nothing to capture (no tracked modifications); the next review will read the FULL diff.\n' >&2
+  exit 70
+fi
+
+# Never write a sha that is not actually a commit in this repository.
+if ! git -C "$WORKDIR" cat-file -e "${BASELINE}^{commit}" 2>/dev/null; then
+  printf 'capture-review-baseline: ERROR: git stash create returned something that is not a commit: %s\n' "$BASELINE" >&2
+  printf 'capture-review-baseline: the next review will read the FULL diff.\n' >&2
+  exit 70
+fi
+
+BASELINE_TMP="$(mktemp "${BASELINE_FILE}.XXXXXX")"
+trap 'rm -f "$BASELINE_TMP"' EXIT
+{
+  printf '%s\n' "$BASELINE"
+  printf 'round=%s\n' "$ROUND"
+} > "$BASELINE_TMP"
+mv "$BASELINE_TMP" "$BASELINE_FILE"
+trap - EXIT
+
+printf 'capture-review-baseline: round %s reviewed state %s; round %s will review the delta since it.\n' \
+  "$ROUND" "$BASELINE" "$((ROUND + 1))"
+HELPER
+  chmod +x "$SQUAD_DIR/capture-review-baseline"
 
   # write-lens-result produces the schema-valid result file for a lens that did
   # NOT run this round: skipped by the scope rule, or carried forward from an
@@ -3064,9 +3268,17 @@ likewise takes a role, not a pane ID.
   re-run lens, for a carried-forward lens and for a skipped one alike. Only
   merge-reviews ever sees both results, and it runs AFTERWARDS. The two prompts
   never cross-feed.
-- Every review reviews the FULL uncommitted diff. There is no delta review and
-  no review baseline: a later round does not review "what changed since the last
-  round", it reviews everything that is uncommitted, exactly like round 1.
+- Round 1 reviews the FULL uncommitted diff. Round 2 and later review only what
+  changed since the state the previous round reviewed, plus that lens's own
+  previous findings. classify-diff decides which, and writes it as review_mode;
+  read it, never decide it yourself, and never narrow a full round by hand.
+- EVERY failure around the delta falls back to the FULL diff - a missing,
+  unreadable or unusable baseline, a delta that cannot be computed, a delta that
+  comes back empty. There is no path that reviews less than the whole change
+  unless a real delta was computed. When in doubt, the full diff.
+- After every review round, run capture-review-baseline. Before a review, never:
+  a baseline captured for a review that then does not happen would move the
+  starting line past work no lens ever read.
 - Round 1, the first review of this run, ALWAYS runs BOTH lenses, subject only
   to the classify-diff skip rule.
 - In a later round a lens MUST be re-run when ANY of these hold: it previously
@@ -3112,8 +3324,16 @@ applies a $WAIT_TIMEOUT_SECONDS second timeout as a final fallback.
 - $SQUAD_DIR/brakeman-result.json - the raw Brakeman JSON report. Both lenses may
   cite it as evidence; the SECURITY lens must read it. It is a GATE result, not
   a review verdict, and it is never an input to merge-reviews.
-- $SQUAD_DIR/review-scope.txt     - which lenses this round needs and which
-  round it is, written by classify-diff. Read it, never guess it.
+- $SQUAD_DIR/review-scope.txt     - which lenses this round needs, which round
+  it is, and whether this round reviews the full diff or only the delta. Written
+  by classify-diff. Read it, never guess it.
+- $SQUAD_DIR/review-delta.diff    - in a delta round, what changed since the
+  state the previous round reviewed. Written by classify-diff, and absent in a
+  full round.
+- $SQUAD_DIR/review-changed-files.txt - every file the WHOLE change touches, not
+  just the delta. Both lenses get this path in every round.
+- $SQUAD_DIR/review-baseline.txt  - the working state the last review read,
+  written by capture-review-baseline. Never write it by hand.
 - $SQUAD_DIR/checklist.correctness.md - the review lenses for the CORRECTNESS
   review. Referenced by that task file, never pasted into it.
 - $SQUAD_DIR/checklist.security.md    - the review lenses for the SECURITY
@@ -3276,11 +3496,13 @@ a pass. verdict is "must_fix" when the must_fix array is non-empty, otherwise
 Run this once at the start of EVERY review round, in your own pane, before you
 write any review task:
 
-  '$SQUAD_DIR/classify-diff' '$WORKDIR' '$SQUAD_DIR/review-scope.txt' '$SQUAD_DIR/review-round.txt' '$REVIEW_MAX_ROUNDS'
+  '$SQUAD_DIR/classify-diff' '$WORKDIR' '$SQUAD_DIR/review-scope.txt' '$SQUAD_DIR/review-round.txt' '$REVIEW_MAX_ROUNDS' '$SQUAD_DIR/review-baseline.txt' '$SQUAD_DIR/review-delta.diff' '$SQUAD_DIR/review-changed-files.txt'
   cat '$SQUAD_DIR/review-scope.txt'
 
-It writes round, max_rounds, final_round, scope, correctness, security and the
-changed-path counts. THE SKIP RULE it applies, in one sentence:
+It writes round, max_rounds, final_round, scope, correctness, security, the
+changed-path counts, and the review scope for this round: review_mode,
+review_baseline, delta_file, changed_files_file and review_scope_reason.
+THE SKIP RULE it applies, in one sentence:
 
   A review lens is skipped ONLY when every path the change touches - both
   sides of a rename, and deletions too - is either a non-executable media
@@ -3300,9 +3522,60 @@ the classifier reads the file, and a document carrying active content is code.
 Never override the helper towards skipping. If classify-diff exits non-zero, the
 diff could not be classified: run BOTH lenses and tell PO.
 
-Every review reviews the FULL uncommitted diff. classify-diff decides WHETHER a
-lens runs, never what it looks at - there is no delta review and no review
-baseline, so a round-3 review reads exactly the same diff a round-1 review did.
+The SKIP decision above is always computed on the FULL change, never on the
+delta. A documentation-only delta sitting on top of a code change still runs the
+security lens. That is deliberately the expensive direction; do not optimise it.
+
+### What each round REVIEWS (full diff, or only the delta)
+
+One Advisor lens run costs roughly 360k input tokens, almost none of it the task
+text - it is the lens reading the whole diff and exploring the repo from
+scratch. Only the first round needs to do that. Round 1 is the real review;
+later rounds exist to confirm that specific findings were fixed and that the fix
+broke nothing.
+
+classify-diff decides this for you and writes it as review_mode. Read it. Never
+decide the scope yourself.
+
+  review_mode=full   Review ALL uncommitted changes, exactly as round 1 always
+                     does. This is also what you get whenever anything about the
+                     delta could not be established.
+  review_mode=delta  Review the contents of delta_file: what changed since the
+                     state the previous round reviewed.
+
+In a delta round the review task must ALSO carry, for every lens:
+
+- The path in changed_files_file. It lists every file the WHOLE change touches,
+  not just the delta, and it is a few hundred bytes. It is what lets a lens
+  notice that the delta touches something it should go and read more of.
+- The must_fix findings THAT SAME LENS raised last round, which the Coder was
+  asked to fix. Never the other lens's findings - see the independence rule.
+- This instruction, in the task text, in these words: the delta is the PRIMARY
+  SCOPE, not a blindfold. Tell Advisor it MAY and SHOULD read the surrounding
+  files, the earlier change and any history it needs whenever the delta does not
+  make sense on its own, and that a fix which looks correct in isolation but
+  breaks its caller is exactly what this round is for.
+
+Every fallback goes towards reading MORE, never less. If review_mode is full,
+read the full diff and do not go looking for a delta. If classify-diff exits
+non-zero at all, run BOTH lenses on the full diff and tell PO.
+
+### Capture the review baseline (mandatory, after every review round)
+
+Run this in your own pane once the round's review is finished - after
+merge-reviews, whether the verdict was pass or must_fix:
+
+  '$SQUAD_DIR/capture-review-baseline' '$WORKDIR' '$SQUAD_DIR/review-baseline.txt' '<round>'
+
+It records the working state this round just reviewed, so the next round can
+review only what changed since. It uses \`git stash create\`, which writes a
+commit object WITHOUT touching the working tree, the stash list, or anything
+staged in the index - it is safe to run while Coder has work in progress.
+
+Run it AFTER the review, never before. A baseline captured before a review that
+then does not happen would move the starting line past work no lens ever read.
+If it fails, or you forget it, the next round simply reads the full diff again -
+that costs tokens and is safe. Never hand-write this file.
 
 ### The review checklists (one file per lens)
 
@@ -3336,19 +3609,29 @@ not an error and never a reason to skip a lens.
 
 Run this when review-scope.txt says correctness=run and you are not carrying the
 lens forward. The first of two independent lenses. Write an English request to
-$SQUAD_DIR/review-correctness-task.txt. Tell Advisor to inspect all uncommitted
-changes - the full diff, not a delta since the last round - against the approved
-acceptance criteria, the Coder's test report, and the mandatory RuboCop and
-Brakeman results, and to cover correctness, data integrity, tests,
-compatibility, performance, and the project's own conventions. Report findings
-only. A pass verdict is allowed only when relevant tests ran and both the
-RuboCop and Brakeman statuses are 0. The lens may cite the Brakeman result as
-evidence.
+$SQUAD_DIR/review-correctness-task.txt. Tell Advisor to inspect the change
+against the approved acceptance criteria, the Coder's test report, and the
+mandatory RuboCop and Brakeman results, and to cover correctness, data
+integrity, tests, compatibility, performance, and the project's own conventions.
+Report findings only. A pass verdict is allowed only when relevant tests ran and
+both the RuboCop and Brakeman statuses are 0. The lens may cite the Brakeman
+result as evidence.
+
+Scope the task from review_mode, as described above:
+
+- review_mode=full - all uncommitted changes.
+- review_mode=delta - the contents of delta_file, PLUS the CORRECTNESS must_fix
+  findings from last round, PLUS the changed_files_file path. Say in the task
+  text that the delta is the primary scope and not a blindfold: Advisor may and
+  should read the surrounding files and the earlier change whenever the delta
+  does not make sense alone.
 
 The task file must carry a "Files to read before reviewing" section, and that
 section must name $SQUAD_DIR/checklist.correctness.md as a file Advisor MUST
 read before reviewing. Reading it is not optional and it is not summarised for
-Advisor by you. Never name checklist.security.md or checklist.merged.md here.
+Advisor by you. In a delta round that section also names delta_file and
+changed_files_file. Never name checklist.security.md or checklist.merged.md
+here, and never the security lens's findings.
 
 Open this task file with the output contract above; the contract stays FIRST in
 the file, ahead of the files-to-read section and everything else. Then run:
@@ -3363,10 +3646,17 @@ the file, ahead of the files-to-read section and everything else. Then run:
 Run this when review-scope.txt says security=run and you are not carrying the
 lens forward. It runs even when the correctness lens returned must_fix, and its
 outcome never depends on the correctness lens's. Write an English request to
-$SQUAD_DIR/review-security-task.txt. Tell Advisor to inspect the same full
-uncommitted diff INDEPENDENTLY for authorization, tenant and user isolation,
-input validation, injection, information disclosure, secret handling, and
-filesystem, shell and database risks. Report findings only.
+$SQUAD_DIR/review-security-task.txt. Tell Advisor to inspect the same change
+INDEPENDENTLY for authorization, tenant and user isolation, input validation,
+injection, information disclosure, secret handling, and filesystem, shell and
+database risks. Report findings only.
+
+Scope the task from review_mode exactly as the correctness lens does, from the
+SAME delta_file and the SAME changed_files_file - but with the SECURITY must_fix
+findings from last round, never the correctness ones. In a delta round say in
+the task text that the delta is the primary scope and not a blindfold: Advisor
+may and should read the surrounding files and the earlier change whenever the
+delta does not make sense alone.
 
 Tell it to READ $SQUAD_DIR/brakeman-result.txt and, when present,
 $SQUAD_DIR/brakeman-result.json as evidence - a passing Brakeman scan is a
@@ -3376,12 +3666,17 @@ tenant-isolation logic. Citing the Brakeman gate is allowed and expected.
 The task file must carry a "Files to read before reviewing" section, and that
 section must name $SQUAD_DIR/checklist.security.md as a file Advisor MUST read
 before reviewing. Reading it is not optional and it is not summarised for
-Advisor by you. Never name checklist.correctness.md or checklist.merged.md here.
+Advisor by you. In a delta round that section also names delta_file and
+changed_files_file. Never name checklist.correctness.md or checklist.merged.md
+here.
 
 This task text must NOT mention, quote, summarize or point at the CORRECTNESS
 result in any way, in this round or any earlier one. Write it as if the
-correctness lens had never run. The Brakeman gate is shared evidence and is not
-a lens, so referencing it does not break the independence of the two lenses.
+correctness lens had never run. That applies to the carried-over findings above
+with full force: a delta round hands each lens ONLY its own previous findings.
+The delta file itself is shared evidence, like the Brakeman gate, because it is
+the change - not a review of it. The Brakeman gate is shared evidence too, so
+referencing it does not break the independence of the two lenses.
 
 Open this task file with the output contract above; the contract stays FIRST in
 the file, ahead of the files-to-read section and everything else. Then run:
@@ -3443,6 +3738,9 @@ If merge-reviews fails it says so loudly and writes a must_fix aggregate. That
 means a lens result is missing or malformed: re-run that lens, and report it to
 PO if it keeps failing. Never hand-write the aggregate files to work around it.
 
+Once merge-reviews has run, capture the review baseline for this round (see
+above). Do it whatever the verdict was: the next round's delta starts here.
+
 ### When the review round cap is reached
 
 classify-diff reports final_round=yes on review round $REVIEW_MAX_ROUNDS, the
@@ -3485,22 +3783,25 @@ or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
 5. Read Coder status and structured verification report.
 6. Run the mandatory RuboCop helper and require status 0.
 7. Run the mandatory Brakeman helper and require status 0.
-8. Run classify-diff to get this round's scope and round number.
-9. Ask Advisor for the CORRECTNESS review of the full uncommitted diff and the
-   verification evidence, unless the scope file skips it or it is genuinely
-   carried forward. Record a skip or a carry with write-lens-result.
-10. Ask Advisor for the SECURITY review of the same full diff, independently,
-   under the same rule. It runs even when the correctness lens returned
-   must_fix, and its task text never mentions the correctness result.
+8. Run classify-diff to get this round's scope, round number and review_mode.
+9. Ask Advisor for the CORRECTNESS review at the scope review_mode gives - the
+   full diff in round 1, the delta plus that lens's own previous findings later
+   - unless the scope file skips it or it is genuinely carried forward. Record a
+   skip or a carry with write-lens-result.
+10. Ask Advisor for the SECURITY review of the same change, independently, under
+   the same rule. It runs even when the correctness lens returned must_fix, and
+   its task text never mentions the correctness result or its findings.
 11. Run merge-reviews to write the aggregate files for the GUI.
-12. If either lens status is non-zero, either lens verdict is must_fix, or
+12. Run capture-review-baseline for this round, so the next round can review
+   only what changes from here.
+13. If either lens status is non-zero, either lens verdict is must_fix, or
    RuboCop or Brakeman failed, ask Coder to fix the issues - UNLESS classify-diff
    reported final_round=yes, in which case mark and report to PO instead of
    starting another fix round. Pass the union of the findings from both lenses.
-13. After every fix, repeat from step 5.
-14. Report completion to PO in Japanese. Include the squad worktree path, branch,
+14. After every fix, repeat from step 5.
+15. Report completion to PO in Japanese. Include the squad worktree path, branch,
    test commands and results, the mandatory RuboCop and Brakeman results, and
-   any lens that was skipped or carried forward.
+   any lens that was skipped, carried forward, or reviewed at delta scope.
 PROMPT
 }
 
@@ -3623,6 +3924,16 @@ resume_run() {
   # recorded value wins over the environment, exactly as WAIT_TIMEOUT_SECONDS
   # does, so resuming never silently changes the cap the run started with.
   REVIEW_MAX_ROUNDS="${REVIEW_MAX_ROUNDS:-$SQUAD_REVIEW_MAX_ROUNDS_DEFAULT}"
+  # Drop the review baseline, so the FIRST review after a resume reads the FULL
+  # diff again.
+  #
+  # Deliberately by construction rather than by luck. A resumed Manager has lost
+  # the conversation it built its judgement in, and in a delta round it would be
+  # handed a small diff plus "the findings from last round" that it can no
+  # longer see. That is precisely where a delta review is weakest. It also
+  # covers the case where the working tree moved while the squad was closed. One
+  # extra full review per resume is a price worth paying; resumes are rare.
+  rm -f "$SQUAD_DIR/review-baseline.txt"
   # Regenerated on resume for the same reason the helpers are: a run created
   # before a schema existed gets it as soon as it is resumed.
   generate_schemas
