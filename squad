@@ -15,6 +15,7 @@ Usage: squad <task>
        squad rm <run-id>...
        squad clean
        squad base [--run <run-id>] [<ref>]
+       squad gen-helpers <dir>
 
 Create an isolated git worktree and split the current tmux pane into 3 AI agents:
   Manager (Claude Code) - left, talks to you
@@ -38,6 +39,30 @@ Diff base (what Squad Cockpit compares this squad against):
   squad base <ref>       Re-pin it to where this squad forked from <ref>.
   squad base --run <run-id> [<ref>]
                          Same, for a squad in another window.
+
+Inspection:
+  squad gen-helpers <dir>
+                         Write the generated helper scripts, schemas, checklist
+                         and Manager prompts into <dir> and exit. It launches
+                         nothing, so it is the way to inspect or test what a
+                         squad would generate.
+
+Environment:
+  SQUAD_REVIEW_MAX_ROUNDS   Hard cap on review -> fix -> review rounds. A
+                            positive integer; default 3. At the cap the Manager
+                            reports to you instead of starting another fix round.
+  SQUAD_WAIT_TIMEOUT_SECONDS
+                            Fallback timeout for waiting on an agent. A positive
+                            integer; default 7200.
+  SQUAD_REVIEW_CHECKLIST    Path to the shared review checklist. Falls back to
+                            VET_CHECKLIST, then ~/.vet/checklist.md, then the
+                            bundled _vet/checklist.md.
+  SQUAD_RUBOCOP_COMMAND     Override the detected RuboCop command.
+  SQUAD_BRAKEMAN_COMMAND    Override the detected Brakeman command.
+  SQUAD_STATE_ROOT          Where run state is kept. Default
+                            ~/.local/state/squad.
+  SQUAD_WORKTREE_ROOT       Where squad worktrees are created. Default
+                            ~/.local/share/squad/worktrees.
 EOF
   exit "$status"
 }
@@ -163,6 +188,9 @@ write_state() {
     # calling write_state. Without the default, set -u would abort the resume.
     printf 'BRAKEMAN_COMMAND=%q\n' "${BRAKEMAN_COMMAND:-}"
     printf 'WAIT_TIMEOUT_SECONDS=%q\n' "$WAIT_TIMEOUT_SECONDS"
+    # Defaulted for the same reason BRAKEMAN_COMMAND is: a run created before
+    # the review round cap existed has no such key in state.env.
+    printf 'REVIEW_MAX_ROUNDS=%q\n' "${REVIEW_MAX_ROUNDS:-$SQUAD_REVIEW_MAX_ROUNDS_DEFAULT}"
     printf 'WINDOW_ID=%q\n' "${WINDOW_ID:-}"
     printf 'CURRENT_WINDOW_NAME=%q\n' "${CURRENT_WINDOW_NAME:-}"
     # NON-AUTHORITATIVE. tmux assigns new pane IDs on every resume, so these are
@@ -564,6 +592,127 @@ There is no isolation from existing files; be careful not to destroy them."
   fi
 }
 
+# The hard cap on review -> fix -> review rounds. Without it the loop has no
+# bound at all: a finding the Coder cannot actually fix buys another full review
+# round, forever, and PO never hears about it.
+#
+# Same validation idiom as SQUAD_WAIT_TIMEOUT_SECONDS, deliberately: validated
+# before anything is created, message to stderr, exit 1.
+SQUAD_REVIEW_MAX_ROUNDS_DEFAULT=3
+resolve_review_max_rounds() {
+  REVIEW_MAX_ROUNDS="${SQUAD_REVIEW_MAX_ROUNDS:-$SQUAD_REVIEW_MAX_ROUNDS_DEFAULT}"
+  [[ "$REVIEW_MAX_ROUNDS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: SQUAD_REVIEW_MAX_ROUNDS must be a positive integer." >&2
+    exit 1
+  }
+}
+
+# gen-helpers writes about thirty FIXED filenames with plain redirection, and
+# redirection FOLLOWS a symlink that is already sitting at the target name. A
+# reused or hostile directory could therefore have squad overwrite any file the
+# caller can write, just by pre-placing helpers/run-coder as a symlink to it.
+#
+# The cheap fix, chosen over resolving every output path: the target must be a
+# directory this command can OWN - absent, or present and empty. One check
+# covers every output name at once, including names added later, and an empty
+# directory cannot contain a symlink to follow. `gen-helpers` is a developer
+# entry point that always wants a fresh directory anyway, so this costs nothing
+# real.
+require_own_gen_dir() {
+  local dir="$1"
+  if [[ -L "$dir" ]]; then
+    echo "Error: squad gen-helpers target is a symlink; refusing to write through it: $dir" >&2
+    exit 1
+  fi
+  [[ -e "$dir" ]] || return 0
+  [[ -d "$dir" ]] || {
+    echo "Error: squad gen-helpers target exists and is not a directory: $dir" >&2
+    exit 1
+  }
+  [[ -z "$(ls -A "$dir" 2>/dev/null)" ]] || {
+    echo "Error: squad gen-helpers target directory is not empty: $dir" >&2
+    echo "       It writes fixed filenames by redirection, which would follow any" >&2
+    echo "       symlink already sitting at one of them. Use a new or empty directory." >&2
+    exit 1
+  }
+}
+
+# --- Structured output schemas ------------------------------------------------
+# A function, not inline launch code, so `squad gen-helpers` writes exactly what
+# a launch writes. review-schema.json in particular is a CONTRACT with the
+# separate squad-cockpit repository: its five top-level keys and its
+# additionalProperties:false must not change from here.
+generate_schemas() {
+  mkdir -p "$SQUAD_DIR"
+
+  cat > "$SQUAD_DIR/plan-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": { "type": "string" },
+    "scope": { "type": "array", "items": { "type": "string" } },
+    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+    "files_to_inspect": { "type": "array", "items": { "type": "string" } },
+    "implementation_steps": { "type": "array", "items": { "type": "string" } },
+    "tests": { "type": "array", "items": { "type": "string" } },
+    "risks": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": [
+    "summary",
+    "scope",
+    "acceptance_criteria",
+    "files_to_inspect",
+    "implementation_steps",
+    "tests",
+    "risks"
+  ]
+}
+SCHEMA
+
+  cat > "$SQUAD_DIR/coder-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": { "type": "string" },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "tests_run": { "type": "array", "items": { "type": "string" } },
+    "tests_not_run": { "type": "array", "items": { "type": "string" } },
+    "test_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+    "rubocop_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+    "brakeman_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+    "remaining_issues": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": [
+    "summary",
+    "changed_files",
+    "tests_run",
+    "tests_not_run",
+    "test_status",
+    "rubocop_status",
+    "brakeman_status",
+    "remaining_issues"
+  ]
+}
+SCHEMA
+
+  cat > "$SQUAD_DIR/review-schema.json" <<'SCHEMA'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "type": "string", "enum": ["pass", "must_fix"] },
+    "summary": { "type": "string" },
+    "must_fix": { "type": "array", "items": { "type": "string" } },
+    "should_fix": { "type": "array", "items": { "type": "string" } },
+    "test_gaps": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["verdict", "summary", "must_fix", "should_fix", "test_gaps"]
+}
+SCHEMA
+}
+
 # --- Review checklist ---------------------------------------------------------
 # The review lenses both Advisor reviews look through. Same file format, same
 # lookup order and same merge semantics as vet, so a project that already tunes
@@ -608,6 +757,61 @@ require_readable_checklist_config() {
     }
     return 0
   done
+}
+
+# Which checklist items a single lens sees, as a jq filter over checklist.json.
+#
+# The split is by ID PREFIX - the part of `- [ID] question` before the first
+# "-" - because that prefix is the only structure the shared _vet/checklist.md
+# format guarantees. Three groups, decided from the IDs the merged file really
+# contains:
+#
+#   correctness only  COR, ARCH, TEST, PERF
+#   security only     SEC
+#   BOTH lenses       DAT (data integrity), ERR (error and information
+#                     handling), COMPAT (compatibility) - each genuinely serves
+#                     both lenses - and every other prefix, known or not.
+#
+# The two "only" sets are DISJOINT, so every item in checklist.merged.md lands
+# in at least one derived file. An unrecognised prefix (a project's own ID) goes
+# to both rather than disappearing from the review altogether.
+# shellcheck disable=SC2016  # $lens is a jq variable, bound with --arg below.
+LENS_CHECKLIST_SELECT='
+  def lens_prefix: (.id | split("-") | .[0]);
+  .items[]
+  | select(
+      lens_prefix as $p
+      | if $lens == "security"
+        then ($p != "COR" and $p != "ARCH" and $p != "TEST" and $p != "PERF")
+        else ($p != "SEC")
+        end
+    )
+'
+
+# One derived per-lens checklist file, in the same `- [ID] question` shape as
+# checklist.merged.md so it stays readable and re-parseable. The Manager
+# references this file by path; it never pastes the list into a task file.
+write_lens_checklist() {
+  local lens="$1" out="$2" count=0
+  if command -v jq >/dev/null 2>&1; then
+    count="$(
+      jq -r --arg lens "$lens" "[$LENS_CHECKLIST_SELECT] | length" \
+        "$SQUAD_DIR/checklist.json" 2>/dev/null || true
+    )"
+  fi
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  {
+    printf '# Review lenses for the %s review\n\n' "$lens"
+    printf 'Derived from checklist.merged.md by item ID prefix.\n'
+    printf 'Items: %s\n\n' "$count"
+    if [[ "$count" -eq 0 ]]; then
+      printf '(no checklist items)\n'
+    else
+      jq -r --arg lens "$lens" \
+        "$LENS_CHECKLIST_SELECT"' | "- [\(.id)] \(.text)  <!-- source: \(.source) -->"' \
+        "$SQUAD_DIR/checklist.json"
+    fi
+  } > "$out"
 }
 
 generate_review_checklist() {
@@ -742,6 +946,13 @@ generate_review_checklist() {
       jq -r '.items[] | "- [\(.id)] \(.text)  <!-- source: \(.source) -->"' "$SQUAD_DIR/checklist.json"
     fi
   } > "$SQUAD_DIR/checklist.merged.md"
+
+  # The merged file STAYS: it is the audit record of what was in force, and
+  # squad-cockpit reads it. What changed is that the review tasks no longer
+  # paste it - they reference one of these two derived files instead, which is
+  # roughly half the lines each and is read once per lens instead of twice.
+  write_lens_checklist correctness "$SQUAD_DIR/checklist.correctness.md"
+  write_lens_checklist security "$SQUAD_DIR/checklist.security.md"
 }
 
 # --- Generated helper scripts -------------------------------------------------
@@ -1674,6 +1885,524 @@ log ">>> Advisor $LENS review finished."
 HELPER
   chmod +x "$SQUAD_DIR/run-review"
 
+  # classify-diff answers the two questions the review phase needs BEFORE it
+  # spends a token: which lenses this diff actually needs, and which review round
+  # this is. One helper, because both answers are wanted at the same moment.
+  #
+  # THE SKIP RULE, in one sentence - the same sentence the Manager prompt
+  # states, deliberately duplicated so the rule cannot drift between the code
+  # that applies it and the prompt that explains it:
+  #
+  #   A review lens is skipped ONLY when every path the change touches - both
+  #   sides of a rename, and deletions too - is either a non-executable media
+  #   file or a non-executable documentation file whose content this classifier
+  #   read in full and found free of active content; anything else - executable
+  #   code and any file git records as executable whatever its name, a document
+  #   carrying a script, an embed, an event-handler attribute, a javascript: or
+  #   data: URL, a leading shebang or an evaluable source block, a document too
+  #   large, binary, deleted or unreadable to vouch for, shell scripts, config,
+  #   dependency and lock files, CI definitions, env samples, database, migration
+  #   and schema files, routes and API definitions, templates and views,
+  #   generated runtime artifacts, symlinks and submodules, and any extension the
+  #   classifier does not recognise - runs it.
+  #
+  # Fail-safe in both directions: an unrecognised extension RUNS the lenses, and
+  # a path list that cannot be computed is an ERROR rather than an empty list -
+  # an empty list would read as "documentation only" and would silently skip the
+  # security lens on a change nobody ever classified.
+  cat > "$SQUAD_DIR/classify-diff" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# THE SKIP RULE, in one sentence. The Manager prompt states the same sentence,
+# and the two must not drift apart:
+#
+# A review lens is skipped ONLY when every path the change touches - both
+# sides of a rename, and deletions too - is either a non-executable media
+# file or a non-executable documentation file whose content this classifier
+# read in full and found free of active content; anything else - executable
+# code and any file git records as executable whatever its name, a document
+# carrying a script, an embed, an event-handler attribute, a javascript: or
+# data: URL, a leading shebang or an evaluable source block, a document too
+# large, binary, deleted or unreadable to vouch for, shell scripts, config,
+# dependency and lock files, CI definitions, env samples, database, migration
+# and schema files, routes and API definitions, templates and views,
+# generated runtime artifacts, symlinks and submodules, and any extension the
+# classifier does not recognise - runs it.
+
+if [[ $# -ne 4 ]]; then
+  printf 'Usage: classify-diff <workdir> <scope-file> <round-file> <max-rounds>\n' >&2
+  exit 2
+fi
+
+WORKDIR="$1"
+SCOPE_FILE="$2"
+ROUND_FILE="$3"
+MAX_ROUNDS="$4"
+
+[[ "$MAX_ROUNDS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'classify-diff: ERROR: max-rounds must be a positive integer: %s\n' "$MAX_ROUNDS" >&2
+  exit 2
+}
+[[ -d "$WORKDIR" ]] || {
+  printf 'classify-diff: ERROR: not a directory: %s\n' "$WORKDIR" >&2
+  exit 2
+}
+
+# Clear the scope file FIRST, before anything can fail.
+#
+# This helper runs once per round, so by round 2 a scope file from the previous
+# round is already sitting there. If the classification below fails, an absent
+# scope file is the honest answer; last round's decision is not. Leaving a stale
+# "docs-only / skip" behind for the Manager to read would turn a diff nobody
+# managed to classify into one that looks like a decided skip - the same
+# unreviewed-change-looks-reviewed failure as before, reached through the error
+# path instead of the happy one.
+rm -f "$SCOPE_FILE"
+
+# The path list is EVIDENCE, so a git failure stops here with a non-zero status
+# and no scope file.
+#
+# Staged changes are listed as well as unstaged ones: the review covers the
+# whole uncommitted diff, and a staged .rb file behind an unstaged README edit
+# must never be able to look like a docs-only round.
+#
+# Three deliberate choices about HOW the diff is listed, each of which closed a
+# real hole in an earlier version of this helper:
+#
+#   * NO --diff-filter. Filtering to ACMRT silently drops D, so a round that
+#     DELETED app.rb while editing README.md classified as documentation-only
+#     and skipped both lenses. Deleting code changes behaviour like any edit.
+#   * --no-renames. With rename detection git reports only the DESTINATION
+#     path, so renaming app.rb to docs/app.md looked like a single docs path.
+#     Turning detection off splits a rename into a delete of the old path plus
+#     an add of the new one, so BOTH sides reach the classifier.
+#   * --raw, not --name-only, because --raw carries the FILE MODES. An
+#     executable file is code no matter what it is called, and git records 100755
+#     for it; an added runbook.md with a shebang is not documentation.
+#
+# core.quotePath=false keeps a non-ASCII path readable rather than \nnn-escaped.
+git_out() {
+  local label="$1"
+  shift
+  if ! git -c core.quotePath=false -C "$WORKDIR" "$@"; then
+    printf 'classify-diff: ERROR: could not list %s in %s\n' "$label" "$WORKDIR" >&2
+    return 70
+  fi
+}
+
+UNSTAGED_RAW="$(git_out 'unstaged changes' diff --raw --no-renames)" || exit 70
+STAGED_RAW="$(git_out 'staged changes' diff --cached --raw --no-renames)" || exit 70
+UNTRACKED="$(git_out 'untracked files' ls-files --others --exclude-standard)" || exit 70
+
+# One "<mode> <path>" record per SIDE of every change. A git raw line reads
+#
+#   :100644 100755 <sha> <sha> M<TAB>path
+#
+# where the two modes are the file before and after the change; 000000 means the
+# file does not exist on that side and carries no information. A line with no
+# informative mode at all - an unmerged path, which git reports as 000000/000000
+# - still gets a record, with an unknown mode, so it can never be classified by
+# its name alone.
+RECORDS="$(
+  {
+    printf '%s\n%s\n' "$UNSTAGED_RAW" "$STAGED_RAW" |
+      while IFS= read -r raw; do
+        [[ "$raw" == :* ]] || continue
+        meta="${raw%%$'\t'*}"
+        raw_path="${raw#*$'\t'}"
+        read -r src_mode dst_mode _ <<< "${meta#:}"
+        emitted=0
+        for side_mode in "$src_mode" "$dst_mode"; do
+          [[ "$side_mode" != "000000" ]] || continue
+          printf '%s %s\n' "$side_mode" "$raw_path"
+          emitted=1
+        done
+        [[ "$emitted" -eq 1 ]] || printf 'unknown %s\n' "$raw_path"
+      done
+    # Untracked files have no git record yet, so the mode comes from the
+    # filesystem instead - same three cases, same meanings.
+    while IFS= read -r other_path; do
+      [[ -n "$other_path" ]] || continue
+      if [[ -L "$WORKDIR/$other_path" ]]; then
+        printf '120000 %s\n' "$other_path"
+      elif [[ -x "$WORKDIR/$other_path" ]]; then
+        printf '100755 %s\n' "$other_path"
+      else
+        printf '100644 %s\n' "$other_path"
+      fi
+    done <<< "$UNTRACKED"
+  } | sort -u
+)"
+
+# How much document this helper will read before it gives up and calls the file
+# code. One number, not two, because a partial read is the worst of both: it
+# costs the I/O and still cannot vouch for the tail. A document over the bound
+# is not read at all and classifies as CODE. 1 MiB is far above any real
+# markdown or org file and far below anything that would slow a diff of
+# hundreds of documents down.
+SNIFF_MAX_BYTES=1048576
+
+# What "active content" means inside a document, as one case-insensitive ERE.
+#
+# Each alternative is something that EXECUTES or PULLS IN content when the
+# document is rendered, exported or served - not merely something that looks
+# like code. A fenced shell example is documentation; an <iframe> is not.
+#
+#   <script <iframe <object <embed <applet   HTML elements that run or embed
+#   <svg                                     inline SVG carries the same DOM
+#                                            that got .svg removed from the list
+#   javascript: data:text/html               URL schemes that execute
+#   on<name>=                                an HTML event-handler attribute.
+#                                            Anchored to a preceding boundary so
+#                                            that "configuration=" and
+#                                            "monitoring=" do NOT match; without
+#                                            that anchor any word containing
+#                                            "on" before an "=" would fire, and
+#                                            a false positive costs a whole
+#                                            two-lens round.
+#   #+begin_src #+begin_export #+call:       org-babel evaluates these on export
+#   #+include: #+setupfile:                  org pulls in another file
+#   .. raw:: .. include::                    reStructuredText passthrough and
+#                                            file inclusion
+#   include:: pass:[                         AsciiDoc inclusion and passthrough
+#
+# A shebang is handled separately below, because position matters for it.
+DOC_ACTIVE_CONTENT_RE='<script|<iframe|<object|<embed|<applet|<svg|javascript:|data:text/html|(^|[[:space:]>"'"'"'/])on[a-z][a-z0-9]*[[:space:]]*=|^[[:space:]]*#\+(begin_src|begin_export|call:|include:|setupfile:)|^[[:space:]]*\.\.[[:space:]]+(raw|include)::|^include::|pass:\['
+
+# Does this documentation file carry active content?
+#
+# Returns 0 - meaning "treat it as code" - when it does, AND whenever the
+# question cannot be answered at all. Every failure mode here resolves the same
+# way, because a document this helper could not read is a document it cannot
+# vouch for, and "could not check" must never come out as "documentation".
+#
+# The file is read AS IT IS AFTER THE CHANGE, from the worktree. A file DELETED
+# by this diff therefore has nothing to read and lands in the unreadable case.
+doc_carries_active_content() {
+  local path="$1"
+  local full="$WORKDIR/$path"
+  local size nonnul
+
+  # Not a plain readable file - deleted by this diff, a symlink, a directory, or
+  # unreadable. No content to vouch for.
+  [[ -f "$full" && -r "$full" && ! -L "$full" ]] || return 0
+
+  size="$(wc -c < "$full" 2>/dev/null || true)"
+  size="${size//[[:space:]]/}"
+  [[ "$size" =~ ^[0-9]+$ ]] || return 0
+  [[ "$size" -le "$SNIFF_MAX_BYTES" ]] || return 0
+
+  # Binary content is not documentation, and a text pattern scan over it means
+  # nothing. A NUL byte anywhere is the practical test, and it is why media is
+  # never routed through this function.
+  nonnul="$(LC_ALL=C tr -d '\000' < "$full" 2>/dev/null | wc -c || true)"
+  nonnul="${nonnul//[[:space:]]/}"
+  [[ "$nonnul" =~ ^[0-9]+$ ]] || return 0
+  [[ "$size" -eq "$nonnul" ]] || return 0
+
+  # A shebang counts on the FIRST LINE only - byte 0 is the one position where
+  # it makes the file runnable. Further down it is a code sample in a tutorial,
+  # and a file that is actually executable was already caught by the 100755
+  # mode gate in is_docs_or_media.
+  [[ "$(head -c 2 "$full" 2>/dev/null || true)" != '#!' ]] || return 0
+
+  if LC_ALL=C grep -qiE "$DOC_ACTIVE_CONTENT_RE" -- "$full" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# Documentation and media ONLY, and only for an ordinary non-executable file.
+# Everything else - including every extension not named here - is code as far as
+# this classifier is concerned.
+is_docs_or_media() {
+  local mode="$1" path="$2" base ext
+
+  # MODE FIRST, before the name is even looked at. An executable file is code
+  # however it is named, and so is a symlink (120000) or a submodule (160000),
+  # whose real content this classifier cannot see. Only a plain 100644 file can
+  # go on to be judged by its extension.
+  [[ "$mode" == "100644" ]] || return 1
+
+  base="${path##*/}"
+
+  # Names that look like documentation by extension but are dependency or build
+  # inputs. Checked FIRST so they never reach the docs list below.
+  case "$base" in
+    requirements*.txt|constraints*.txt|CMakeLists.txt) return 1 ;;
+  esac
+
+  ext=""
+  [[ "$base" == *.* ]] && ext="${base##*.}"
+  ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+
+  # The test every entry below has to pass: can this format carry executable or
+  # active content BY SPECIFICATION? If it can, it is code, not documentation.
+  # Five extensions failed that test outright and are deliberately NOT here:
+  #
+  #   mdx      compiled as a JavaScript module - JSX and imports execute
+  #   svg      an XML DOM that may carry <script>, event handlers, foreignObject
+  #   pdf      supports embedded JavaScript actions
+  #   ai       a PDF/PostScript container, so it inherits the same
+  #   html/htm  never listed, and must not be
+  #
+  # Text markup (md, rst, adoc, org, txt) stays on the list, but its EXTENSION
+  # IS NO LONGER SUFFICIENT: all of it permits raw HTML, and org evaluates
+  # source blocks on export under common configurations. So the content decides,
+  # via doc_carries_active_content below. Removing these extensions instead
+  # would have deleted the documentation-only case rather than tightened it.
+  case "$ext" in
+    md|markdown|rst|adoc|asciidoc|org|txt|text)
+      if doc_carries_active_content "$path"; then
+        return 1
+      fi
+      return 0
+      ;;
+    # MEDIA is judged by extension alone, and is deliberately NOT sniffed. These
+    # formats have no script engine, so there is no active content to find; the
+    # ones that DO have one - svg, pdf, ai - are absent from this list entirely.
+    # A binary-content test would also reject every one of them out of hand.
+    png|jpg|jpeg|gif|bmp|tif|tiff|ico|webp|avif|heic) return 0 ;;
+    mp3|wav|ogg|flac|m4a|mp4|mov|webm|avi|mkv) return 0 ;;
+    psd|sketch|fig) return 0 ;;
+  esac
+  case "$base" in
+    LICENSE|LICENCE|COPYING|NOTICE|AUTHORS|CONTRIBUTORS|README|CHANGELOG|CHANGES|CONTRIBUTING)
+      # Extensionless prose, sniffed on exactly the same terms as .md.
+      if doc_carries_active_content "$path"; then
+        return 1
+      fi
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# A PATH is code when ANY record for it is code. A file renamed from app.rb to
+# docs/app.md contributes a record for each side, and the .rb side alone is
+# enough to run the lenses.
+ALL_PATHS=""
+CODE_PATHS=""
+while IFS=' ' read -r record_mode record_path; do
+  [[ -n "$record_path" ]] || continue
+  ALL_PATHS="$ALL_PATHS$record_path"$'\n'
+  is_docs_or_media "$record_mode" "$record_path" ||
+    CODE_PATHS="$CODE_PATHS$record_path"$'\n'
+done <<< "$RECORDS"
+
+count_paths() {
+  printf '%s' "$1" | sed '/^[[:space:]]*$/d' | sort -u | wc -l | tr -d '[:space:]'
+}
+
+TOTAL="$(count_paths "$ALL_PATHS")"
+CODE="$(count_paths "$CODE_PATHS")"
+DOCS=$((TOTAL - CODE))
+FIRST_CODE_PATH="$(
+  printf '%s' "$CODE_PATHS" | sed '/^[[:space:]]*$/d' | sort -u | head -n 1
+)"
+
+if [[ "$TOTAL" -eq 0 ]]; then
+  # NOT "docs only": nothing was classified at all. Running both lenses is the
+  # fail-safe answer, and an empty diff is itself something PO needs to hear.
+  SCOPE="no-changes"
+  CORRECTNESS="run"
+  SECURITY="run"
+elif [[ "$CODE" -eq 0 ]]; then
+  SCOPE="docs-only"
+  CORRECTNESS="skip"
+  SECURITY="skip"
+else
+  SCOPE="code"
+  CORRECTNESS="run"
+  SECURITY="run"
+fi
+
+# The round counter lives in a file, not in the Manager's head, so the hard cap
+# survives a compaction or a resume.
+ROUND=0
+if [[ -s "$ROUND_FILE" ]]; then
+  ROUND="$(head -n 1 "$ROUND_FILE" | tr -d '[:space:]')"
+  [[ "$ROUND" =~ ^[0-9]+$ ]] || ROUND=0
+fi
+ROUND=$((ROUND + 1))
+printf '%s\n' "$ROUND" > "$ROUND_FILE"
+
+if [[ "$ROUND" -ge "$MAX_ROUNDS" ]]; then
+  FINAL_ROUND="yes"
+else
+  FINAL_ROUND="no"
+fi
+
+# Written to a temp file and renamed into place, so the Manager can only ever
+# read a COMPLETE scope file. A half-written one - a full disk, a killed pane -
+# could be missing the very line that says a lens must run.
+SCOPE_TMP="$(mktemp "${SCOPE_FILE}.XXXXXX")"
+trap 'rm -f "$SCOPE_TMP"' EXIT
+{
+  printf 'round=%s\n' "$ROUND"
+  printf 'max_rounds=%s\n' "$MAX_ROUNDS"
+  printf 'final_round=%s\n' "$FINAL_ROUND"
+  printf 'scope=%s\n' "$SCOPE"
+  printf 'correctness=%s\n' "$CORRECTNESS"
+  printf 'security=%s\n' "$SECURITY"
+  printf 'paths=%s\n' "$TOTAL"
+  printf 'docs_paths=%s\n' "$DOCS"
+  printf 'first_code_path=%s\n' "$FIRST_CODE_PATH"
+} > "$SCOPE_TMP"
+mv "$SCOPE_TMP" "$SCOPE_FILE"
+trap - EXIT
+
+# Human-readable line for the pane, so PO can see the decision without opening
+# the scope file.
+case "$SCOPE" in
+  docs-only)
+    printf 'classify-diff: round %s/%s - %s changed paths, all documentation or media: both lenses may be skipped.\n' \
+      "$ROUND" "$MAX_ROUNDS" "$TOTAL"
+    ;;
+  no-changes)
+    printf 'classify-diff: round %s/%s - NO changed paths were found; both lenses run, and the empty diff itself needs reporting.\n' \
+      "$ROUND" "$MAX_ROUNDS"
+    ;;
+  *)
+    printf 'classify-diff: round %s/%s - %s changed paths, %s of them documentation or media; both lenses run (first non-docs path: %s).\n' \
+      "$ROUND" "$MAX_ROUNDS" "$TOTAL" "$DOCS" "$FIRST_CODE_PATH"
+    ;;
+esac
+if [[ "$FINAL_ROUND" == "yes" ]]; then
+  printf 'classify-diff: this is the LAST review round allowed by SQUAD_REVIEW_MAX_ROUNDS (%s). Report to PO instead of starting another fix round.\n' \
+    "$MAX_ROUNDS"
+fi
+HELPER
+  chmod +x "$SQUAD_DIR/classify-diff"
+
+  # write-lens-result produces the schema-valid result file for a lens that did
+  # NOT run this round: skipped by the scope rule, or carried forward from an
+  # earlier clean pass. It exists so the Manager can never hand-write one - a
+  # hand-written pass is exactly the silent pass merge-reviews is built to
+  # refuse - and so the "carried forward" claim is CHECKED against the previous
+  # result rather than trusted.
+  cat > "$SQUAD_DIR/write-lens-result" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 6 ]]; then
+  printf 'Usage: write-lens-result <lens> skipped <result-file> <status-file> <round> <reason>\n' >&2
+  printf '       write-lens-result <lens> carried <result-file> <status-file> <round> <from-round>\n' >&2
+  exit 2
+fi
+
+LENS="$1"
+KIND="$2"
+RESULT_FILE="$3"
+STATUS_FILE="$4"
+ROUND="$5"
+DETAIL="$6"
+
+command -v jq >/dev/null 2>&1 || {
+  printf 'write-lens-result: ERROR: jq is required.\n' >&2
+  exit 2
+}
+
+case "$LENS" in
+  correctness|security) ;;
+  *)
+    printf 'write-lens-result: ERROR: lens must be correctness or security: %s\n' "$LENS" >&2
+    exit 2
+    ;;
+esac
+
+[[ "$ROUND" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'write-lens-result: ERROR: round must be a positive integer: %s\n' "$ROUND" >&2
+  exit 2
+}
+
+case "$KIND" in
+  skipped)
+    [[ -n "$DETAIL" ]] || {
+      printf 'write-lens-result: ERROR: a skipped lens needs a reason.\n' >&2
+      exit 2
+    }
+    jq -n --arg lens "$LENS" --arg round "$ROUND" --arg reason "$DETAIL" '
+      {
+        verdict: "pass",
+        summary: ("SKIPPED: the " + $lens + " lens did not run in review round " + $round + ". Reason: " + $reason),
+        must_fix: [],
+        should_fix: [],
+        test_gaps: []
+      }' > "$RESULT_FILE"
+    printf 'write-lens-result: %s lens recorded as SKIPPED in round %s (%s).\n' "$LENS" "$ROUND" "$DETAIL"
+    ;;
+  carried)
+    [[ "$DETAIL" =~ ^[1-9][0-9]*$ ]] || {
+      printf 'write-lens-result: ERROR: a carried lens needs the round it is carried FROM: %s\n' "$DETAIL" >&2
+      exit 2
+    }
+    [[ -s "$RESULT_FILE" ]] || {
+      printf 'write-lens-result: ERROR: there is no previous %s result to carry forward: %s\n' "$LENS" "$RESULT_FILE" >&2
+      exit 3
+    }
+    # The previous STATUS, not just the previous result. A lens run can emit
+    # pass-shaped JSON and still exit non-zero - the runner died after writing
+    # the result, the schema check failed downstream, the pane was killed - and
+    # carrying that forward would turn a FAILED lens into a clean pass and let
+    # merge-reviews aggregate it as status 0. A non-zero previous status is
+    # never carryable; re-run the lens.
+    [[ -s "$STATUS_FILE" ]] || {
+      printf 'write-lens-result: ERROR: there is no previous %s status to carry forward: %s\n' "$LENS" "$STATUS_FILE" >&2
+      exit 3
+    }
+    PREVIOUS_STATUS="$(head -n 1 "$STATUS_FILE" | tr -d '[:space:]')"
+    # Exactly "0". Anything else - a non-zero code, or a status file that does
+    # not hold an exit code at all - is refused rather than interpreted.
+    [[ "$PREVIOUS_STATUS" == "0" ]] || {
+      printf 'write-lens-result: ERROR: the previous %s lens run exited [%s], not 0, so it cannot be carried forward. Re-run the lens: %s\n' \
+        "$LENS" "$PREVIOUS_STATUS" "$STATUS_FILE" >&2
+      exit 3
+    }
+    # A carry-forward is legal ONLY on top of a clean pass this lens really
+    # produced. Re-checked here, never trusted: this is what stops "carried
+    # forward" from inventing a pass that never happened, and it refuses to
+    # carry a SKIP forward, which would be a review nobody ever ran.
+    jq -s -e '
+      length == 1
+      and (.[0] | type == "object")
+      and (.[0] | keys == ["must_fix","should_fix","summary","test_gaps","verdict"])
+      and (.[0].verdict == "pass")
+      and ((.[0].must_fix | length) == 0)
+      and ((.[0].summary | startswith("SKIPPED:")) | not)
+    ' "$RESULT_FILE" >/dev/null 2>&1 || {
+      printf 'write-lens-result: ERROR: the previous %s result is not a clean pass this lens produced, so it cannot be carried forward. Re-run the lens: %s\n' \
+        "$LENS" "$RESULT_FILE" >&2
+      exit 3
+    }
+    CARRIED_TMP="$(mktemp "${RESULT_FILE}.carried.XXXXXX")"
+    trap 'rm -f "$CARRIED_TMP"' EXIT
+    # An earlier carry marker is stripped before the new one is added, so a lens
+    # carried twice says which round it was LAST reviewed in, not a chain.
+    jq -s --arg from "$DETAIL" --arg round "$ROUND" '
+      .[0]
+      | .summary = (.summary | sub("^CARRIED FORWARD from round [0-9]+ into round [0-9]+: "; ""))
+      | .summary = ("CARRIED FORWARD from round " + $from + " into round " + $round + ": " + .summary)
+    ' "$RESULT_FILE" > "$CARRIED_TMP"
+    [[ -s "$CARRIED_TMP" ]] || {
+      printf 'write-lens-result: ERROR: could not rewrite the %s result.\n' "$LENS" >&2
+      exit 3
+    }
+    mv "$CARRIED_TMP" "$RESULT_FILE"
+    trap - EXIT
+    printf 'write-lens-result: %s lens CARRIED FORWARD from round %s into round %s.\n' "$LENS" "$DETAIL" "$ROUND"
+    ;;
+  *)
+    printf 'write-lens-result: ERROR: kind must be skipped or carried: %s\n' "$KIND" >&2
+    exit 2
+    ;;
+esac
+
+printf '0\n' > "$STATUS_FILE"
+HELPER
+  chmod +x "$SQUAD_DIR/write-lens-result"
+
   # merge-reviews folds the two independent lens results into the single
   # review-result.txt / review-status.txt pair that squad-cockpit reads. The GUI
   # lives in another repository and cannot be changed from here, so those two
@@ -1682,6 +2411,14 @@ HELPER
   # The Manager still gates on the two lens files directly. This aggregate is
   # for the GUI, and it is deterministic on purpose: no agent, no tmux event, no
   # run-wait - the Manager runs it synchronously in its own pane.
+  #
+  # A lens that was SKIPPED by the scope rule or CARRIED FORWARD from an earlier
+  # clean pass arrives here as an ordinary schema-valid result, because
+  # review-schema.json has no room for a new key and the GUI would reject one.
+  # What keeps it from reading like a fresh pass is the marker write-lens-result
+  # stamps into the lens summary, which this helper detects and states in the
+  # aggregate summary. That marker is the ONLY channel for it - do not add a
+  # sixth top-level key.
   cat > "$SQUAD_DIR/merge-reviews" <<'HELPER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1803,15 +2540,55 @@ fi
 
 # must_fix if EITHER lens says must_fix; the arrays are the union of both, each
 # finding tagged with the lens that found it.
+#
+# A lens STATUS is part of the verdict, not just of the aggregate exit code. A
+# lens can write pass-shaped JSON and still exit non-zero - the runner died
+# after writing the result, the pane went away, the schema check failed
+# downstream - and reading only the two JSON verdicts published `verdict: pass`
+# for a lens run that never completed. Anything keying off this file, the squad
+# GUI included, saw a clean pass. A non-zero status now forces must_fix, adds a
+# finding naming the lens and its status, and opens the summary by saying the
+# run FAILED rather than implying it reviewed and approved anything. No new
+# schema key: the five keys and additionalProperties:false are a contract.
+#
+# A lens that did not run fresh this round is named in the summary too, so a
+# skipped or carried lens can never be mistaken for an ordinary pass either.
+# Both banner lines are omitted when both lenses ran fresh and clean, which
+# keeps the ordinary aggregate byte-for-byte what it always was.
 jq -n \
   --slurpfile correctness "$CORRECTNESS_RESULT" \
-  --slurpfile security "$SECURITY_RESULT" '
+  --slurpfile security "$SECURITY_RESULT" \
+  --argjson correctness_rc "$CORRECTNESS_RC" \
+  --argjson security_rc "$SECURITY_RC" '
   ($correctness[0]) as $c |
   ($security[0]) as $s |
+  def lens_state:
+    if startswith("SKIPPED:") then "SKIPPED"
+    elif test("^CARRIED FORWARD from round [0-9]+ into round [0-9]+:") then
+      "CARRIED FORWARD from round " +
+        (capture("^CARRIED FORWARD from round (?<from>[0-9]+) into round").from)
+    else "FRESH"
+    end;
+  ($c.summary | lens_state) as $cstate |
+  ($s.summary | lens_state) as $sstate |
+  (if $cstate == "FRESH" and $sstate == "FRESH" then ""
+   else "[lens states] correctness: " + $cstate + "; security: " + $sstate + "\n\n"
+   end) as $states |
+  ([ (if $correctness_rc != 0 then {lens: "correctness", rc: $correctness_rc} else empty end),
+     (if $security_rc != 0 then {lens: "security", rc: $security_rc} else empty end) ]) as $failed |
+  ($failed | map("[" + .lens + "] LENS RUN FAILED with status " + (.rc | tostring) +
+                 ": this lens did not complete, so it reviewed nothing. Re-run it."))
+    as $failure_findings |
+  (if ($failed | length) == 0 then ""
+   else "[lens run FAILED] " + ($failed | map(.lens + " status " + (.rc | tostring)) | join("; ")) +
+        ". The verdict below is must_fix because a lens did not complete, NOT because it" +
+        " reviewed and approved anything.\n\n"
+   end) as $failure_banner |
   {
-    verdict: (if $c.verdict == "must_fix" or $s.verdict == "must_fix" then "must_fix" else "pass" end),
-    summary: ("[correctness] " + $c.summary + "\n\n[security] " + $s.summary),
-    must_fix: (($c.must_fix | map("[correctness] " + .)) + ($s.must_fix | map("[security] " + .))),
+    verdict: (if ($failed | length) > 0 or $c.verdict == "must_fix" or $s.verdict == "must_fix"
+              then "must_fix" else "pass" end),
+    summary: ($failure_banner + $states + "[correctness] " + $c.summary + "\n\n[security] " + $s.summary),
+    must_fix: ($failure_findings + ($c.must_fix | map("[correctness] " + .)) + ($s.must_fix | map("[security] " + .))),
     should_fix: (($c.should_fix | map("[correctness] " + .)) + ($s.should_fix | map("[security] " + .))),
     test_gaps: (($c.test_gaps | map("[correctness] " + .)) + ($s.test_gaps | map("[security] " + .)))
   }' > "$OUT_RESULT" || fail "could not merge the two lens results"
@@ -1822,6 +2599,10 @@ printf '%s\n' "$AGGREGATE_RC" > "$OUT_STATUS"
 printf 'merge-reviews: correctness status %s, security status %s -> aggregate status %s\n' \
   "$CORRECTNESS_RC" "$SECURITY_RC" "$AGGREGATE_RC"
 printf 'merge-reviews: aggregate verdict %s\n' "$(jq -r '.verdict' "$OUT_RESULT")"
+LENS_STATES="$(
+  jq -r '.summary | split("\n")[0] | select(startswith("[lens states]"))' "$OUT_RESULT" 2>/dev/null || true
+)"
+[[ -z "$LENS_STATES" ]] || printf 'merge-reviews: %s\n' "$LENS_STATES"
 # Exit 0 because the MERGE succeeded. The lens outcome lives in the status file,
 # never in this helper's exit code.
 HELPER
@@ -2206,6 +2987,7 @@ Speak Japanese to PO (user). Write English for agents.
 - Manager session ID: $MANAGER_SESSION_ID
 - Coder session ID: $CODER_SESSION_ID
 - Wait timeout: $WAIT_TIMEOUT_SECONDS seconds
+- Review round cap: $REVIEW_MAX_ROUNDS rounds (SQUAD_REVIEW_MAX_ROUNDS)
 
 $WORKTREE_NOTE
 Agents must not create additional worktrees. In particular, do not create
@@ -2278,13 +3060,34 @@ likewise takes a role, not a pane ID.
   correctness result in the security task text, and never the other way round.
   A lens that is told what the other already found stops looking for what the
   other missed, which is the entire reason there are two of them.
-- ALWAYS run BOTH lenses in every review round, even when the first one returns
-  must_fix. The only exception is a helper failure so severe that the diff
-  cannot be reviewed at all; report that to PO instead of guessing.
-- After BOTH lenses have finished, ALWAYS run the merge-reviews helper. It
-  writes the aggregate $SQUAD_DIR/review-status.txt and
-  $SQUAD_DIR/review-result.txt that the squad GUI reads. Your own decisions
-  still come from the two lens files.
+- LENS INDEPENDENCE IS ABSOLUTE, and nothing below weakens it. It holds for a
+  re-run lens, for a carried-forward lens and for a skipped one alike. Only
+  merge-reviews ever sees both results, and it runs AFTERWARDS. The two prompts
+  never cross-feed.
+- Every review reviews the FULL uncommitted diff. There is no delta review and
+  no review baseline: a later round does not review "what changed since the last
+  round", it reviews everything that is uncommitted, exactly like round 1.
+- Round 1, the first review of this run, ALWAYS runs BOTH lenses, subject only
+  to the classify-diff skip rule.
+- In a later round a lens MUST be re-run when ANY of these hold: it previously
+  returned must_fix; its previous status was non-zero or its previous result was
+  malformed; it was skipped last round and the diff now makes it in scope; or
+  the diff changed at all in a way relevant to that lens. Since Coder edits code
+  to fix findings, the DEFAULT is re-run. Carry-forward is the narrow exception,
+  allowed ONLY when that lens returned a clean pass AND nothing relevant to it
+  has changed since. When in doubt, re-run.
+- A lens is never skipped or carried forward by hand. The only ways to record
+  one are the classify-diff scope file and the write-lens-result helper.
+- After BOTH lens results exist - whether run, carried or skipped - ALWAYS run
+  the merge-reviews helper. It writes the aggregate
+  $SQUAD_DIR/review-status.txt and $SQUAD_DIR/review-result.txt that the squad
+  GUI reads. Your own decisions still come from the two lens files.
+- There is a HARD cap of $REVIEW_MAX_ROUNDS review rounds.
+  When classify-diff reports final_round=yes, this is the last review round: do
+  NOT start another Coder fix round after it. Run
+  '$SQUAD_DIR/await-po' mark 'review round cap reached'
+  and report the outstanding findings, the test results and the RuboCop and
+  Brakeman gate results to PO instead.
 - NEVER commit, push, force-push, merge, rebase, or create a pull request unless
   PO explicitly asks for that Git operation. Editing files is allowed.
 - NEVER create additional git worktrees, including Claude Code default locations
@@ -2309,6 +3112,14 @@ applies a $WAIT_TIMEOUT_SECONDS second timeout as a final fallback.
 - $SQUAD_DIR/brakeman-result.json - the raw Brakeman JSON report. Both lenses may
   cite it as evidence; the SECURITY lens must read it. It is a GATE result, not
   a review verdict, and it is never an input to merge-reviews.
+- $SQUAD_DIR/review-scope.txt     - which lenses this round needs and which
+  round it is, written by classify-diff. Read it, never guess it.
+- $SQUAD_DIR/checklist.correctness.md - the review lenses for the CORRECTNESS
+  review. Referenced by that task file, never pasted into it.
+- $SQUAD_DIR/checklist.security.md    - the review lenses for the SECURITY
+  review. Referenced by that task file, never pasted into it.
+- $SQUAD_DIR/checklist.merged.md  - both lists in one file. It is the audit
+  record of what was in force, not an input to a review task.
 - $SQUAD_DIR/review-correctness-result.txt - correctness lens findings
 - $SQUAD_DIR/review-security-result.txt    - security lens findings
 - $SQUAD_DIR/review-result.txt    - the AGGREGATE of the two lenses, written by
@@ -2460,35 +3271,87 @@ empty arrays. A sentence saying the change looks fine is a FAILED lens run, not
 a pass. verdict is "must_fix" when the must_fix array is non-empty, otherwise
 "pass".
 
-### The review checklist (used by BOTH review lenses)
+### Classify the diff before the review lenses (mandatory, once per round)
 
-Before writing either review task, read the merged checklist:
+Run this once at the start of EVERY review round, in your own pane, before you
+write any review task:
 
-  cat '$SQUAD_DIR/checklist.merged.md'
+  '$SQUAD_DIR/classify-diff' '$WORKDIR' '$SQUAD_DIR/review-scope.txt' '$SQUAD_DIR/review-round.txt' '$REVIEW_MAX_ROUNDS'
+  cat '$SQUAD_DIR/review-scope.txt'
 
-It is a list of LENSES to look through, not boxes to tick. Paste its contents
-into each review task file under a "Review checklist" heading, and tell Advisor
-to report only what it finds wrong - no coverage table, no "this lens was fine".
+It writes round, max_rounds, final_round, scope, correctness, security and the
+changed-path counts. THE SKIP RULE it applies, in one sentence:
+
+  A review lens is skipped ONLY when every path the change touches - both
+  sides of a rename, and deletions too - is either a non-executable media
+  file or a non-executable documentation file whose content this classifier
+  read in full and found free of active content; anything else - executable
+  code and any file git records as executable whatever its name, a document
+  carrying a script, an embed, an event-handler attribute, a javascript: or
+  data: URL, a leading shebang or an evaluable source block, a document too
+  large, binary, deleted or unreadable to vouch for, shell scripts, config,
+  dependency and lock files, CI definitions, env samples, database, migration
+  and schema files, routes and API definitions, templates and views,
+  generated runtime artifacts, symlinks and submodules, and any extension the
+  classifier does not recognise - runs it.
+
+Unknown means RUN. A documentation extension is necessary but NOT sufficient:
+the classifier reads the file, and a document carrying active content is code.
+Never override the helper towards skipping. If classify-diff exits non-zero, the
+diff could not be classified: run BOTH lenses and tell PO.
+
+Every review reviews the FULL uncommitted diff. classify-diff decides WHETHER a
+lens runs, never what it looks at - there is no delta review and no review
+baseline, so a round-3 review reads exactly the same diff a round-1 review did.
+
+### The review checklists (one file per lens)
+
+Each lens has its own derived checklist file:
+
+  $SQUAD_DIR/checklist.correctness.md   for the CORRECTNESS review
+  $SQUAD_DIR/checklist.security.md      for the SECURITY review
+
+Do NOT paste either file into a task file, and do NOT read them yourself.
+Instead, each review task file carries a "Files to read before reviewing"
+section naming its own lens file by absolute path, and instructs Advisor to read
+that file FIRST and to use it as the lenses for the review. Referencing costs
+one read by one agent; pasting costs the whole list in every prompt of every
+round, which is what this is here to avoid.
+
+Never name the other lens's checklist file, and never name checklist.merged.md,
+in a review task: the merged file is the audit record, not a review input.
+
+They are lists of LENSES to look through, not boxes to tick. Tell Advisor to
+report only what it finds wrong - no coverage table, no "this lens was fine".
 review-schema.json findings are flat strings, so tell Advisor to put the
 checklist ID at the FRONT of the finding text, for example:
 
   [SEC-001] Missing tenant boundary check in app/controllers/reports_controller.rb
 
-If the file says "(no checklist items)", this project has no checklist. Say so
-in the task text and let the review run unstructured; that is not an error and
-never a reason to skip a lens.
+If a lens file says "(no checklist items)", that lens has no checklist for this
+project. Say so in that task text and let that lens run unstructured; that is
+not an error and never a reason to skip a lens.
 
 ### Ask Advisor for a CORRECTNESS review
 
-The first of two independent lenses. Write an English request to
+Run this when review-scope.txt says correctness=run and you are not carrying the
+lens forward. The first of two independent lenses. Write an English request to
 $SQUAD_DIR/review-correctness-task.txt. Tell Advisor to inspect all uncommitted
-changes against the approved acceptance criteria, the Coder's test report, and
-the mandatory RuboCop and Brakeman results, and to cover correctness, data
-integrity, tests, compatibility, performance, and the project's own conventions.
-Report findings only. A pass verdict is allowed only when relevant tests ran and
-both the RuboCop and Brakeman statuses are 0. The lens may cite the Brakeman
-result as evidence. Open this task file with the output contract above. Then
-run:
+changes - the full diff, not a delta since the last round - against the approved
+acceptance criteria, the Coder's test report, and the mandatory RuboCop and
+Brakeman results, and to cover correctness, data integrity, tests,
+compatibility, performance, and the project's own conventions. Report findings
+only. A pass verdict is allowed only when relevant tests ran and both the
+RuboCop and Brakeman statuses are 0. The lens may cite the Brakeman result as
+evidence.
+
+The task file must carry a "Files to read before reviewing" section, and that
+section must name $SQUAD_DIR/checklist.correctness.md as a file Advisor MUST
+read before reviewing. Reading it is not optional and it is not summarised for
+Advisor by you. Never name checklist.security.md or checklist.merged.md here.
+
+Open this task file with the output contract above; the contract stays FIRST in
+the file, ahead of the files-to-read section and everything else. Then run:
 
   '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-correctness-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-correctness-task.txt $SQUAD_DIR/review-correctness-result.txt $SQUAD_DIR/review-correctness-status.txt $review_correctness_event $SQUAD_DIR/review-schema.json $SQUAD_DIR/title.txt correctness'
   '$SQUAD_DIR/run-wait' '$review_correctness_event' '$SQUAD_DIR/review-correctness-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor correctness review'
@@ -2497,31 +3360,70 @@ run:
 
 ### Ask Advisor for a SECURITY review
 
-The second lens, and it runs even when the correctness lens returned must_fix.
-Write an English request to $SQUAD_DIR/review-security-task.txt. Tell Advisor to
-inspect the same uncommitted diff INDEPENDENTLY for authorization, tenant and
-user isolation, input validation, injection, information disclosure, secret
-handling, and filesystem, shell and database risks. Report findings only.
+Run this when review-scope.txt says security=run and you are not carrying the
+lens forward. It runs even when the correctness lens returned must_fix, and its
+outcome never depends on the correctness lens's. Write an English request to
+$SQUAD_DIR/review-security-task.txt. Tell Advisor to inspect the same full
+uncommitted diff INDEPENDENTLY for authorization, tenant and user isolation,
+input validation, injection, information disclosure, secret handling, and
+filesystem, shell and database risks. Report findings only.
 
 Tell it to READ $SQUAD_DIR/brakeman-result.txt and, when present,
 $SQUAD_DIR/brakeman-result.json as evidence - a passing Brakeman scan is a
 starting point, not a conclusion, since Brakeman cannot see authorization or
 tenant-isolation logic. Citing the Brakeman gate is allowed and expected.
 
+The task file must carry a "Files to read before reviewing" section, and that
+section must name $SQUAD_DIR/checklist.security.md as a file Advisor MUST read
+before reviewing. Reading it is not optional and it is not summarised for
+Advisor by you. Never name checklist.correctness.md or checklist.merged.md here.
+
 This task text must NOT mention, quote, summarize or point at the CORRECTNESS
-result in any way. Write it as if the correctness lens had never run. The
-Brakeman gate is shared evidence and is not a lens, so referencing it does not
-break the independence of the two lenses. Open this task file with the output
-contract above. Then run:
+result in any way, in this round or any earlier one. Write it as if the
+correctness lens had never run. The Brakeman gate is shared evidence and is not
+a lens, so referencing it does not break the independence of the two lenses.
+
+Open this task file with the output contract above; the contract stays FIRST in
+the file, ahead of the files-to-read section and everything else. Then run:
 
   '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/review-security-status.txt' advisor '$SQUAD_DIR/run-review $SQUAD_DIR/review-security-task.txt $SQUAD_DIR/review-security-result.txt $SQUAD_DIR/review-security-status.txt $review_security_event $SQUAD_DIR/review-schema.json $SQUAD_DIR/title.txt security'
   '$SQUAD_DIR/run-wait' '$review_security_event' '$SQUAD_DIR/review-security-status.txt' advisor '$WAIT_TIMEOUT_SECONDS' 'Advisor security review'
   cat '$SQUAD_DIR/review-security-status.txt'
   cat '$SQUAD_DIR/review-security-result.txt'
 
+### Record a lens that did not run this round
+
+merge-reviews needs a result file for BOTH lenses every round. When a lens did
+not run, the helper below writes that result. NEVER write one by hand: a
+hand-written lens result is a fabricated review, and it reaches the GUI as a
+pass.
+
+A lens is SKIPPED when review-scope.txt says so - that is, when the skip rule
+above found the diff to be documentation or media only. The reason is one short
+line:
+
+  '$SQUAD_DIR/write-lens-result' security skipped '$SQUAD_DIR/review-security-result.txt' '$SQUAD_DIR/review-security-status.txt' <round> 'docs/media-only diff per review-scope.txt'
+
+A lens is CARRIED FORWARD only when it returned a clean pass in an earlier round
+AND nothing relevant to it has changed since. Since Coder edits code to fix
+findings, that is rare: re-running is the default and the safe answer, and when
+in doubt you re-run. Pass the round it is carried FROM:
+
+  '$SQUAD_DIR/write-lens-result' correctness carried '$SQUAD_DIR/review-correctness-result.txt' '$SQUAD_DIR/review-correctness-status.txt' <round> <from-round>
+
+The helper re-checks the previous result before carrying it: a result that is
+not a clean pass this lens itself produced is refused, and you must re-run that
+lens. It also refuses to carry a skip forward. A lens that previously returned
+must_fix, a non-zero status, or a malformed result can NEVER be carried - re-run
+it.
+
+Skipping and carrying change nothing about independence. Never mention the other
+lens's findings when you re-run, carry or skip a lens.
+
 ### Merge the two reviews (mandatory)
 
-Run this after BOTH lenses have finished, before you decide anything:
+Run this after BOTH lens results exist for this round - whether each one was
+run, carried forward or skipped - before you decide anything:
 
   '$SQUAD_DIR/merge-reviews' '$SQUAD_DIR/review-correctness-result.txt' '$SQUAD_DIR/review-correctness-status.txt' '$SQUAD_DIR/review-security-result.txt' '$SQUAD_DIR/review-security-status.txt' '$SQUAD_DIR/review-result.txt' '$SQUAD_DIR/review-status.txt'
   cat '$SQUAD_DIR/review-status.txt'
@@ -2533,9 +3435,27 @@ aggregate the squad GUI reads: status 0 only when both lens statuses are 0,
 verdict must_fix when either lens says must_fix, findings unioned and tagged
 with the lens that raised them.
 
+When a lens was skipped or carried forward, the aggregate summary opens with a
+"[lens states]" line naming it, so the aggregate never reads like two fresh
+passes. Say the same thing to PO in your own report.
+
 If merge-reviews fails it says so loudly and writes a must_fix aggregate. That
 means a lens result is missing or malformed: re-run that lens, and report it to
 PO if it keeps failing. Never hand-write the aggregate files to work around it.
+
+### When the review round cap is reached
+
+classify-diff reports final_round=yes on review round $REVIEW_MAX_ROUNDS, the
+last round SQUAD_REVIEW_MAX_ROUNDS allows. When that round's review is done and
+anything is still outstanding, do NOT ask Coder for another fix round. Instead:
+
+  '$SQUAD_DIR/await-po' mark 'review round cap reached'
+
+then report to PO in Japanese: the outstanding must_fix, should_fix and
+test_gaps findings from both lens result files with the lens that raised each,
+the tests that were run and their results, and the RuboCop and Brakeman gate
+results. Say plainly that the round cap stopped the loop and ask PO how to
+proceed. Never raise the cap yourself.
 
 ### Ask Coder to fix review findings
 
@@ -2565,17 +3485,22 @@ or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
 5. Read Coder status and structured verification report.
 6. Run the mandatory RuboCop helper and require status 0.
 7. Run the mandatory Brakeman helper and require status 0.
-8. Ask Advisor for the CORRECTNESS review of the uncommitted changes and the
-   verification evidence.
-9. Ask Advisor for the SECURITY review of the same diff, independently. This
-   runs even when the correctness lens returned must_fix.
-10. Run merge-reviews to write the aggregate files for the GUI.
-11. If either lens status is non-zero, either lens verdict is must_fix, or
-   RuboCop or Brakeman failed, ask Coder to fix the issues. Pass the union of
-   the findings from both lenses.
-12. After every fix, repeat from step 5.
-13. Report completion to PO in Japanese. Include the squad worktree path, branch,
-   test commands and results, and the mandatory RuboCop and Brakeman results.
+8. Run classify-diff to get this round's scope and round number.
+9. Ask Advisor for the CORRECTNESS review of the full uncommitted diff and the
+   verification evidence, unless the scope file skips it or it is genuinely
+   carried forward. Record a skip or a carry with write-lens-result.
+10. Ask Advisor for the SECURITY review of the same full diff, independently,
+   under the same rule. It runs even when the correctness lens returned
+   must_fix, and its task text never mentions the correctness result.
+11. Run merge-reviews to write the aggregate files for the GUI.
+12. If either lens status is non-zero, either lens verdict is must_fix, or
+   RuboCop or Brakeman failed, ask Coder to fix the issues - UNLESS classify-diff
+   reported final_round=yes, in which case mark and report to PO instead of
+   starting another fix round. Pass the union of the findings from both lenses.
+13. After every fix, repeat from step 5.
+14. Report completion to PO in Japanese. Include the squad worktree path, branch,
+   test commands and results, the mandatory RuboCop and Brakeman results, and
+   any lens that was skipped or carried forward.
 PROMPT
 }
 
@@ -2693,6 +3618,14 @@ resume_run() {
   # for a run created before the Brakeman gate did (where it resolves to the
   # empty command, i.e. skip) and so launch and resume stay idempotent.
   printf '%s\n' "${BRAKEMAN_COMMAND:-}" > "$SQUAD_DIR/brakeman-command.txt"
+  # Same reason: a squad created before the review round cap existed has no
+  # REVIEW_MAX_ROUNDS in state.env, and the Manager prompt interpolates it. The
+  # recorded value wins over the environment, exactly as WAIT_TIMEOUT_SECONDS
+  # does, so resuming never silently changes the cap the run started with.
+  REVIEW_MAX_ROUNDS="${REVIEW_MAX_ROUNDS:-$SQUAD_REVIEW_MAX_ROUNDS_DEFAULT}"
+  # Regenerated on resume for the same reason the helpers are: a run created
+  # before a schema existed gets it as soon as it is resumed.
+  generate_schemas
   # Re-resolved before the prompt, so a resumed run reviews against the project
   # checklist as it stands NOW, not as it stood when the squad was created.
   generate_review_checklist
@@ -2794,6 +3727,66 @@ case "$1" in
     resume_run "${1:-}" "$resume_session"
     exit 0
     ;;
+  gen-helpers)
+    [[ -n "${2:-}" ]] || {
+      echo "Error: squad gen-helpers requires a target directory" >&2
+      exit 1
+    }
+    # Writes the WHOLE generated surface - helpers, schemas, checklist and the
+    # Manager prompts - so all of it can be inspected or tested without a tmux
+    # server, a worktree, a pane or a single agent. The placeholder values below
+    # only ever reach the generated text.
+    require_own_gen_dir "$2"
+    SQUAD_DIR="$2"
+    mkdir -p "$SQUAD_DIR"
+    RUN_ID="${SQUAD_GEN_RUN_ID:-gen-helpers}"
+    REPO_ROOT="${SQUAD_GEN_REPO_ROOT:-$(pwd)}"
+    WORKDIR="${SQUAD_GEN_WORKDIR:-$REPO_ROOT}"
+    BRANCH="${SQUAD_GEN_BRANCH:-feat/squad-$RUN_ID}"
+    SQUAD_TITLE="${SQUAD_GEN_TITLE:-gen-helpers}"
+    TICKET_ID="${SQUAD_GEN_TICKET_ID:-}"
+    MANAGER_SESSION_ID="${SQUAD_GEN_MANAGER_SESSION_ID:-00000000-0000-0000-0000-000000000000}"
+    CODER_SESSION_ID="${SQUAD_GEN_CODER_SESSION_ID:-00000000-0000-0000-0000-000000000001}"
+    WINDOW_SHORT_NAME="${SQUAD_GEN_SHORT_NAME:-$(placeholder_window_name)}"
+    WAIT_TIMEOUT_SECONDS="${SQUAD_WAIT_TIMEOUT_SECONDS:-7200}"
+    [[ "$WAIT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+      echo "Error: SQUAD_WAIT_TIMEOUT_SECONDS must be a positive integer." >&2
+      exit 1
+    }
+    resolve_review_max_rounds
+    # set_worktree_mode reads WORKDIR against REPO_ROOT, so it must come after
+    # both are assigned.
+    set_worktree_mode
+    # TOCTOU narrowing, deliberately cheap rather than airtight.
+    #
+    # The check above is a check-then-use, and nothing holds the directory in
+    # between: with a writable parent, a symlink can be raced into place at one
+    # of the fixed output names after the check and before the write. Two
+    # mitigations, both one line:
+    #
+    #   * the check is REPEATED here, immediately before the first write, so the
+    #     window is the generation itself rather than the whole argument parse;
+    #   * noclobber makes every `>` below REFUSE a path that already exists,
+    #     which is what a symlink raced into place resolves to.
+    #
+    # RESIDUAL RACE, knowingly left open: a symlink raced in after this second
+    # check whose target does NOT yet exist is still followed, and the target
+    # created through it. Closing that needs O_NOFOLLOW on every open, which
+    # bash cannot express. gen-helpers is a developer-facing test entry point,
+    # and this is where the PO drew the line - do not read it as hardened.
+    require_own_gen_dir "$SQUAD_DIR"
+    set -o noclobber
+    printf '%s\n' "${SQUAD_GEN_RUBOCOP_COMMAND:-}" > "$SQUAD_DIR/rubocop-command.txt"
+    printf '%s\n' "${SQUAD_GEN_BRAKEMAN_COMMAND:-}" > "$SQUAD_DIR/brakeman-command.txt"
+    printf '%s\n' "$SQUAD_TITLE" > "$SQUAD_DIR/title.txt"
+    generate_schemas
+    generate_review_checklist
+    generate_helper_scripts
+    generate_manager_prompt
+    generate_resume_prompt
+    printf 'Generated helpers, schemas, checklist and prompts in %s\n' "$SQUAD_DIR"
+    exit 0
+    ;;
 esac
 
 TASK="$*"
@@ -2809,6 +3802,7 @@ WAIT_TIMEOUT_SECONDS="${SQUAD_WAIT_TIMEOUT_SECONDS:-7200}"
   echo "Error: SQUAD_WAIT_TIMEOUT_SECONDS must be a positive integer." >&2
   exit 1
 }
+resolve_review_max_rounds
 ORIGINAL_WORKDIR="$(pwd)"
 
 if [[ -z "${TMUX:-}" ]]; then
@@ -3045,6 +4039,7 @@ Coder session:     $CODER_SESSION_ID
 RuboCop command:   ${RUBOCOP_COMMAND:-(none: not a Ruby project, RuboCop step is skipped)}
 Brakeman command:  ${BRAKEMAN_COMMAND:-(none: not a Ruby project or Brakeman not installed, Brakeman step is skipped)}
 Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
+Review rounds:     $REVIEW_MAX_ROUNDS maximum
 INFO
 
 cat "$SQUAD_DIR/run-info.txt"
@@ -3077,72 +4072,7 @@ tmux set-option -w -t "$WINDOW_ID" @squad_state_file "$STATE_FILE"
 
 # --- Structured output schemas ------------------------------------------------
 
-cat > "$SQUAD_DIR/plan-schema.json" <<'SCHEMA'
-{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "summary": { "type": "string" },
-    "scope": { "type": "array", "items": { "type": "string" } },
-    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
-    "files_to_inspect": { "type": "array", "items": { "type": "string" } },
-    "implementation_steps": { "type": "array", "items": { "type": "string" } },
-    "tests": { "type": "array", "items": { "type": "string" } },
-    "risks": { "type": "array", "items": { "type": "string" } }
-  },
-  "required": [
-    "summary",
-    "scope",
-    "acceptance_criteria",
-    "files_to_inspect",
-    "implementation_steps",
-    "tests",
-    "risks"
-  ]
-}
-SCHEMA
-
-cat > "$SQUAD_DIR/coder-schema.json" <<'SCHEMA'
-{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "summary": { "type": "string" },
-    "changed_files": { "type": "array", "items": { "type": "string" } },
-    "tests_run": { "type": "array", "items": { "type": "string" } },
-    "tests_not_run": { "type": "array", "items": { "type": "string" } },
-    "test_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
-    "rubocop_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
-    "brakeman_status": { "type": "string", "enum": ["pass", "fail", "blocked"] },
-    "remaining_issues": { "type": "array", "items": { "type": "string" } }
-  },
-  "required": [
-    "summary",
-    "changed_files",
-    "tests_run",
-    "tests_not_run",
-    "test_status",
-    "rubocop_status",
-    "brakeman_status",
-    "remaining_issues"
-  ]
-}
-SCHEMA
-
-cat > "$SQUAD_DIR/review-schema.json" <<'SCHEMA'
-{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "verdict": { "type": "string", "enum": ["pass", "must_fix"] },
-    "summary": { "type": "string" },
-    "must_fix": { "type": "array", "items": { "type": "string" } },
-    "should_fix": { "type": "array", "items": { "type": "string" } },
-    "test_gaps": { "type": "array", "items": { "type": "string" } }
-  },
-  "required": ["verdict", "summary", "must_fix", "should_fix", "test_gaps"]
-}
-SCHEMA
+generate_schemas
 
 printf '%s\n' "$RUBOCOP_COMMAND" > "$SQUAD_DIR/rubocop-command.txt"
 printf '%s\n' "$BRAKEMAN_COMMAND" > "$SQUAD_DIR/brakeman-command.txt"
