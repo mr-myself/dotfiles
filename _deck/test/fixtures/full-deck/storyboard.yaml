@@ -1,0 +1,405 @@
+# THE FIXTURE DECK - every page type, every slot filled.
+#
+# WHY THIS FILE EXISTS.
+#
+# test/fixtures/ was empty. There was no rendered deck anywhere in the repo
+# that used the page types the themes declare, which is how `standard-3col`
+# came to ship slot coordinates - col-N-art at top: 277 - that were inside the
+# card body box and could not be used. Nothing rendered them, so nothing
+# caught them. The PO found out by building a real deck and measuring 38
+# collisions.
+#
+# It earns its keep twice, and both are load-bearing:
+#
+#   AS DOCUMENTATION   someone about to write a storyboard can render this and
+#                      see what each page type actually looks like. Not having
+#                      that was the direct cause of the first real deck being
+#                      unreadable.
+#   AS A TEST          rendered and linted in test/geometry/fixture-deck.test.js,
+#                      and measured in test/geometry/occupancy-baseline.test.js,
+#                      which is where the occupancy rule's thresholds come
+#                      from. They are measured off this deck rather than
+#                      chosen by feel.
+#
+# THE CONTENT IS INVENTED. A fictional municipality choosing a payroll system.
+# Nothing is confidential, nothing is quoted from anywhere, and no number in
+# it is real - which is also why this deck carries no sources/ directory: the
+# intake gates check a deck built from imported material, and this one was
+# not.
+#
+# WHEN YOU ADD A PAGE TYPE, add a slide here. The cross-check in
+# test/unit/content.test.js fails if an implemented page type has no fixture
+# slide, so this cannot quietly fall behind again.
+schema: deck.storyboard/1
+title: "架空市 給与システム更新のご提案"
+
+slides:
+  # --- cover ----------------------------------------------------------------
+  - id: cover
+    page_type: cover
+    purpose: "資料の主題と対象を一目で伝える"
+    section_label: "ご提案"
+    title: "給与システム更新のご提案"
+    subtitle: "架空市 総務課 向け"
+    speaker_notes: null
+    slots:
+      - id: cover-art
+        brief: "朝の市庁舎と周囲の山並みを水彩で。人物は描かず、文字は一切入れない。"
+        width_px: 760
+        height_px: 941
+    source_refs: []
+
+  # --- agenda ---------------------------------------------------------------
+  - id: agenda
+    page_type: agenda
+    purpose: "全体の流れを示し、いまどこを話しているかを明確にする"
+    section_label: "本日の流れ"
+    title: "本日の目次"
+    subtitle: null
+    agenda:
+      items:
+        - "いまの給与事務で起きていること"
+        - "候補システムの比較"
+        - "導入の進めかた"
+        - "決めていただきたいこと"
+      active: 1
+    footer:
+      label: "ご確認"
+      text: "本日は比較と進めかたまでをご確認いただきます。"
+    speaker_notes: null
+    slots:
+      - id: agenda-art
+        brief: "机の上の書類と窓辺の植物を水彩で、淡く。文字は一切入れない。"
+        width_px: 620
+        height_px: 871
+    source_refs: []
+
+  # --- section-divider ------------------------------------------------------
+  - id: ch-01
+    page_type: section-divider
+    purpose: "第1章の始まりを示す"
+    section_label: "第01章"
+    title: "いまの給与事務"
+    subtitle: "どこに時間がかかっているか"
+    speaker_notes: null
+    slots:
+      - id: divider-art
+        brief: "静かな川面と対岸の木立を水彩で。文字は一切入れない。"
+        width_px: 700
+        height_px: 941
+    source_refs: []
+
+  # --- standard-3col --------------------------------------------------------
+  #
+  # THE THEME'S FLAGSHIP LAYOUT: a picture above each column. All three column
+  # slots are declared and filled here, which is exactly what no fixture did
+  # before and exactly why the collision shipped.
+  - id: three-points
+    page_type: standard-3col
+    purpose: "いまの事務で時間がかかっている三か所を並べて示す"
+    section_label: "いまの給与事務"
+    title: "時間がかかっている三か所"
+    subtitle: "いずれも月末の同じ週に重なっている"
+    body:
+      - kind: cards
+        cards:
+          - heading: "勤怠の集計"
+            body: "各課から届く様式がそろっておらず、突き合わせに二日かかっている。"
+            icon: teal
+          - heading: "手当の確認"
+            body: "住居手当と通勤手当の変更届を、紙の台帳と照らして確認している。"
+            icon: orange
+          - heading: "年末調整"
+            body: "十一月から十二月にかけて、他の二つと同じ担当者に集中している。"
+            icon: teal
+    footer:
+      label: "要点"
+      text: "三つとも、同じ二名の担当者に同じ週に集中している。"
+    speaker_notes: null
+    slots:
+      - id: col-1-art
+        brief: "書類の束とタイムカードを水彩で。文字は一切入れない。"
+        width_px: 474
+        height_px: 210
+      - id: col-2-art
+        brief: "台帳と封筒を水彩で。文字は一切入れない。"
+        width_px: 474
+        height_px: 210
+      - id: col-3-art
+        brief: "冬の窓辺と暦を水彩で。文字は一切入れない。"
+        width_px: 474
+        height_px: 210
+    source_refs: []
+
+  # --- standard-3col, THE SECOND ONE ----------------------------------------
+  #
+  # A SECOND SLIDE OF A PAGE TYPE THAT HAS SLOTS, declaring the same slot ids
+  # as the first. This shape existed nowhere - the fixture had one slide per
+  # page type and the stress harness did too - and that is exactly why a deck
+  # could carry column art on only ONE three-column slide and neither of us
+  # saw it. The PO's real deck has four, so twelve illustrations could not be
+  # imported and four pages shipped as empty frames.
+  #
+  # `col-1-art` names the first column's picture, which every three-column
+  # slide has. Slot ids are unique within a slide and repeat across slides;
+  # the pair (slide, slot) is the identity, and it is what `prompts` puts in
+  # the filename and what `assets import` addresses.
+  - id: who-does-it
+    page_type: standard-3col
+    purpose: "移行を誰がやるのかを三つに分けて示す"
+    section_label: "導入の進めかた"
+    title: "誰が手を動かすか"
+    subtitle: "三者の分担をはっきりさせておきます"
+    body:
+      - kind: cards
+        cards:
+          - heading: "総務課"
+            body: "要件の確認と、庁内への周知を担当する。"
+            icon: teal
+          - heading: "情報システム担当"
+            body: "データ移行の段取りと、既存システムとの接続を見る。"
+            icon: orange
+          - heading: "導入業者"
+            body: "設定と研修を行い、最初の一か月は常駐で支援する。"
+            icon: teal
+    footer:
+      label: "要点"
+      text: "三者とも十一月から動ける体制にしておきます。"
+    speaker_notes: null
+    slots:
+      - id: col-1-art
+        brief: "書類を囲んで打ち合わせる庁舎の一室を水彩で。文字は一切入れない。"
+        width_px: 474
+        height_px: 210
+      - id: col-2-art
+        brief: "サーバー室の機器と配線を水彩で、淡く。文字は一切入れない。"
+        width_px: 474
+        height_px: 210
+      - id: col-3-art
+        brief: "研修を受ける職員の手元と資料を水彩で。文字は一切入れない。"
+        width_px: 474
+        height_px: 210
+    source_refs: []
+
+  # --- statement ------------------------------------------------------------
+  #
+  # The page type the theme exempts from the occupancy rule by name. Its
+  # whitespace is the design, and the fixture is where that claim is checked:
+  # occupancy-baseline.test.js measures this page and asserts it falls UNDER
+  # the threshold the other page types are held to.
+  - id: the-point
+    page_type: statement
+    purpose: "この資料でいちばん伝えたい一行を、他に何も置かずに示す"
+    section_label: "いちばん伝えたいこと"
+    title: "いま決めるのは、どの製品かではありません。"
+    subtitle: null
+    body:
+      - kind: statement
+        text: "来年四月に間に合わせるために、十一月までに何を決め終えるかです。"
+    footer:
+      label: "ご判断"
+      text: "この一点だけ、本日のうちに向きをそろえさせてください。"
+    speaker_notes: null
+    slots: []
+    source_refs: []
+
+  # --- comparison -----------------------------------------------------------
+  - id: options
+    page_type: comparison
+    purpose: "三つの候補を同じ軸で比べ、どこが違うのかを示す"
+    section_label: "候補システムの比較"
+    title: "三つの候補と、その違い"
+    subtitle: "同じ三つの軸で見ています"
+    comparison:
+      axes:
+        - "初期費用"
+        - "庁内で運用できるか"
+        - "既存システムとの連携"
+      columns:
+        - label: "A社"
+          caption: "県内の自治体での導入が多い"
+          cells:
+            - "高い"
+            - "研修なしで引き継げる"
+            - "財務会計のみ"
+        - label: "B社"
+          caption: "全国向けのパッケージ"
+          cells:
+            - "中ほど"
+            - "年に一度の研修が要る"
+            - "財務会計と人事給与"
+        - label: "C社"
+          caption: "現行システムの後継"
+          cells:
+            - "安い"
+            - "いまの手順をそのまま使える"
+            - "財務会計のみ"
+      note: "連携の範囲を優先するか、庁内での運用しやすさを優先するかで分かれます。"
+    speaker_notes: null
+    slots:
+      - id: comparison-art
+        brief: "三社の担当者が同じ資料を囲んで話している場面を水彩で、淡く。文字は一切入れない。"
+        width_px: 1562
+        height_px: 220
+    source_refs: []
+
+  # --- process --------------------------------------------------------------
+  - id: how
+    page_type: process
+    purpose: "導入までの順序と、それぞれの段階で何をするかを示す"
+    section_label: "導入の進めかた"
+    title: "四つの段階で進めます"
+    subtitle: "順序を入れ替えられない段階があります"
+    process:
+      direction: horizontal
+      steps:
+        - label: "十一月"
+          heading: "候補を絞る"
+          items:
+            - "三社から見積もりを取る"
+            - "総務課で要件を確認する"
+        - label: "十二月"
+          heading: "試す"
+          items:
+            - "一課で一か月使ってみる"
+        - label: "一月"
+          heading: "決める"
+          items:
+            - "庁議にかける"
+        - label: "二月から三月"
+          heading: "移行する"
+          items:
+            - "過去三年分のデータを移す"
+            - "担当者の研修を行う"
+      note: "試用の結果が出るまで、庁議の日程は押さえられません。"
+    speaker_notes: null
+    slots:
+      - id: process-art
+        brief: "十一月から三月へと移ろう庁舎まわりの景色を水彩で、横長に。文字は一切入れない。"
+        width_px: 1562
+        height_px: 220
+    source_refs: []
+
+  # --- ecosystem, hub form --------------------------------------------------
+  - id: who
+    page_type: ecosystem
+    purpose: "給与システムが何とつながっているかを示す"
+    section_label: "導入の進めかた"
+    title: "給与システムがつながる先"
+    subtitle: "矢印はデータの向きです"
+    ecosystem:
+      layout: hub
+      centre:
+        label: "給与システム"
+        caption: "総務課が運用する"
+      nodes:
+        - label: "勤怠管理"
+          caption: "打刻データを渡す"
+          direction: from
+        - label: "財務会計"
+          caption: "仕訳を受け取る"
+          direction: to
+        - label: "人事台帳"
+          caption: "異動と手当の変更を双方向で"
+          direction: both
+        - label: "金融機関"
+          caption: "振込データを受け取る"
+          direction: to
+      note: "人事台帳だけが双方向で、ここが移行時にいちばん手がかかります。"
+    speaker_notes: null
+    slots: []
+    source_refs: []
+
+  # --- ecosystem, layers form -----------------------------------------------
+  - id: foundation
+    page_type: ecosystem
+    purpose: "やりたいことと、その下に共通して要るものを分けて示す"
+    section_label: "導入の進めかた"
+    title: "どの案でも、下に同じものが要ります"
+    subtitle: "上の三つは、下がそろって初めて動きます"
+    ecosystem:
+      layout: layers
+      layers:
+        - label: "やりたいこと"
+          items:
+            - "給与計算の自動化"
+            - "年末調整の電子化"
+            - "明細の電子配付"
+        - label: "どの案でも要る土台"
+          items:
+            - "職員マスタの整備"
+            - "勤怠データの電子化"
+      note: "土台の二つは、製品を決める前から始められます。"
+    speaker_notes: null
+    slots:
+      - id: ecosystem-art
+        brief: "職員名簿と勤怠の記録が机に並ぶ様子を水彩で、横長に。文字は一切入れない。"
+        width_px: 1562
+        height_px: 220
+    source_refs: []
+
+  # --- timeline -------------------------------------------------------------
+  - id: when
+    page_type: timeline
+    purpose: "いつ何が起きるかを、源の言いかたのまま順に示す"
+    section_label: "決めていただきたいこと"
+    title: "四月に間に合わせるための日程"
+    subtitle: "並びは前後しません"
+    timeline:
+      entries:
+        - when: "十一月中"
+          label: "候補を三社に絞る"
+          items:
+            - "見積もりがそろう"
+        - when: "年内"
+          label: "試用の結果を見る"
+          items:
+            - "現場の反応"
+            - "実際にかかった時間"
+        - when: "一月の庁議"
+          label: "契約先を決める"
+          emphasis: true
+        - when: "四月一日"
+          label: "新システムで最初の給与計算"
+      note: "一月の庁議を外すと、四月には間に合いません。"
+    speaker_notes: null
+    slots:
+      - id: timeline-art
+        brief: "冬から春へ季節が移る野の景色を水彩で、横長に。文字は一切入れない。"
+        width_px: 1562
+        height_px: 220
+    source_refs: []
+
+  # --- table ----------------------------------------------------------------
+  #
+  # A table is not a failure. This one is the shape a table is genuinely right
+  # for: many rows of the same kind, with precise values meant to be read off.
+  - id: costs
+    page_type: table
+    purpose: "三社の費用を、読み取れる形で並べる"
+    section_label: "決めていただきたいこと"
+    title: "費用の内訳"
+    subtitle: "いずれも五年間の総額です"
+    table:
+      columns:
+        - heading: "項目"
+          width_fr: 1.4
+        - heading: "A社"
+          align: end
+        - heading: "B社"
+          align: end
+        - heading: "C社"
+          align: end
+      rows:
+        - ["初期費用", "1,200万円", "800万円", "450万円"]
+        - ["年間保守", "180万円", "150万円", "120万円"]
+        - ["データ移行", "320万円", "280万円", "90万円"]
+        - ["研修", "60万円", "90万円", "0万円"]
+        - ["五年間の総額", "2,480万円", "1,920万円", "1,140万円"]
+      note: "いずれも税抜きで、回線費用は含んでいません。"
+    footer:
+      label: "ご判断"
+      text: "費用だけで見ればC社ですが、連携の範囲が財務会計のみです。"
+    speaker_notes: null
+    slots: []
+    source_refs: []

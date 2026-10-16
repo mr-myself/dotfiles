@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/lint-report.schema.json",
+  "title": "out/lint/report.json",
+  "description": "PROCESS and VERDICT are separate fields on purpose. A lint run that completed and found violations is `process: ok` with `verdict: fail` - a successful process with a failing answer. A run that crashed is `process: failed`, and its verdict is forced to `fail` because it has no verdict to report. Reading only one of the two fields must never make a crashed run look like an approving one. Every field the lint command actually emits is described here; test/unit/report-schema.test.js validates a REAL emitted report against this file, so the two cannot drift apart again.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "command",
+    "process",
+    "verdict",
+    "summary",
+    "generated_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "deck.report/1"
+    },
+    "command": {
+      "const": "lint"
+    },
+    "process": {
+      "enum": [
+        "ok",
+        "failed"
+      ],
+      "description": "Did the command run to completion? Nothing more."
+    },
+    "verdict": {
+      "enum": [
+        "pass",
+        "fail",
+        "none"
+      ],
+      "description": "Did the geometry it inspected pass?"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "theme": {
+      "type": "string"
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "blocking",
+        "suggestions",
+        "slides"
+      ],
+      "properties": {
+        "blocking": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "suggestions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "slides": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "honest_limits": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rule",
+          "severity",
+          "slide",
+          "element",
+          "axis",
+          "reference",
+          "message",
+          "expected",
+          "measured"
+        ],
+        "properties": {
+          "rule": {
+            "enum": [
+              "content-integrity",
+              "slot-fill",
+              "occupancy",
+              "centring",
+              "overflow",
+              "collision",
+              "safe-margins",
+              "alignment",
+              "type-size",
+              "contrast",
+              "repetition",
+              "proximity"
+            ]
+          },
+          "severity": {
+            "enum": [
+              "fail",
+              "suggestion",
+              "unsupported"
+            ],
+            "description": "`unsupported` is BLOCKING: geometry deck could not measure, or evidence it could not read, is a reported failure and never a silent pass."
+          },
+          "slide": {
+            "type": "string"
+          },
+          "element": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "axis": {
+            "enum": [
+              "x",
+              "y",
+              null
+            ],
+            "description": "Which axis failed. Centring fails each axis independently, so a horizontal-only error names x and only x."
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The declared reference region the contract was checked against."
+          },
+          "message": {
+            "type": "string"
+          },
+          "expected": {},
+          "measured": {},
+          "boxes": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "evidence": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Path to the annotated PNG with the offending box drawn on it."
+          },
+          "evidence_error": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "content_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "render_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Which render this verdict inspected. `deck export` refuses a report whose fingerprint is not the current render's, so a stale verdict cannot vouch for output it never saw."
+    },
+    "rule_status": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ran",
+          "error",
+          "findings"
+        ],
+        "properties": {
+          "ran": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "findings": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "description": "Per rule: did it run at all. A rule that threw is `ran: false` and contributes a blocking `unsupported` finding, so a crashed rule can never read as a clean one."
+    },
+    "by_rule": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "blocking",
+          "suggestions"
+        ],
+        "properties": {
+          "blocking": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "suggestions": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "details": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Present on a failure report written by recordFailure."
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  }
+}

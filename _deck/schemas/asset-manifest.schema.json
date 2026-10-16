@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/asset-manifest.schema.json",
+  "title": "assets/manifest.json",
+  "description": "What filled each slot, and the SHA-256 of the file the PO handed over. The source hash survives to the output: deck never mutates the PO's file, it fits it with aspect-preserving containment at render time.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "assets"],
+  "properties": {
+    "schema": { "const": "deck.assets/1" },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["slot_id", "slide_id", "stored_file", "original_path", "sha256", "imported_at", "brief_digest"],
+        "properties": {
+          "slot_id": { "type": "string" },
+          "slide_id": { "type": "string" },
+          "stored_file": { "type": "string", "description": "Path under assets/, relative to the deck root. A copy; the original is never touched." },
+          "original_path": { "type": "string", "description": "Where the PO's file came from, recorded for provenance." },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "bytes": { "type": "integer", "minimum": 0 },
+          "imported_at": { "type": "string", "format": "date-time" },
+          "pixel_size": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["width", "height"],
+            "properties": { "width": { "type": "integer" }, "height": { "type": "integer" } }
+          },
+          "brief_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of the slot brief AT IMPORT TIME. An imported asset is REUSED when its container merely moves or resizes, and is only re-requested when this digest no longer matches the storyboard's brief."
+          },
+          "reuse_unchanged": { "type": "boolean" },
+          "superseded_by": { "type": ["string", "null"], "description": "Set when a later import replaced this one. Entries are appended, never edited in place, so the history of a slot survives." }
+        }
+      }
+    }
+  }
+}

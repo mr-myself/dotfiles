@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/deck.schema.json",
+  "title": "deck.yaml - the per-deck request",
+  "description": "Modelled on the design kit's 03_依頼内容テンプレート.yaml: the parts that change per deck, separated from the theme, which is the parts that do not. Following that file, an empty list or empty string means \"keep the default\", never \"remove it\".",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "request"],
+  "properties": {
+    "schema": { "const": "deck.request/1" },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_name", "purpose", "audience", "theme"],
+      "properties": {
+        "project_name": { "type": "string", "minLength": 1 },
+        "purpose": { "type": "string", "minLength": 1, "description": "What the deck is for. Feeds illustration prompts." },
+        "audience": { "type": "string", "minLength": 1 },
+        "theme": { "type": "string", "minLength": 1, "description": "Theme name under _deck/themes, or a path to a theme directory." },
+        "language": { "type": "string", "default": "ja-JP" },
+        "content_source_files": { "type": "array", "items": { "type": "string" }, "description": "Paths under sources/. Immutable once imported." },
+        "preserve_title_and_subtitle_verbatim": { "type": "boolean", "default": true },
+        "preserve_body_verbatim": { "type": "boolean", "default": true },
+        "output": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "formats": {
+              "type": "array",
+              "items": { "enum": ["pdf", "png", "pptx", "pptx_image", "pptx_editable", "svg"] },
+              "description": "PDF is the primary deliverable; PNG comes with it. The pptx and svg names PARSE so that a request written against the design kit (whose output_formats include pptx_image) is readable, and are then refused BY NAME with the reason - the same treatment as an unimplemented page type. Accepting and ignoring them would mean the PO asks for a pptx, gets a clean exit, and finds no pptx."
+            },
+            "png_scale": {
+              "enum": [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4],
+              "default": 2,
+              "description": "PNG scale relative to the authored canvas. Constrained to scales where 96 x scale is a whole number, because pdftoppm takes an integer -r. A value like 1.1 would need 105.6 dpi and silently produce pages of the wrong size."
+            },
+            "page_numbers": { "type": "boolean", "default": true }
+          }
+        },
+        "additional_instructions": { "type": "string", "default": "" }
+      }
+    },
+    "theme_overrides": {
+      "type": "object",
+      "description": "Per-deck token overrides, merged over the theme. Changing these invalidates rendered output but NOT content approval.",
+      "additionalProperties": true
+    }
+  }
+}

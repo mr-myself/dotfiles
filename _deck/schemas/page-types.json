@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/page-types.json",
+  "title": "deck page types",
+  "description": "The page-type vocabulary. Every name from the design kit's page_types is listed, so a storyboard written against the kit parses rather than failing with 'unknown page type'. Only `implemented` names render; `unimplemented` names are rejected BY NAME with the reason, because silently falling back to a different layout would ship a page the PO never asked for.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "implemented",
+    "unimplemented"
+  ],
+  "properties": {
+    "implemented": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "const": [
+        "cover",
+        "agenda",
+        "section-divider",
+        "standard-3col",
+        "table",
+        "statement",
+        "comparison",
+        "process",
+        "ecosystem",
+        "timeline"
+      ]
+    },
+    "unimplemented": {
+      "type": "array",
+      "description": "Names kept in the vocabulary from 02_デザイン仕様.yaml, plus the kit's generic `standard` which standard-3col supersedes. Each carries the reason it is refused.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "reason"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

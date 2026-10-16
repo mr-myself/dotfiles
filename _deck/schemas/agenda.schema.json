@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/agenda.schema.json",
+  "title": "deck proposed agenda",
+  "description": "GATE 4's artifact: what the next meeting is for, what is on it, and WHAT IS BEING LEFT OUT AND WHY. The exclusions are the half that makes this reviewable - an agenda that only lists what it includes cannot be checked for what it quietly dropped. `deck gate agenda` requires every unresolved decision and every pending action in the ledger to appear in one list or the other.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "meeting", "items"],
+  "properties": {
+    "schema": { "const": "deck.agenda/1" },
+    "meeting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose", "audience"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "when": { "type": ["string", "null"], "description": "As the PO said it. 来週火曜 is a legitimate value." },
+        "purpose": { "type": "string", "minLength": 1 },
+        "audience": { "type": "string", "minLength": 1 }
+      }
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "heading", "why", "ledger_refs"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+          "heading": { "type": "string", "minLength": 1 },
+          "why": { "type": "string", "minLength": 1, "description": "Why this belongs on the NEXT meeting's agenda. Not a restatement of the heading." },
+          "wants": {
+            "enum": ["decision", "information", "agreement", "review", null],
+            "description": "What the agent wants out of the room for this item."
+          },
+          "ledger_refs": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "Which ledger entries this item rests on. An agenda item resting on nothing in the source is the agent's own idea, and must be marked as such with an explicit `agent_proposed` ref."
+          }
+        }
+      }
+    },
+    "excluded": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ledger_refs", "reason"],
+        "properties": {
+          "ledger_refs": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "missing_evidence": {
+      "type": "array",
+      "description": "What the agent wanted and could not find in the source. Shown to the PO at gate 4 so they can supply it rather than discover the hole in the meeting.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["what", "why"],
+        "properties": {
+          "what": { "type": "string", "minLength": 1 },
+          "why": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

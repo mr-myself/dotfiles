@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/ledger.schema.json",
+  "title": "deck source ledger",
+  "description": "EXTRACTION, KEPT SEPARATE FROM REASONING. The agenda and the storyboard are built from this file, never from a summary of the source: a summary is where a number loses its unit, an unresolved action becomes a finished one, and a decision acquires a certainty the minutes never had. Every entry therefore carries `quote`, the EXACT source wording, and `deck gate ledger` verifies that each quote really occurs in the saved source text. An entry whose quote cannot be found is a fabrication, and it is refused by name.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "entries"
+  ],
+  "properties": {
+    "schema": {
+      "const": "deck.ledger/1"
+    },
+    "extracted_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "source_id",
+        "quote"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+        },
+        "kind": {
+          "enum": [
+            "decision",
+            "open_question",
+            "action",
+            "number"
+          ],
+          "description": "The four things worth carrying forward from a meeting. Anything else belongs in the agent's own prose, not in the ledger."
+        },
+        "source_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Which manifest source this came from."
+        },
+        "block_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The Notion block id, when there was one, so the PO can click back to it."
+        },
+        "quote": {
+          "type": "string",
+          "minLength": 1,
+          "description": "VERBATIM from the source text. Whitespace may be collapsed; nothing else may change. This is checked, not trusted."
+        },
+        "status": {
+          "enum": [
+            "resolved",
+            "unresolved",
+            "done",
+            "pending",
+            null
+          ],
+          "description": "A decision is resolved or unresolved; an action is done or pending. NEVER record an action as done because it sounds finished - only because the source says so. The agenda gate requires every unresolved and pending entry to be either on the agenda or explicitly excluded with a reason."
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "due": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Verbatim as the source wrote it. Do not normalise 来週 into a date."
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The number as written, including separators."
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "円, %, 人, 件. A number without its unit is not a number."
+        },
+        "period": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Which period it describes. Two numbers for different months are not a trend."
+        },
+        "conflicts_with": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ids of entries this one contradicts. Minutes do contradict themselves; recording it is how the agent avoids silently picking one."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent's own remark. Never a substitute for the quote."
+        },
+        "source_omits": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "owner",
+              "due",
+              "period",
+              "unit",
+              "value"
+            ]
+          },
+          "description": "Fields the SOURCE genuinely does not state. Recording the absence is the honest answer; inventing an owner or inferring a period is exactly what these gates exist to prevent. Every entry with a non-empty source_omits must be raised at the agenda gate, so the hole becomes a question for the room."
+        }
+      }
+    }
+  }
+}

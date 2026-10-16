@@ -1,0 +1,28 @@
+{
+  "implemented": [
+    "cover",
+    "agenda",
+    "section-divider",
+    "standard-3col",
+    "table",
+    "statement",
+    "comparison",
+    "process",
+    "ecosystem",
+    "timeline"
+  ],
+  "unimplemented": [
+    {
+      "name": "standard",
+      "reason": "the design kit's generic standard page. Use standard-3col, which is the measured form of this layout in the reference deck; a bare `standard` has no column count and deck will not invent one."
+    },
+    {
+      "name": "media",
+      "reason": "not implemented in this increment. A media page makes a reserved image frame the subject; use a slot on another page type instead."
+    },
+    {
+      "name": "background-only",
+      "reason": "not implemented in this increment. A background-only page carries no content, so it cannot be expressed as a storyboard slide with verbatim fields."
+    }
+  ]
+}

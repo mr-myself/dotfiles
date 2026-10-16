@@ -1,0 +1,690 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/storyboard.schema.json",
+  "title": "deck storyboard",
+  "description": "THE content source of truth. Every text field here is verbatim: the renderer may re-wrap a line, but nothing may summarise, rephrase, truncate or invent. Layout line breaks are expressed in `line_breaks_after`, never by editing the text.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "title",
+    "slides"
+  ],
+  "properties": {
+    "schema": {
+      "const": "deck.storyboard/1"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The deck's own title, verbatim."
+    },
+    "notes": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Free notes for the author. Not rendered, not part of the content digest."
+    },
+    "slides": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Explicit order. The array order IS the slide order and is part of the agenda digest.",
+      "items": {
+        "$ref": "#/$defs/slide"
+      }
+    }
+  },
+  "$defs": {
+    "slide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "page_type",
+        "purpose"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "description": "Stable slide id. Referenced by assets, approvals and lint findings, so renaming one is a content change."
+        },
+        "page_type": {
+          "type": "string",
+          "description": "One of the implemented page types. Names from the design kit that deck has not implemented parse here and are then refused BY NAME, never silently substituted.",
+          "enum": [
+            "cover",
+            "agenda",
+            "section-divider",
+            "standard-3col",
+            "table",
+            "statement",
+            "standard",
+            "comparison",
+            "process",
+            "ecosystem",
+            "timeline",
+            "media",
+            "background-only"
+          ]
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What this slide is FOR, in the author's words. Feeds the illustration prompt, so it must describe intent rather than restate the title."
+        },
+        "section_label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The eyebrow above the title. null means intentionally absent."
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subtitle": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null means an INTENTIONALLY ABSENT subtitle and must never be back-filled. The content digest covers it, so adding one later invalidates content approval."
+        },
+        "line_breaks_after": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Layout line breaks, kept separate from the text itself so the words stay one verbatim string. Values are character offsets into the named field at which a hard break is placed.",
+          "properties": {
+            "title": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "subtitle": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "statement": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "body": {
+          "type": "array",
+          "description": "Body content blocks. Which blocks a page type accepts is checked by deck validate, not by this schema.",
+          "items": {
+            "$ref": "#/$defs/block"
+          }
+        },
+        "table": {
+          "$ref": "#/$defs/table"
+        },
+        "footer": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "text"
+          ],
+          "description": "The footer banner. Used only when the source has a corresponding conclusion; deck never writes one.",
+          "properties": {
+            "text": {
+              "type": "string",
+              "minLength": 1
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "agenda": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "items": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "active": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "description": "1-based index of the current item. Only that item is dark; the rest use the theme's inactive grey, which is a DECLARED contrast exception."
+            }
+          }
+        },
+        "variant": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A declared layout variant. The repetition rule compares slides only within the same (page_type, variant) bucket, so a legitimately different page is expressible without disabling the rule."
+        },
+        "speaker_notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/slot"
+          }
+        },
+        "source_refs": {
+          "type": "array",
+          "description": "Where this slide's content came from, as paths under sources/ or free citations.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "comparison": {
+          "$ref": "#/$defs/comparison"
+        },
+        "process": {
+          "$ref": "#/$defs/process"
+        },
+        "ecosystem": {
+          "$ref": "#/$defs/ecosystem"
+        },
+        "timeline": {
+          "$ref": "#/$defs/timeline"
+        }
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "paragraph",
+            "bullets",
+            "cards",
+            "statement"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cards": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "description": "standard-3col takes up to three cards. More than three is refused rather than reflowed into a layout the theme has not been measured for.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "heading"
+            ],
+            "properties": {
+              "heading": {
+                "type": "string",
+                "minLength": 1
+              },
+              "body": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "icon": {
+                "enum": [
+                  "teal",
+                  "orange",
+                  "blue",
+                  "peach",
+                  "mint",
+                  null
+                ],
+                "description": "An icon-circle fill role from the theme. `teal` and `orange` are the reference deck's saturated pair; `blue`, `peach` and `mint` are its pale variants. The circle is CSS, so it carries no raster and no text."
+              }
+            }
+          }
+        }
+      }
+    },
+    "table": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "columns",
+        "rows"
+      ],
+      "properties": {
+        "columns": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "heading"
+            ],
+            "properties": {
+              "heading": {
+                "type": "string"
+              },
+              "width_fr": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "align": {
+                "enum": [
+                  "start",
+                  "center",
+                  "end"
+                ]
+              }
+            }
+          }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "brief",
+        "width_px",
+        "height_px"
+      ],
+      "description": "An illustration slot. Slot images MUST contain no text: HTML/CSS renders every word on the slide, which is what keeps a page-number change from forcing a re-render of 23 rasters.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+        },
+        "brief": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the illustration must depict. Changing this materially is what re-requests the image; moving or resizing the container is not."
+        },
+        "width_px": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height_px": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reuse_unchanged": {
+          "type": "boolean",
+          "default": false,
+          "description": "A real photo, logo, product screen or QR code. Never regenerated, never recoloured, never cropped in a way that loses content. deck emits no generation prompt for these."
+        },
+        "decorative": {
+          "type": "boolean",
+          "default": false,
+          "description": "Declares that this slot may be overlapped by foreground content - a watercolour wash under a heading. Only declared overlap is allowed by the collision rule."
+        }
+      }
+    },
+    "comparison": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "axes",
+        "columns"
+      ],
+      "description": "TWO OR MORE OPTIONS, COMPARED ON THE SAME AXES. `axes` names the attributes once; every column supplies one cell per axis, in the same order, so corresponding rows sit at the same height across columns - which is the whole reason this is not a table of free-form rows. The design kit: 左右で項目・尺度・ラベル位置を対応させる.",
+      "properties": {
+        "axes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "The comparison axes, in display order. One row per axis."
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "description": "The options being compared. Two to four: beyond that the rows stop being readable side by side and the content is a table.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "cells"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "caption": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A short second line under the label."
+              },
+              "cells": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string"
+                },
+                "description": "One cell per axis, in the same order as `axes`. deck refuses a column whose length differs: a comparison with a missing cell silently misaligns every row below it."
+              },
+              "emphasis": {
+                "type": "boolean",
+                "default": false,
+                "description": "Marks this column as the recommendation. deck NEVER sets this itself - a verdict is the author's, and inventing one is exactly what the content gates exist to prevent."
+              }
+            }
+          }
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "process": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "description": "ORDERED STEPS WITH DIRECTION. The array order IS the order, and it is drawn with numbers and forward arrows. The design kit: 番号と矢印で順序を明確にする。複数工程があっても矢印の方向を誤らない. A step may contain several items; they are drawn inside the step, never as extra steps.",
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 5,
+          "description": "Two to five. One step is not a process; beyond five the arrows are thinner than the words.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "heading"
+            ],
+            "properties": {
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The stage's own name, e.g. フェーズ0. The step NUMBER is drawn by deck from the array position and must not be written into the text."
+              },
+              "heading": {
+                "type": "string",
+                "minLength": 1
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "What happens in this step. A stage with several items keeps them inside the step."
+              }
+            }
+          }
+        },
+        "direction": {
+          "enum": [
+            "horizontal",
+            "vertical",
+            null
+          ],
+          "default": "horizontal",
+          "description": "horizontal reads left to right; vertical reads top to bottom. The arrows follow it, and deck will not draw an arrow against the declared direction."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ecosystem": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "layout"
+      ],
+      "description": "WHO DOES WHAT, AND WHAT CONNECTS TO WHAT. Either a hub with periphery, or an upper layer of functions over a lower shared base. The design kit: 中心と周辺、または上段の機能と下段の基盤で関係を整理。ラベルを読める位置に置く. Every label is drawn in its own box; nothing is ever placed on a connector.",
+      "properties": {
+        "layout": {
+          "enum": [
+            "hub",
+            "layers"
+          ]
+        },
+        "centre": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "label"
+          ],
+          "description": "The hub. Required when layout is hub.",
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1
+            },
+            "caption": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "nodes": {
+          "type": "array",
+          "maxItems": 6,
+          "description": "The periphery, for a hub. Up to six: beyond that the connectors cross and the kit forbids crossing.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "caption": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "direction": {
+                "enum": [
+                  "from",
+                  "to",
+                  "both",
+                  null
+                ],
+                "default": "to",
+                "description": "Which way the arrow runs between the hub and this node. The start and the end of an arrow are meaning, not decoration."
+              }
+            }
+          }
+        },
+        "layers": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "description": "For `layers`: the upper function layers and the shared base, top to bottom. The LAST layer is drawn as the base.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "caption": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "The things that sit in this layer, drawn side by side inside it."
+              }
+            }
+          }
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "timeline": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "entries"
+      ],
+      "description": "DATED OR SEQUENCED EVENTS ALONG AN AXIS. The design kit: 日時と項目を順に配置。同じ時期の出来事はまとめても、時間関係を変えない. The array order is the time order and deck never re-sorts it: `when` is the author's own wording - 来週火曜 is a legitimate value - and sorting free text would reorder the facts.",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "when",
+              "label"
+            ],
+            "properties": {
+              "when": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Verbatim as the source wrote it."
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "Several things at the same time are grouped inside one entry, which is what keeps the time relationship true."
+              },
+              "emphasis": {
+                "type": "boolean",
+                "default": false,
+                "description": "The entry the slide is about. The author's call, never deck's."
+              }
+            }
+          }
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

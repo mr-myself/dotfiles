@@ -37,6 +37,11 @@ vet
 whatdid
 - ln -s ~/mr-myself/setup/dotfiles/whatdid ~/.local/bin/whatdid
 
+deck
+- ln -s ~/mr-myself/setup/dotfiles/deck ~/.local/bin/deck
+- npm install --prefix ~/mr-myself/setup/dotfiles/_deck
+- then: deck "資料のタイトル"   (the agent asks you for the rest)
+
 ## And more
 I recommend you to use 'oh-my-zsh'!
 https://github.com/robbyrussell/oh-my-zsh

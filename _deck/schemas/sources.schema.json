@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deck.local/schemas/sources.schema.json",
+  "title": "deck source manifest",
+  "description": "WHAT WAS FETCHED, AND WHETHER ALL OF IT ARRIVED. A deck built on half the minutes is worse than no deck, because nobody can see which half is missing. Every entry records where the material came from, when, and whether the retrieval was complete; an incomplete entry BLOCKS approval rather than being noted and forgotten. Source files are immutable once written: the agent may add a source, never rewrite one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "sources"],
+  "properties": {
+    "schema": { "const": "deck.sources/1" },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/source" }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "ref", "retrieved_at", "text_file", "complete"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "description": "Stable id. Ledger entries cite it, so renaming one breaks the citation rather than silently repointing it."
+        },
+        "kind": {
+          "enum": ["notion", "file", "typed"],
+          "description": "notion: fetched through the notion-personal MCP tools. file: a path the PO gave. typed: text the PO typed into the pane, saved verbatim."
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The Notion URL, the file path, or the literal string \"pane\" for typed input."
+        },
+        "retrieved_at": { "type": "string", "minLength": 1, "description": "ISO 8601. When the bytes arrived, not when the deck was built." },
+        "raw_file": {
+          "type": ["string", "null"],
+          "description": "Workspace-relative path to the untouched API response, when there was one. Kept so a later question about what Notion actually returned is answerable."
+        },
+        "text_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workspace-relative path to the flattened plain text. THIS is what every verbatim check runs against, so it must contain the source's words and not a summary of them."
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "false means the retrieval is known to be partial. It blocks agenda approval. Never set it true to get past the gate."
+        },
+        "block_count": { "type": ["integer", "null"], "minimum": 0 },
+        "page_ids": { "type": "array", "items": { "type": "string" } },
+        "block_ids": { "type": "array", "items": { "type": "string" } },
+        "pagination": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["requests", "has_more"],
+          "description": "Notion pages its block children. has_more true at the end of the walk means a cursor was left unfollowed, which is a partial fetch whatever `complete` claims.",
+          "properties": {
+            "requests": { "type": "integer", "minimum": 1 },
+            "has_more": { "type": "boolean" },
+            "next_cursor": { "type": ["string", "null"] }
+          }
+        },
+        "missing": {
+          "type": "array",
+          "description": "Anything known to be absent: a child page that errored, a database the token cannot read, a block type that carries content this flattening drops. A non-empty list blocks approval.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["what", "why"],
+            "properties": {
+              "what": { "type": "string", "minLength": 1 },
+              "why": { "type": "string", "minLength": 1 },
+              "id": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "notes": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

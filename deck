@@ -1,0 +1,2436 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# deck - AI-assisted slide production
+# ==============================================================================
+#
+# TWO LAYERS, AND THE DIFFERENCE MATTERS.
+#
+#   THE GATE    _deck/src: the renderer and the geometry linter. Authoritative
+#               text and layout live in HTML/CSS on a fixed 16:9 pixel canvas,
+#               rendered by the installed Google Chrome to PDF and rasterized
+#               to PNG. Because the layout is real DOM, every geometry check is
+#               a measurement rather than an opinion.
+#
+#   THE PRODUCT this file: a launcher that starts ONE Claude Code agent which
+#               interviews the PO in Japanese, reads the source material,
+#               agrees the agenda and the exact copy with them, WRITES
+#               storyboard.yaml itself, and then drives the gates above -
+#               fixing what the linter finds and re-running it.
+#
+# The gate shipped first, which left the PO hand-writing storyboard.yaml. That
+# is rubocop without a programmer. The deterministic commands now live behind
+# `deck gate <name>` - they are the agent's gates, not the PO's interface - and
+# the PO's interface is a sentence:
+#
+#     deck "野沢温泉 次回MTG資料"
+#
+# ONE AGENT, NOT THREE. squad runs two independent review lenses because
+# judging code is subjective and a second reader sees what the first missed.
+# Here the review IS `deck lint`: nine rules over measured geometry, the same
+# answer every time. A second opinion pane would spend tokens to re-read a
+# deterministic result.
+#
+# Like squad and vet, the PO runs this through a ~/.local/bin symlink, so
+# _deck has to be found relative to the resolved real path and not to $0.
+
+usage() {
+  local status="${1:-1}"
+  cat <<'EOF'
+Usage: deck <title> [--source <notion-url|file>] [options]
+       deck list
+       deck resume [run-id]
+       deck close [run-id]
+       deck rm <run-id>...
+       deck clean
+       deck gate <command> [args...]
+       deck gen-helpers <dir>
+
+Start an AI agent that interviews you in Japanese, reads your source material,
+agrees the agenda and the exact wording with you, writes the storyboard itself
+and produces the deck. You never open storyboard.yaml.
+
+Example:
+  deck "野沢温泉 次回MTG資料"
+  deck "営業会議 11月" --source https://www.notion.so/...
+  deck "定例ふりかえり" --source ./notes.md --when 来週火曜
+
+Launch options:
+  --source <ref>   A Notion URL, or a path to a file. May be repeated. When
+                   omitted the agent asks for it, and will also take text
+                   typed straight into the pane.
+  --purpose <text> What the deck is for. Asked if not given.
+  --audience <who> Who is in the room. Asked if not given.
+  --when <text>    Which meeting, and when. Free text: 来週火曜 is fine.
+  --dir <path>     Where to create the deck workspace. Default:
+                   $DECK_DECKS_ROOT/<date>-<title>, or the deck you are
+                   already standing in.
+  --theme <name>   Theme for a new workspace. Default: watercolor.
+
+Lifecycle, as squad has:
+  deck list             List retained runs, their phase and their status.
+  deck resume           Resume the most recent retained run.
+  deck resume <run-id>  Resume a specific run. State, approvals and position
+                        survive a close: the agent is told which gate it had
+                        reached.
+  deck close            Close the run for the current tmux window.
+  deck rm <run-id>...   Delete closed runs' artifacts. Never the deck itself.
+  deck clean            Delete ALL run artifacts that are not running.
+
+The gates (deterministic, no agent, no network):
+  deck gate init <dir>      Scaffold a deck workspace.
+  deck gate doctor          Chrome, poppler, fonts, node. Installs nothing.
+  deck gate source          Was the material fully retrieved? A partial fetch
+                            BLOCKS, because an agenda built on half the
+                            minutes looks exactly like one built on all of it.
+  deck gate ledger          Does every extracted quote really occur in the
+                            source? Checked, not trusted.
+  deck gate agenda          Is every still-open item either on the agenda or
+                            explicitly excluded with a reason?
+  deck gate copy            The readable Japanese copy sheet for the content
+                            gate, each line marked quoted or written.
+  deck gate fidelity        Do the storyboard's numbers, dates and table cells
+                            trace back to the source?
+  deck gate validate        Schema and semantics of the storyboard.
+  deck gate approve agenda|content   Record the approved revision's digest.
+  deck gate render [--release]       storyboard -> HTML -> PDF -> PNGs.
+  deck gate lint            The layout gate, on measured geometry.
+  deck gate prompts --single         ONE pasteable illustration brief.
+  deck gate inbox           Import whatever was dropped in <deck>/inbox.
+  deck gate export          Verify and list the deliverable.
+  deck gate status          Phase, approvals, slots.
+
+  `deck gate` with no arguments prints the gate layer's own help. The old
+  spellings (`deck render`) are gone: a bare verb is now a deck title, and
+  guessing between the two would eventually guess wrong. Use `deck -- <title>`
+  if your deck is really called "render".
+
+Inspection:
+  deck gen-helpers <dir>
+                   Write the generated helpers and the agent prompt into <dir>
+                   and exit. Launches nothing, so it is the way to inspect or
+                   test what a run would generate.
+
+Environment:
+  DECK_REPAIR_MAX_ROUNDS  Hard cap on lint -> fix -> lint rounds. A positive
+                          integer; default 3. At the cap the agent reports to
+                          you instead of starting another round.
+  DECK_DECKS_ROOT         Where new deck workspaces are created.
+                          Default: $HOME/decks.
+  DECK_STATE_ROOT         Cross-run state and run artifacts.
+                          Default: ${XDG_STATE_HOME:-$HOME/.local/state}/deck.
+  DECK_HOME               Where deck's Node sources, schemas and themes live.
+  DECK_NODE               The node binary to use. Default: node from PATH.
+  DECK_AGENT              The agent binary. Default: claude.
+EOF
+  exit "$status"
+}
+
+# ------------------------------------------------------------------ resolution
+
+script_real_path() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="$dir/$src"
+  done
+  printf '%s/%s\n' "$(cd -P "$(dirname "$src")" && pwd)" "$(basename "$src")"
+}
+DECK_SCRIPT_PATH="$(script_real_path)"
+DECK_SCRIPT_DIR="$(dirname "$DECK_SCRIPT_PATH")"
+DECK_HOME="${DECK_HOME:-$DECK_SCRIPT_DIR/_deck}"
+export DECK_HOME
+
+NODE_BIN="${DECK_NODE:-node}"
+DECK_AGENT="${DECK_AGENT:-claude}"
+
+# The state root is the Node side's too, so the two agree on one location
+# without the launcher having to tell it.
+deck_state_root() {
+  if [[ -n "${DECK_STATE_ROOT:-}" ]]; then
+    printf '%s' "$DECK_STATE_ROOT"
+  else
+    printf '%s/deck' "${XDG_STATE_HOME:-$HOME/.local/state}"
+  fi
+}
+DECK_RUN_ROOT="$(deck_state_root)/runs"
+DECK_DECKS_ROOT="${DECK_DECKS_ROOT:-$HOME/decks}"
+
+require_node_sources() {
+  if [[ ! -f "$DECK_HOME/src/cli.js" ]]; then
+    echo "Error: deck's Node sources are missing." >&2
+    echo "       Looked for: $DECK_HOME/src/cli.js" >&2
+    echo "       deck resolved its own path to: $DECK_SCRIPT_PATH" >&2
+    echo "       Set DECK_HOME if _deck lives somewhere else." >&2
+    exit 2
+  fi
+  if ! command -v "$NODE_BIN" >/dev/null 2>&1; then
+    echo "Error: node was not found on PATH (looked for '$NODE_BIN')." >&2
+    echo "       deck needs Node 20.11 or newer. Set DECK_NODE to point at it." >&2
+    exit 2
+  fi
+  # Dependencies are committed as a lockfile, not as node_modules. Say so
+  # plainly rather than letting Node fail with a bare MODULE_NOT_FOUND.
+  if [[ ! -d "$DECK_HOME/node_modules/playwright-core" ]]; then
+    echo "Error: deck's dependencies are not installed." >&2
+    echo "       Run: npm install --prefix $DECK_HOME" >&2
+    exit 2
+  fi
+}
+
+# ------------------------------------------------------------------- run state
+
+# The newest run, by the START TIME IT RECORDED.
+#
+# This used to be `sort | tail -1` over the FULL PATH, and a path begins with
+# the deck directory name - so a run under "zebra-deck" from last week
+# outranked one under "ab-deck" from a minute ago, and `deck resume` with no
+# argument picked the wrong deck. The recorded STARTED_AT is what "latest"
+# means.
+latest_run_state_file() {
+  find "$DECK_RUN_ROOT" -mindepth 3 -maxdepth 3 -name state.env -type f 2>/dev/null |
+    while IFS= read -r f; do
+      unset STARTED_AT
+      # shellcheck disable=SC1090
+      source "$f" 2>/dev/null || continue
+      printf '%s\t%s\n' "${STARTED_AT:-0000-00-00 00:00:00}" "$f"
+    done |
+    sort |
+    tail -n 1 |
+    cut -f2-
+}
+
+load_run() {
+  local requested_id="${1:-}"
+  local allow_latest="${2:-true}"
+  local state_file=""
+
+  if [[ -n "$requested_id" ]]; then
+    # MATCHED BY PATH, not by a loop.
+    #
+    # This used to pipe every state.env through a `while read` whose body was
+    # `[[ test ]] && printf`. On a non-matching run that body exits 1, so the
+    # loop exited 1, so the command substitution exited 1 - and `set -e` then
+    # killed deck inside the assignment, with no message at all. `deck resume
+    # <run-id>` therefore died silently for every run that was not the first
+    # one `find` happened to return.
+    state_file="$(
+      find "$DECK_RUN_ROOT" -mindepth 3 -maxdepth 3 -path "*/$requested_id/state.env" -type f 2>/dev/null |
+        head -n 1
+    )" || state_file=""
+    # AN EXPLICIT ID THAT DOES NOT EXIST IS AN ERROR, not an invitation to
+    # pick something else. Falling back meant a mistyped id silently resumed,
+    # closed or REMOVED a different deck's run.
+    [[ -n "$state_file" && -f "$state_file" ]] || {
+      printf 'Error: no deck run with id "%s".\n' "$requested_id" >&2
+      printf '       deck will not fall back to another run for an id you typed.\n' >&2
+      printf '       See: deck list\n' >&2
+      exit 1
+    }
+  elif [[ -n "${TMUX:-}" ]]; then
+    state_file="$(tmux show-option -wqv @deck_state_file 2>/dev/null || true)"
+  fi
+
+  if [[ ( -z "$state_file" || ! -f "$state_file" ) && "$allow_latest" == "true" ]]; then
+    state_file="$(latest_run_state_file)"
+  fi
+
+  [[ -n "$state_file" && -f "$state_file" ]] || {
+    echo "Error: no matching deck run found (see: deck list)" >&2
+    exit 1
+  }
+
+  # state.env is generated by deck itself and contains shell-escaped values.
+  # shellcheck disable=SC1090
+  source "$state_file"
+  STATE_FILE="$state_file"
+}
+
+write_state() {
+  mkdir -p "$RUN_DIR"
+  {
+    printf 'RUN_ID=%q\n' "$RUN_ID"
+    printf 'STARTED_AT=%q\n' "$STARTED_AT"
+    printf 'TASK=%q\n' "$TASK"
+    printf 'DECK_DIR=%q\n' "$DECK_DIR"
+    printf 'RUN_DIR=%q\n' "$RUN_DIR"
+    printf 'DECK_BIN=%q\n' "$DECK_SCRIPT_PATH"
+    printf 'AGENT_SESSION_ID=%q\n' "$AGENT_SESSION_ID"
+    printf 'REPAIR_MAX_ROUNDS=%q\n' "${REPAIR_MAX_ROUNDS:-$DECK_REPAIR_MAX_ROUNDS_DEFAULT}"
+    printf 'WINDOW_SHORT_NAME=%q\n' "${WINDOW_SHORT_NAME:-deck}"
+    printf 'WINDOW_ID=%q\n' "${WINDOW_ID:-}"
+    printf 'CURRENT_WINDOW_NAME=%q\n' "${CURRENT_WINDOW_NAME:-}"
+    # NON-AUTHORITATIVE, exactly as squad records its panes: tmux assigns a new
+    # pane id on every resume. Kept for diagnostics only; nothing addresses a
+    # pane through it.
+    printf 'AGENT_PANE=%q\n' "${AGENT_PANE:-}"
+    # THE RUN IS LIVE IF THIS PROCESS IS. deck does not own a tmux window - it
+    # runs in whatever window the PO was already in - so window existence is
+    # not liveness: a resume records the PO's long-lived shell window, and that
+    # window outlives the run. The launcher process is the run.
+    printf 'LAUNCHER_PID=%q\n' "${LAUNCHER_PID:-}"
+    printf 'PURPOSE=%q\n' "${PURPOSE:-}"
+    printf 'AUDIENCE=%q\n' "${AUDIENCE:-}"
+    printf 'MEETING_WHEN=%q\n' "${MEETING_WHEN:-}"
+    printf 'SOURCE_SPECS=%q\n' "${SOURCE_SPECS:-}"
+    # WHERE THE PO WAS STANDING when they launched. A --source of ./notes.md
+    # means "relative to here", and the launcher then cds into the deck
+    # workspace before starting the agent - so without recording this, a
+    # relative source path pointed at a file that was never there.
+    printf 'INVOKED_FROM=%q\n' "${INVOKED_FROM:-}"
+    printf 'THEME=%q\n' "${THEME:-watercolor}"
+    printf 'RUN_STATUS=%q\n' "${RUN_STATUS:-running}"
+  } > "$RUN_DIR/state.env.tmp.$$"
+  # Replaced by rename, so a concurrent reader - `deck list` in another
+  # window, a close while the launcher is live - never sees a half-written
+  # state file.
+  mv -f "$RUN_DIR/state.env.tmp.$$" "$RUN_DIR/state.env"
+  STATE_FILE="$RUN_DIR/state.env"
+}
+
+DECK_REPAIR_MAX_ROUNDS_DEFAULT=3
+
+# The hard cap on lint -> fix -> lint rounds. Without it the loop has no bound:
+# a finding the agent cannot actually fix buys another full round, forever, and
+# the PO never hears about it. Same validation idiom as squad's, deliberately:
+# validated before anything is created, message to stderr, exit 1.
+# THE RECORDED CAP WINS ON A RESUME.
+#
+# This used to take the environment or the default unconditionally, and resume
+# called it after load_run - so a run launched with DECK_REPAIR_MAX_ROUNDS=7
+# came back with a cap of 3, and the agent was told a limit the PO had never
+# set. The recorded value is part of the run.
+#
+# An explicitly set DECK_REPAIR_MAX_ROUNDS still wins, because the PO changing
+# it is a deliberate act; it is reported when it differs from the record.
+#
+# @param $1  "resume" to prefer the recorded value
+resolve_repair_max_rounds() {
+  local mode="${1:-launch}" recorded="${REPAIR_MAX_ROUNDS:-}"
+  if [[ "$mode" == "resume" && -n "$recorded" && -z "${DECK_REPAIR_MAX_ROUNDS:-}" ]]; then
+    REPAIR_MAX_ROUNDS="$recorded"
+  else
+    REPAIR_MAX_ROUNDS="${DECK_REPAIR_MAX_ROUNDS:-${recorded:-$DECK_REPAIR_MAX_ROUNDS_DEFAULT}}"
+  fi
+  [[ "$REPAIR_MAX_ROUNDS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: DECK_REPAIR_MAX_ROUNDS must be a positive integer." >&2
+    exit 1
+  }
+  if [[ "$mode" == "resume" && -n "$recorded" && "$recorded" != "$REPAIR_MAX_ROUNDS" ]]; then
+    printf 'Note: this run recorded a repair cap of %s; DECK_REPAIR_MAX_ROUNDS is set, so %s is used.\n' \
+      "$recorded" "$REPAIR_MAX_ROUNDS"
+  fi
+}
+
+# The tmux WINDOW name to use before the agent has decided what this run is
+# about. DISPLAY ONLY: runs are resolved by WINDOW_ID and by the @deck_run_id
+# pane option, never by this string.
+placeholder_window_name() {
+  printf 'deck:%s' "${RUN_ID:0:15}"
+}
+
+# Is the run still running? The launcher process is the run: it starts the
+# agent in the foreground and outlives nothing.
+run_is_live() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+window_exists() {
+  local target_window_id="${1:-}"
+  [[ -n "$target_window_id" ]] || return 1
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux list-windows -a -F '#{window_id}' 2>/dev/null |
+    awk -v target="$target_window_id" '$0 == target { found = 1 } END { exit !found }'
+}
+
+# Where the run has got to, read from the DECK rather than from the run record.
+#
+# The phase is the Node side's answer, re-derived from what is on disk, so a
+# run whose agent died still reports the truth: the approvals and the rendered
+# output are the facts, and a run record that disagreed with them would be the
+# thing that misleads the PO.
+run_phase() {
+  local deck_dir="${1:-}"
+  [[ -n "$deck_dir" && -f "$deck_dir/deck.yaml" ]] || { printf 'no-deck'; return 0; }
+  local out
+  out="$(cd "$deck_dir" && "$NODE_BIN" "$DECK_HOME/src/cli.js" status --json 2>/dev/null)" || {
+    printf 'unknown'
+    return 0
+  }
+  printf '%s' "$out" | "$NODE_BIN" -e '
+let s = ""; process.stdin.on("data", (d) => { s += d; });
+process.stdin.on("end", () => {
+  try { process.stdout.write(String(JSON.parse(s).phase || "unknown")); }
+  catch { process.stdout.write("unknown"); }
+});' 2>/dev/null || printf 'unknown'
+}
+
+list_runs() {
+  local state_file title status phase waiting
+  printf '%-22s  %-9s  %-16s  %-4s  %s\n' "RUN ID" "STATUS" "PHASE" "WAIT" "TITLE"
+  find "$DECK_RUN_ROOT" -mindepth 3 -maxdepth 3 -name state.env -type f 2>/dev/null |
+    sort -r |
+    while IFS= read -r state_file; do
+      unset RUN_ID RUN_STATUS RUN_DIR WINDOW_ID DECK_DIR TASK LAUNCHER_PID
+      # shellcheck disable=SC1090
+      source "$state_file"
+      title="$(cat "$RUN_DIR/title.txt" 2>/dev/null || printf '%s' "${TASK:-unknown}")"
+      status="${RUN_STATUS:-unknown}"
+      if run_is_live "${LAUNCHER_PID:-}"; then
+        status="running"
+      elif [[ "$status" == "running" ]]; then
+        status="closed"
+      fi
+      phase="$(run_phase "${DECK_DIR:-}")"
+      waiting="-"
+      [[ -e "$RUN_DIR/awaiting-po.env" ]] && waiting="[?]"
+      printf '%-22s  %-9s  %-16s  %-4s  %s\n' "$RUN_ID" "$status" "$phase" "$waiting" "$title"
+    done
+}
+
+# True when a tmux on PATH is one of deck's own kill-guard shims rather than
+# the real binary. The marker is the wrapper's own message, written further
+# down, so the two stay in sync.
+is_tmux_guard_shim() {
+  [[ -n "$1" && -f "$1" ]] && grep -q 'deck: blocked dangerous tmux command' "$1" 2>/dev/null
+}
+
+# The REAL tmux binary, skipping deck's kill-guard shims.
+#
+# The agent runs with a PATH shim that refuses kill-server/kill-session/
+# kill-window/kill-pane, and this resolves what that shim should exec. It has
+# to skip shims rather than take the first tmux on PATH, because deck can be
+# launched from inside an already-guarded pane and `command -v tmux` would then
+# find the outer shim - a shim execing a shim refuses everything.
+#
+# Unlike squad, deck has no carve-out to make: nothing in deck kills a window.
+deck_real_tmux() {
+  local candidate
+  if [[ -n "${DECK_REAL_TMUX:-}" ]] && ! is_tmux_guard_shim "$DECK_REAL_TMUX"; then
+    printf '%s' "$DECK_REAL_TMUX"
+    return 0
+  fi
+  # Every candidate is checked, because a nested guard can capture a shim in
+  # DECK_REAL_TMUX and `command -v` would then find the outer shim first.
+  while IFS= read -r candidate; do
+    if ! is_tmux_guard_shim "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(type -aP tmux 2>/dev/null || true)
+  return 1
+}
+
+# THE INVARIANT: whenever the awaiting-PO marker's presence CHANGES, the tmux
+# window name is recomposed from the current base. No exceptions.
+#
+# tmux only repaints a window name when something calls rename-window, so
+# unlinking the marker on its own leaves the [?] badge on screen with nothing
+# left that will ever repaint it - the file says "not waiting" while the PO
+# still sees "waiting", and they would believe the badge. Every clearing path
+# therefore goes through await-po, which is the single place that does both
+# halves.
+clear_awaiting_po() {
+  local run_dir="$1"
+  if [[ -x "$run_dir/await-po" ]]; then
+    "$run_dir/await-po" clear 2>/dev/null || true
+  else
+    # A run created before await-po existed has no helper to call. It also has
+    # no marker and no badge, so removing the file directly is right there.
+    rm -f "$run_dir/awaiting-po.env"
+  fi
+}
+
+# CLOSE IS NOT DESTRUCTIVE HERE, and that is a deliberate difference from
+# squad.
+#
+# squad's close kills the run's tmux window, which is right there: squad
+# CREATED that window and split three panes into it, so the window is the
+# squad. deck creates no window. It runs one agent in the pane the PO was
+# already standing in, which is usually their own shell - and on a resumed run
+# that pane is recorded in WINDOW_ID. Killing it would close a window the PO
+# never gave deck, taking whatever else was in it.
+#
+# So close records the lifecycle state, takes the waiting badge down, and says
+# what is still running. Stopping a live agent is the PO's call, in the pane
+# they can see.
+close_run() {
+  load_run "${1:-}" true
+  clear_awaiting_po "$RUN_DIR"
+  local was_live=false
+  run_is_live "${LAUNCHER_PID:-}" && was_live=true
+  # THE LIVE PROCESS IDENTITY SURVIVES A CLOSE.
+  #
+  # This used to clear LAUNCHER_PID unconditionally while deliberately leaving
+  # the agent running - so the next `resume` saw a dead run, launched a SECOND
+  # agent against the same run directory, and `rm`/`clean` would happily
+  # delete helpers the live agent was still executing. Close marks the
+  # lifecycle; only the launcher itself, on its way out, clears its own pid.
+  RUN_STATUS="closed"
+  write_state
+  printf 'Closed deck run %s.\n' "$RUN_ID"
+  printf 'The deck itself is untouched at: %s\n' "$DECK_DIR"
+  if [[ "$was_live" == "true" ]]; then
+    printf '\nNOTE: the agent for this run is STILL RUNNING in its own pane (pid %s).\n' "$LAUNCHER_PID"
+    printf '      deck does not kill windows or panes - it did not create them.\n'
+    printf '      Stop it there with Ctrl-C if you want it to stop now.\n'
+    printf '      Until it exits, resume and rm are refused: a second agent on the\n'
+    printf '      same run would have two writers in one deck.\n'
+  fi
+  printf '\nResume with: deck resume %s\n' "$RUN_ID"
+}
+
+remove_run() {
+  local run_id="$1"
+  load_run "$run_id" false
+  if run_is_live "${LAUNCHER_PID:-}"; then
+    echo "Error: run $RUN_ID is still running (pid $LAUNCHER_PID); close it first." >&2
+    return 1
+  fi
+  # THE DECK IS NEVER DELETED. It is the PO's document: they asked to remove a
+  # RUN, which is the agent's scratch space, the prompt and the gate records.
+  rm -rf "${RUN_DIR:?}"
+  printf 'Removed run artifacts for %s.\n' "$RUN_ID"
+  printf 'The deck is untouched at: %s\n' "$DECK_DIR"
+}
+
+clean_runs() {
+  local state_file ids=() reply total=0
+  while IFS= read -r state_file; do
+    unset RUN_ID WINDOW_ID LAUNCHER_PID
+    # shellcheck disable=SC1090
+    source "$state_file"
+    total=$((total + 1))
+    run_is_live "${LAUNCHER_PID:-}" || ids+=("$RUN_ID")
+  done < <(find "$DECK_RUN_ROOT" -mindepth 3 -maxdepth 3 -name state.env -type f 2>/dev/null | sort)
+
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    # Two different situations, and saying the wrong one is a small lie the PO
+    # would have to go and check.
+    if [[ "$total" -eq 0 ]]; then
+      echo "Nothing to clean: there are no retained runs."
+    else
+      echo "Nothing to clean: all $total retained run(s) are still running."
+    fi
+    return 0
+  fi
+  printf 'This will delete the run artifacts of %d run(s):\n' "${#ids[@]}"
+  printf '  %s\n' "${ids[@]}"
+  printf 'The decks themselves are NOT deleted.\n'
+  printf 'Continue? [y/N] '
+  read -r reply
+  [[ "$reply" == "y" || "$reply" == "Y" ]] || { echo "Cancelled."; return 0; }
+  local id
+  for id in "${ids[@]}"; do
+    remove_run "$id" || true
+  done
+}
+
+tag_pane() {
+  local pane="$1" role="$2"
+  command -v tmux >/dev/null 2>&1 || return 0
+  [[ -n "${TMUX:-}" ]] || return 0
+  tmux set-option -p -t "$pane" @deck_run_id "$RUN_ID" 2>/dev/null || true
+  tmux set-option -p -t "$pane" @deck_role "$role" 2>/dev/null || true
+}
+
+# gen-helpers writes a fixed set of filenames with plain redirection, and
+# redirection FOLLOWS a symlink already sitting at the target name. A reused or
+# hostile directory could therefore have deck overwrite any file the caller can
+# write, just by pre-placing helpers/await-po as a symlink to it.
+#
+# The cheap fix, chosen over resolving every output path: the target must be a
+# directory this command can OWN - absent, or present and empty. One check
+# covers every output name at once, including names added later, and an empty
+# directory cannot contain a symlink to follow.
+require_own_gen_dir() {
+  local dir="$1"
+  if [[ -e "$dir" && ! -d "$dir" ]]; then
+    echo "Error: $dir exists and is not a directory." >&2
+    exit 1
+  fi
+  if [[ -d "$dir" ]] && [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+    echo "Error: $dir is not empty." >&2
+    echo "       deck gen-helpers writes a fixed set of file names, and will not" >&2
+    echo "       overwrite anything already sitting at one of them. Use a new" >&2
+    echo "       directory." >&2
+    exit 1
+  fi
+}
+
+# --------------------------------------------------------- generated helpers
+# Regenerated on every launch AND on every resume, so a run created by an older
+# version of this script gets the current helpers as soon as it is resumed.
+# None of them may contain a tmux pane ID.
+
+generate_helper_scripts() {
+  mkdir -p "$RUN_DIR"
+
+  # --- Display width ----------------------------------------------------------
+  # squad uses jq for this because jq is one of its hard dependencies and the
+  # awk on macOS is not Unicode-aware. deck's hard dependency is node, so the
+  # same codepoint table lives in a tiny node script instead: `cut -c` counts
+  # CHARACTERS, and would let a ten-character Japanese name occupy twenty
+  # columns.
+  cat > "$RUN_DIR/window-width.mjs" <<'HELPER'
+// Display columns, not characters. One Japanese character costs two columns.
+const RANGES = [
+  [0x1100, 0x115F], [0x2E80, 0x303E], [0x3041, 0x33FF], [0x3400, 0x4DBF],
+  [0x4E00, 0x9FFF], [0xA000, 0xA4CF], [0xAC00, 0xD7A3], [0xF900, 0xFAFF],
+  [0xFE30, 0xFE6F], [0xFF00, 0xFF60], [0xFFE0, 0xFFE6],
+  [0x1F300, 0x1F9FF], [0x20000, 0x3FFFD],
+];
+const cw = (cp) => (RANGES.some(([a, b]) => cp >= a && cp <= b) ? 2 : 1);
+const cols = (s) => [...s].reduce((n, ch) => n + cw(ch.codePointAt(0)), 0);
+
+const [mode, text = '', maxArg = '20'] = process.argv.slice(2);
+const max = Number(maxArg);
+if (mode === 'width') {
+  process.stdout.write(`${cols(text)}\n`);
+} else if (mode === 'fit') {
+  if (cols(text) <= max) {
+    process.stdout.write(`${text}\n`);
+  } else {
+    // Two columns are reserved for the ellipsis, so the result still fits.
+    let w = 0; let out = '';
+    for (const ch of text) {
+      const c = cw(ch.codePointAt(0));
+      if (w + c > max - 2) break;
+      w += c; out += ch;
+    }
+    process.stdout.write(`${out}..\n`);
+  }
+} else {
+  process.stderr.write('Usage: window-width.mjs <width|fit> <text> [max]\n');
+  process.exit(2);
+}
+HELPER
+
+  # --- Window name ------------------------------------------------------------
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'RUN_DIR=%q\n' "$RUN_DIR"
+    printf 'NODE_BIN=%q\n' "$NODE_BIN"
+    printf 'WINDOW_FALLBACK_NAME=%q\n' "$(placeholder_window_name)"
+    cat <<'HELPER'
+# Usage:
+#   window-name display [base]   the name to hand to tmux rename-window
+#   window-name fit <text> [max] width-aware truncation
+#   window-name width <text>     display columns of a string
+
+# How wide the tmux window name may be, in DISPLAY COLUMNS, not characters. A
+# window name sits in a list beside other windows, so this is a hard budget:
+# one Japanese character costs two columns, so 20 columns is about ten of them.
+SHORT_NAME_MAX_COLUMNS=20
+
+# Shown while the agent is waiting on the PO. Deliberately ASCII: it costs
+# exactly four columns in every terminal, where an emoji's width depends on the
+# font and would make the budget below a guess. To change it, change this one
+# line - the marker is never stored in the base name.
+AWAITING_PO_MARKER='[?] '
+
+measure() {
+  "$NODE_BIN" "$RUN_DIR/window-width.mjs" "$1" "$2" "${3:-0}"
+}
+
+case "${1:-}" in
+  fit)
+    [[ $# -ge 2 ]] || { printf 'Usage: window-name fit <text> [max-columns]\n' >&2; exit 2; }
+    measure fit "$2" "${3:-$SHORT_NAME_MAX_COLUMNS}"
+    ;;
+  width)
+    [[ $# -eq 2 ]] || { printf 'Usage: window-name width <text>\n' >&2; exit 2; }
+    measure width "$2"
+    ;;
+  display)
+    BASE="${2:-}"
+    # short-name.txt is the stored base, written by update-title on every title
+    # change and seeded at launch. The baked-in fallback covers a run whose
+    # first title update has not happened yet.
+    if [[ -z "$BASE" && -s "$RUN_DIR/short-name.txt" ]]; then
+      BASE="$(head -n 1 "$RUN_DIR/short-name.txt")"
+    fi
+    [[ -n "$BASE" ]] || BASE="$WINDOW_FALLBACK_NAME"
+    # PRESENCE of the marker file is the truth; its contents are detail only,
+    # so a half-written or hand-edited file still renders correctly.
+    if [[ -e "$RUN_DIR/awaiting-po.env" ]]; then
+      MARKER_COLUMNS="$(measure width "$AWAITING_PO_MARKER")"
+      # The marker spends part of the SAME budget, so the composed name still
+      # fits the window list. The base is re-fitted rather than pre-truncated,
+      # which is why clearing the marker restores the full stored base.
+      printf '%s%s\n' "$AWAITING_PO_MARKER" \
+        "$(measure fit "$BASE" "$((SHORT_NAME_MAX_COLUMNS - MARKER_COLUMNS))")"
+    else
+      measure fit "$BASE" "$SHORT_NAME_MAX_COLUMNS"
+    fi
+    ;;
+  *)
+    printf 'Usage: window-name <display|fit|width> [args]\n' >&2
+    exit 2
+    ;;
+esac
+HELPER
+  } > "$RUN_DIR/window-name"
+  chmod +x "$RUN_DIR/window-name"
+
+  # --- Awaiting-PO marker -----------------------------------------------------
+  # Records that the agent has asked the PO something and is waiting.
+  #
+  # WHY A FILE OF ITS OWN. Not RUN_STATUS: that feeds `deck list` and the
+  # closed/running lifecycle, and "running but waiting" is not a lifecycle
+  # state. Not a state.env key: write_state rewrites a fixed set of variables
+  # wholesale, so a key written by a helper while deck itself is mid-write
+  # would be lost. An independent file, replaced by rename, has neither problem
+  # and is readable by anything.
+  #
+  # TMUX IS OPTIONAL HERE, unlike in squad. deck splits no panes, so it can run
+  # in a plain terminal; the marker file is the durable truth and the window
+  # rename is best effort. A missing tmux costs the badge, not the record.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'RUN_DIR=%q\n' "$RUN_DIR"
+    cat <<'HELPER'
+# Usage:
+#   await-po mark [reason...]   about to ask the PO something; raise the marker
+#   await-po clear              the PO has been heard from; lower it
+#   await-po status             print the current state (debugging)
+#
+# Both mark and clear are IDEMPOTENT. The agent runs `clear` at the start of
+# every turn without knowing whether a marker exists, so clearing nothing must
+# be silent and free.
+
+MARKER="$RUN_DIR/awaiting-po.env"
+
+# Re-apply the window name for the CURRENT marker state. Best effort on
+# purpose: the marker file is the durable truth and is already written by the
+# time this runs, so a tmux that cannot be reached must not turn into a failed
+# command in the agent's face.
+apply_window_name() {
+  local display
+  command -v tmux >/dev/null 2>&1 || return 0
+  [[ -n "${TMUX:-}" ]] || return 0
+  display="$("$RUN_DIR/window-name" display 2>/dev/null)" || return 0
+  tmux rename-window "$display" 2>/dev/null || true
+}
+
+# One safe line: no control characters (so the file stays parseable), no
+# runaway length, whitespace collapsed. The value is additionally written with
+# %q below, so quotes, $, backticks and the like are inert even when sourced.
+sanitize_reason() {
+  local cleaned
+  cleaned="$(printf '%s' "$1" |
+    tr '\n\r\t' '   ' |
+    sed -E 's/[[:cntrl:]]//g; s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')"
+  # NOT `cut -c`: that counts BYTES unless the locale says otherwise, and a
+  # Japanese reason split mid-character comes back out of %q as octal escapes.
+  # window-name truncates by display column, in node, which is Unicode-aware
+  # wherever it runs.
+  "$RUN_DIR/window-name" fit "$cleaned" 120 2>/dev/null || printf '%s' "$cleaned"
+}
+
+case "${1:-}" in
+  mark)
+    shift
+    REASON="$(sanitize_reason "${*:-}")"
+    GATE="${DECK_GATE_LABEL:-}"
+    # Written to a temp file and RENAMED, so a reader never observes a
+    # half-written marker. $$ keeps two concurrent marks from sharing a temp
+    # path; rename is atomic within the directory, so the last writer wins.
+    TMP="$MARKER.tmp.$$"
+    {
+      printf 'AWAITING_PO=1\n'
+      printf 'AWAITING_PO_AT=%q\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+      [[ -n "$REASON" ]] && printf 'AWAITING_PO_REASON=%q\n' "$REASON"
+      [[ -n "$GATE" ]] && printf 'AWAITING_PO_GATE=%q\n' "$GATE"
+    } > "$TMP"
+    mv -f "$TMP" "$MARKER"
+    apply_window_name
+    if [[ -n "$REASON" ]]; then
+      printf 'Awaiting PO: %s\n' "$REASON"
+    else
+      printf 'Awaiting PO.\n'
+    fi
+    ;;
+  clear)
+    rm -f "$MARKER"
+    apply_window_name
+    ;;
+  status)
+    if [[ -e "$MARKER" ]]; then
+      printf 'awaiting-po: YES\n'
+      cat "$MARKER"
+    else
+      printf 'awaiting-po: no\n'
+    fi
+    printf 'window name would be: %s\n' \
+      "$("$RUN_DIR/window-name" display 2>/dev/null || printf '(unavailable)')"
+    ;;
+  *)
+    printf 'Usage: await-po <mark [reason...]|clear|status>\n' >&2
+    exit 2
+    ;;
+esac
+HELPER
+  } > "$RUN_DIR/await-po"
+  chmod +x "$RUN_DIR/await-po"
+
+  # --- Title update -----------------------------------------------------------
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'RUN_DIR=%q\n' "$RUN_DIR"
+    cat <<'HELPER'
+# Usage: update-title <new-title-file> <new-short-name-file>
+#
+# Two files, one command, because a long pane title and a short window name go
+# stale independently and the window list is how the PO tells their windows
+# apart.
+[[ $# -eq 2 ]] || { printf 'Usage: update-title <title-file> <short-name-file>\n' >&2; exit 2; }
+[[ -s "$1" ]] || { printf 'update-title: %s is empty\n' "$1" >&2; exit 2; }
+[[ -s "$2" ]] || { printf 'update-title: %s is empty\n' "$2" >&2; exit 2; }
+
+head -n 1 "$1" > "$RUN_DIR/title.txt"
+head -n 1 "$2" > "$RUN_DIR/short-name.txt"
+
+if command -v tmux >/dev/null 2>&1 && [[ -n "${TMUX:-}" ]]; then
+  # Composed through window-name so the awaiting-PO marker survives a title
+  # change: the marker is never stored in the base name, and this is the only
+  # place that puts the two together.
+  tmux rename-window "$("$RUN_DIR/window-name" display)" 2>/dev/null || true
+  tmux select-pane -T "$(head -n 1 "$RUN_DIR/title.txt")" 2>/dev/null || true
+fi
+printf 'title:      %s\n' "$(head -n 1 "$RUN_DIR/title.txt")"
+printf 'short name: %s\n' "$(head -n 1 "$RUN_DIR/short-name.txt")"
+HELPER
+  } > "$RUN_DIR/update-title"
+  chmod +x "$RUN_DIR/update-title"
+
+  # --- One gate ---------------------------------------------------------------
+  # squad's helpers write a <step>-status.txt holding the PROCESS status next to
+  # a <step>-result.txt holding the output, because a helper can produce
+  # pass-shaped output and still have died. deck's Node commands already do
+  # that inside the workspace; this records the same split in the RUN
+  # directory, so the run has its own audit trail of which gate ran when and
+  # what it said - including for a run whose deck is later edited by hand.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -uo pipefail\n'
+    printf 'RUN_DIR=%q\n' "$RUN_DIR"
+    printf 'DECK_DIR=%q\n' "$DECK_DIR"
+    printf 'DECK_BIN=%q\n' "$DECK_SCRIPT_PATH"
+    cat <<'HELPER'
+# Usage: deck-gate <gate> [args...]
+#
+# Runs one deterministic gate in the deck workspace and records its result.
+# Returns the gate's own exit status, so the agent reads 0/1/2/3/4 exactly as
+# `deck gate` defines them:
+#   0 completed and passed   1 completed and FAILED its verdict
+#   2 usage   3 environment  4 the gate itself failed and has no verdict
+[[ $# -ge 1 ]] || { printf 'Usage: deck-gate <gate> [args...]\n' >&2; exit 2; }
+GATE="$1"
+# A gate name is a file name component here, so it may not wander out of the
+# run directory via a crafted argument.
+case "$GATE" in
+  */*|..|.|'') printf 'deck-gate: %s is not a gate name\n' "$GATE" >&2; exit 2 ;;
+esac
+LABEL="$GATE"
+# `approve content` and `approve agenda` are two different gates with two
+# different records, so the record is named after both words.
+case "$GATE" in
+  approve|assets|prompts) [[ -n "${2:-}" ]] && LABEL="$GATE-${2#--}" ;;
+esac
+RESULT="$RUN_DIR/gate-$LABEL-result.txt"
+STATUS="$RUN_DIR/gate-$LABEL-status.txt"
+
+# Cleared BEFORE the run, so a reader can never pick up the previous round's
+# status for this round's gate. Same reason squad's send-to clears the status
+# file before queueing the keystrokes.
+rm -f "$STATUS"
+
+{
+  printf '=== deck gate %s ===\n' "$*"
+  printf 'at:   %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf 'deck: %s\n\n' "$DECK_DIR"
+} > "$RESULT"
+
+cd "$DECK_DIR" || { printf '4\n' > "$STATUS"; printf 'deck-gate: cannot enter %s\n' "$DECK_DIR" >&2; exit 4; }
+"$DECK_BIN" gate "$@" >> "$RESULT" 2>&1
+CODE=$?
+printf '%s\n' "$CODE" > "$STATUS"
+cat "$RESULT"
+exit "$CODE"
+HELPER
+  } > "$RUN_DIR/deck-gate"
+  chmod +x "$RUN_DIR/deck-gate"
+
+  # --- The self-repair cycle --------------------------------------------------
+  # THE CAP IS MECHANICAL, NOT A PROMISE.
+  #
+  # squad caps review rounds by having a helper - classify-diff - decide which
+  # round it is and tell the Manager, rather than asking the Manager to count.
+  # Same reasoning here: a cap the agent polices by remembering how many times
+  # it has looped is a cap that an agent with a long transcript will miscount,
+  # and the failure mode is an unbounded token burn the PO is not watching.
+  #
+  # The round number lives in a file. This helper increments it, refuses to run
+  # past the cap, and prints a machine-readable block the agent reads instead
+  # of deciding.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -uo pipefail\n'
+    printf 'RUN_DIR=%q\n' "$RUN_DIR"
+    printf 'DECK_DIR=%q\n' "$DECK_DIR"
+    printf 'NODE_BIN=%q\n' "$NODE_BIN"
+    printf 'DECK_HOME=%q\n' "$DECK_HOME"
+    printf 'CAP=%q\n' "$REPAIR_MAX_ROUNDS"
+    cat <<'HELPER'
+# Usage:
+#   build-cycle            run one round: render, then lint, then report
+#   build-cycle --status   print where the loop is without running anything
+#   build-cycle --reset    start the count again (after re-approved wording)
+#
+# Exit status:
+#   0  the round ran and lint PASSED
+#   1  the round ran and lint FAILED - fix the findings and run another round
+#   3  REFUSED: the cap is spent. Report to the PO; do not loop again.
+#   4  the round could not complete (render died, no deck)
+ROUND_FILE="$RUN_DIR/repair-round.txt"
+
+read_round() {
+  if [[ -s "$ROUND_FILE" ]]; then head -n 1 "$ROUND_FILE"; else printf '0'; fi
+}
+
+# A RESET IS BOUND TO A NEWLY APPROVED REVISION.
+#
+# --reset used to erase the counter unconditionally, which made the cap
+# advisory rather than mechanical: an agent out of rounds could reset and keep
+# going, and nothing recorded that it had. A reset is legitimate when the PO
+# has approved a NEW revision of the wording - that is fresh work, and it
+# earns a fresh allowance. The digest approved at the last reset is
+# remembered, and a second reset against the same digest is refused.
+approved_content_digest() {
+  cd "$DECK_DIR" 2>/dev/null || return 1
+  "$RUN_DIR/deck-gate" status --json 2>/dev/null | "$NODE_BIN" -e '
+let s = ""; process.stdin.on("data", (d) => { s += d; });
+process.stdin.on("end", () => {
+  try {
+    const j = JSON.parse(s.slice(s.indexOf("{")));
+    const c = (j.approvals || {}).content || {};
+    process.stdout.write(c.approved && c.matches ? String(c.approved_digest) : "");
+  } catch { process.stdout.write(""); }
+});' 2>/dev/null
+}
+
+case "${1:-}" in
+  --reset)
+    RESET_MARK="$RUN_DIR/repair-reset-digest.txt"
+    DIGEST="$(approved_content_digest)"
+    if [[ -z "$DIGEST" ]]; then
+      printf 'round=%s\ncap=%s\nreset=refused\n' "$(read_round)" "$CAP"
+      printf '\nRefusing to reset the repair counter: this deck has no CURRENT content\n' >&2
+      printf 'approval. A reset buys another %s round(s), and it is earned by the PO\n' "$CAP" >&2
+      printf 'approving a new revision of the wording - not by asking for one.\n' >&2
+      printf 'Show the copy sheet, get approval, run approve content, then reset.\n' >&2
+      exit 3
+    fi
+    if [[ -s "$RESET_MARK" ]] && [[ "$(head -n 1 "$RESET_MARK")" == "$DIGEST" ]]; then
+      printf 'round=%s\ncap=%s\nreset=refused\n' "$(read_round)" "$CAP"
+      printf '\nRefusing to reset again for the SAME approved revision.\n' >&2
+      printf 'The counter was already reset for content digest %s.\n' "${DIGEST:0:12}" >&2
+      printf 'If the wording needs to change again, change it, show the PO, and get\n' >&2
+      printf 'approval for the new revision.\n' >&2
+      exit 3
+    fi
+    printf '0\n' > "$ROUND_FILE"
+    printf '%s\n' "$DIGEST" > "$RESET_MARK"
+    printf 'round=0\ncap=%s\nreset=yes\napproved_digest=%s\n' "$CAP" "$DIGEST"
+    exit 0
+    ;;
+  --status)
+    ROUND="$(read_round)"
+    printf 'round=%s\ncap=%s\nfinal_round=%s\n' "$ROUND" "$CAP" \
+      "$([[ "$ROUND" -ge "$CAP" ]] && printf 'yes' || printf 'no')"
+    exit 0
+    ;;
+esac
+
+ROUND="$(read_round)"
+NEXT=$((ROUND + 1))
+if [[ "$NEXT" -gt "$CAP" ]]; then
+  printf 'round=%s\ncap=%s\nfinal_round=yes\nrefused=yes\n' "$ROUND" "$CAP"
+  printf '\nThe repair cap of %s round(s) is spent. Do NOT run another round.\n' "$CAP" >&2
+  printf 'Mark the run as awaiting the PO and report the outstanding findings.\n' >&2
+  exit 3
+fi
+printf '%s\n' "$NEXT" > "$ROUND_FILE"
+
+# A PREVIEW render, never --release. A release render is refused when the
+# content digest has moved, and during repair it often has: that refusal
+# belongs at delivery, not in the middle of the loop.
+"$RUN_DIR/deck-gate" render > "$RUN_DIR/cycle-$NEXT-render.txt" 2>&1
+RENDER=$?
+if [[ "$RENDER" -ne 0 ]]; then
+  printf 'round=%s\ncap=%s\nfinal_round=%s\nrender_status=%s\nlint_verdict=none\n' \
+    "$NEXT" "$CAP" "$([[ "$NEXT" -ge "$CAP" ]] && printf 'yes' || printf 'no')" "$RENDER"
+  printf '\nThe render did not complete; there is no geometry to lint.\n' >&2
+  printf 'See %s\n' "$RUN_DIR/cycle-$NEXT-render.txt" >&2
+  exit 4
+fi
+
+"$RUN_DIR/deck-gate" lint > "$RUN_DIR/cycle-$NEXT-lint.txt" 2>&1
+LINT=$?
+
+# Everything below is read out of the lint report rather than scraped from the
+# human output, so a wording change in a message cannot change what the agent
+# is told. Node does the JSON, because node is already a hard dependency.
+SUMMARY="$("$NODE_BIN" --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+// WHAT COUNTS AS BLOCKING IS DECIDED BY THE LINTER, NOT BY THIS HELPER.
+// A first version re-derived it here as "not info and not warn", which
+// counted 8 findings of severity suggestion as blocking and printed
+// blocking=8 beside lint_verdict=pass. Two copies of a severity rule is one
+// copy too many, so the predicate is imported from the linter itself and the
+// totals come from the report the linter already wrote.
+// NOTE: no apostrophes below. This whole block is a single-quoted shell
+// string, and one apostrophe closes it and feeds the rest to bash.
+const [deckDir, deckHome] = process.argv.slice(1);
+const { isBlocking } = await import(`${deckHome}/src/lint/finding.js`);
+const out = (k, v) => process.stdout.write(`${k}=${v}\n`);
+let report = null;
+try {
+  report = JSON.parse(fs.readFileSync(path.join(deckDir, "out", "lint", "report.json"), "utf8"));
+} catch {}
+if (!report) { out("lint_verdict", "unreadable"); out("blocking", "?"); process.exit(0); }
+const findings = report.findings || [];
+const blocking = findings.filter(isBlocking);
+// REPAIRABLE NOW, vs OUTSTANDING ILLUSTRATIONS.
+//
+// An empty slot blocks the lint verdict, because a deck with no pictures in
+// it is not finished and the whole point of the slot-fill rule is to say so.
+// But the illustrations are step 7 and this loop is step 6, so an agent that
+// treated them as repair work would spend its entire cap on findings it
+// cannot act on yet and then refuse to go on. The two counts are therefore
+// reported separately, and the exit code below is about blocking_layout -
+// the work that can be done in THIS round.
+//
+// This is not a second opinion about severity. The linter decides what
+// blocks, and lint_verdict still says fail; this only splits the blocking
+// set by which step of the flow can clear it.
+const slotFindings = blocking.filter((f) => f.rule === "slot-fill");
+const layout = blocking.filter((f) => f.rule !== "slot-fill");
+out("lint_verdict", report.verdict || "unknown");
+out("blocking", (report.counts && report.counts.blocking !== undefined) ? report.counts.blocking : blocking.length);
+out("blocking_layout", layout.length);
+out("blocking_slots", slotFindings.length);
+out("suggestions", (report.counts && report.counts.suggestions) || 0);
+out("rules", [...new Set(layout.map((f) => f.rule))].sort().join(",") || "-");
+out("slides", [...new Set(layout.map((f) => f.slide).filter(Boolean))].sort().join(",") || "-");
+' "$DECK_DIR" "$DECK_HOME" 2>/dev/null)"
+
+# The content approval state comes from `deck gate status --json`, which
+# re-derives it from what is on disk rather than reading back a stored phase.
+DIGEST_BLOCK="$(cd "$DECK_DIR" && "$RUN_DIR/deck-gate" status --json 2>/dev/null | "$NODE_BIN" -e '
+let s = ""; process.stdin.on("data", (d) => { s += d; });
+process.stdin.on("end", () => {
+  try {
+    const j = JSON.parse(s.slice(s.indexOf("{")));
+    const c = (j.approvals || {}).content || {};
+    process.stdout.write(`phase=${j.phase}\n`);
+    process.stdout.write(`content_approved=${c.approved ? "yes" : "no"}\n`);
+    process.stdout.write(`content_digest_matches=${c.matches ? "yes" : "no"}\n`);
+    // SLOTS, BESIDE THE VERDICT. The PO got lint_verdict=pass on a deck with
+    // fourteen of fifteen illustration slots empty, and said that seeing
+    // slots_empty=14 on the same line would have caught it on the spot. It
+    // is the count `render --release` refuses on and the count the slot-fill
+    // rule reports, read from status rather than recounted here.
+    const f = j.slot_fill || {};
+    process.stdout.write(`slots_empty=${(f.empty || []).length}\n`);
+    process.stdout.write(`slots_total=${f.total === undefined ? "?" : f.total}\n`);
+    process.stdout.write(`slots_awaiting_your_own=${(f.awaiting_reuse || []).length}\n`);
+  } catch { process.stdout.write("phase=unknown\ncontent_approved=?\ncontent_digest_matches=?\nslots_empty=?\nslots_total=?\nslots_awaiting_your_own=?\n"); }
+});' 2>/dev/null)"
+
+printf 'round=%s\n' "$NEXT"
+printf 'cap=%s\n' "$CAP"
+printf 'final_round=%s\n' "$([[ "$NEXT" -ge "$CAP" ]] && printf 'yes' || printf 'no')"
+printf 'render_status=0\n'
+printf 'lint_status=%s\n' "$LINT"
+printf '%s\n' "$SUMMARY"
+printf '%s\n' "$DIGEST_BLOCK"
+printf 'lint_output=%s\n' "$RUN_DIR/cycle-$NEXT-lint.txt"
+
+# THE EXIT CODE IS ABOUT REPAIR WORK, NOT ABOUT WHETHER THE DECK IS FINISHED.
+#
+# `lint` exits 1 while any finding blocks, empty illustration slots included.
+# Those are step 7 and this is step 6, so looping on them would burn the cap
+# on work that cannot be done yet. When the only thing left is pictures, this
+# exits 0 and says so - lint_verdict above still reads fail, and
+# `render --release` at step 8 still refuses.
+if [[ "$LINT" -eq 0 ]]; then
+  exit 0
+elif [[ "$LINT" -eq 1 ]]; then
+  LAYOUT="$(printf '%s\n' "$SUMMARY" | sed -n 's/^blocking_layout=//p')"
+  if [[ "$LAYOUT" == "0" ]]; then
+    printf '\nThe LAYOUT is clean. What still blocks the lint verdict is empty\n' >&2
+    printf 'illustration slots, which is step 7 and not repair work. Do not run\n' >&2
+    printf 'another repair round for them: go and get the illustrations.\n' >&2
+    exit 0
+  fi
+  exit 1
+else
+  exit 4
+fi
+HELPER
+  } > "$RUN_DIR/build-cycle"
+  chmod +x "$RUN_DIR/build-cycle"
+
+  # --- Source recording -------------------------------------------------------
+  # The agent fetches through its own MCP tools and must then SAVE what it got.
+  # Getting the manifest shape right by hand, every time, in the middle of a
+  # conversation, is exactly the kind of thing that quietly goes wrong, so this
+  # helper writes the entry and runs the gate.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'RUN_DIR=%q\n' "$RUN_DIR"
+    printf 'DECK_DIR=%q\n' "$DECK_DIR"
+    printf 'NODE_BIN=%q\n' "$NODE_BIN"
+    printf 'DECK_HOME=%q\n' "$DECK_HOME"
+    cat <<'HELPER'
+# Usage: record-source <id> <kind> <ref> <text-file> <complete> [raw-file]
+#
+#   kind      notion | file | typed
+#   complete  yes | no        - "no" BLOCKS approval, which is the point
+#   raw-file  REQUIRED for a notion source: a JSON ARRAY holding every raw
+#             response of the retrieval, in order - the whole pagination
+#             chain and every block-children call. The block count, the page
+#             ids and the pagination record are DERIVED from it rather than
+#             asked of you, because those are the facts a fetch should not be
+#             trusted to vouch for about itself.
+#
+# Appends one entry to sources/manifest.json, creating it if needed. The text
+# file is what every verbatim check reads, so it must hold the source's words
+# and not a summary of them.
+[[ $# -ge 5 ]] || {
+  printf 'Usage: record-source <id> <kind> <ref> <text-file> <yes|no> [raw-file]\n' >&2
+  exit 2
+}
+ID="$1"; KIND="$2"; REF="$3"; TEXT="$4"; COMPLETE="$5"; RAW="${6:-}"
+
+"$NODE_BIN" --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+const [deck, deckHome, id, kind, ref, textFile, complete, rawFile] = process.argv.slice(1);
+const { summariseRaw } = await import(`${deckHome}/src/intake/notion.js`);
+// THE DECK ROOT, RESOLVED. A relative argument is relative to the DECK, not
+// to wherever the agent happened to be standing - that is what it means when
+// it types sources/minutes.txt, and it keeps the helper cwd-independent.
+// Both sides are resolved with realpath before being compared, or a deck
+// under a symlinked parent (/tmp on macOS, a symlinked home) produces a
+// text_file of ../../../../private/tmp/... failing its own containment check.
+const deckReal = fs.realpathSync(deck);
+const dir = path.join(deckReal, "sources");
+fs.mkdirSync(dir, { recursive: true });
+const file = path.join(dir, "manifest.json");
+const rel = (f) => {
+  if (!f) return null;
+  const abs = path.isAbsolute(f) ? f : path.join(deckReal, f);
+  const real = fs.existsSync(abs) ? fs.realpathSync(abs) : abs;
+  const r = path.relative(deckReal, real);
+  if (r.startsWith("..") || path.isAbsolute(r)) {
+    process.stderr.write(`record-source: ${f} is outside the deck workspace.\n`);
+    process.stderr.write("Source files must live under the deck, so they travel with it.\n");
+    process.exit(1);
+  }
+  return r;
+};
+let m = { schema: "deck.sources/1", sources: [] };
+if (fs.existsSync(file)) m = JSON.parse(fs.readFileSync(file, "utf8"));
+// IMMUTABLE ONCE WRITTEN. A ledger quote is verified against this text, so
+// replacing a source after extraction would retroactively validate a quote
+// nobody could have made. Adding a source is fine; rewriting one is refused.
+if (m.sources.some((s) => s.id === id)) {
+  process.stderr.write(`record-source: source "${id}" already exists and sources are immutable.\n`);
+  process.stderr.write("Use a new id if this is new material.\n");
+  process.exit(1);
+}
+const textPath = rel(textFile);
+if (!fs.existsSync(path.join(deckReal, textPath))) {
+  process.stderr.write(`record-source: no such text file: ${textFile}\n`);
+  process.exit(1);
+}
+// THE RETRIEVAL EVIDENCE IS DERIVED FROM THE SAVED RESPONSE, not declared.
+//
+// This used to write pagination:null and block_count:null and tell the agent
+// to fill them in. The source gate then checked those self-declared fields
+// and merely whether raw_file was a non-empty string - so an entry with
+// complete:true, pagination:null and a path to a file that did not exist
+// passed cleanly. Counting the blocks and reading has_more off the bytes
+// removes the agent from the loop for exactly the facts it should not be
+// asked to vouch for.
+const rawPath = rel(rawFile);
+let summary = null;
+if (rawPath) {
+  const abs = path.join(deckReal, rawPath);
+  if (!fs.existsSync(abs)) {
+    process.stderr.write(`record-source: the raw response ${rawFile} does not exist.\n`);
+    process.stderr.write("For a notion source this file is the evidence the fetch happened.\n");
+    process.exit(1);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(abs, "utf8"));
+  } catch (err) {
+    process.stderr.write(`record-source: ${rawFile} is not valid JSON: ${String(err)}\n`);
+    process.exit(1);
+  }
+  summary = summariseRaw(parsed);
+}
+if (kind === "notion" && !summary) {
+  process.stderr.write("record-source: a notion source needs its raw response saved.\n");
+  process.stderr.write("Save every response of the chain as a JSON array and pass it as the\n");
+  process.stderr.write("last argument. Without it the fetch cannot be verified at all.\n");
+  process.exit(1);
+}
+m.sources.push({
+  id, kind, ref,
+  retrieved_at: new Date().toISOString(),
+  raw_file: rawPath || null,
+  text_file: textPath,
+  complete: complete === "yes",
+  block_count: summary ? summary.blocks : null,
+  page_ids: summary ? summary.pageIds : [],
+  block_ids: summary ? summary.blockIds : [],
+  pagination: summary ? { requests: summary.requests, has_more: summary.unfinished, next_cursor: null } : null,
+  missing: [],
+  notes: null,
+});
+fs.writeFileSync(file, `${JSON.stringify(m, null, 2)}\n`);
+process.stdout.write(`recorded source "${id}" (${kind}, complete=${complete})\n`);
+if (summary) {
+  process.stdout.write(`  derived from the saved response: ${summary.requests} request(s), ${summary.blocks} block(s), ${summary.tables} table(s)\n`);
+  if (summary.unfinished) {
+    process.stdout.write("  WARNING: the saved response left a pagination cursor unfollowed.\n");
+  }
+  for (const problem of summary.problems) process.stdout.write(`  WARNING: ${problem}\n`);
+}
+process.stdout.write("Add anything MISSING to sources/manifest.json by hand - a child page that\n");
+process.stdout.write("errored, a database the token cannot read. Nothing else needs editing.\n");
+' "$DECK_DIR" "$DECK_HOME" "$ID" "$KIND" "$REF" "$TEXT" "$COMPLETE" "$RAW"
+
+"$RUN_DIR/deck-gate" source || true
+HELPER
+  } > "$RUN_DIR/record-source"
+  chmod +x "$RUN_DIR/record-source"
+}
+
+# --------------------------------------------------------------- agent prompt
+# Contains NO tmux pane ID: nothing is addressed by pane, so the prompt stays
+# valid across any number of resumes. Regenerated on resume for the same
+# reason.
+generate_agent_prompt() {
+  local given_source="${SOURCE_SPECS:-}"
+  cat > "$RUN_DIR/agent-prompt.md" << PROMPT
+# あなたは資料作成担当です / You produce the deck
+
+You talk to the PO in JAPANESE. Everything you write for yourself - notes,
+task files, commit-style records - is in English.
+
+You do the whole job: interview the PO, read the source, propose the agenda,
+write the copy, write storyboard.yaml, render, lint, FIX WHAT LINT FINDS, and
+hand over a PDF. There is no second agent. \`deck gate lint\` is the review:
+nine rules over measured geometry, deterministic, and it already runs.
+
+## Environment
+
+- Deck workspace: $DECK_DIR
+- Run artifacts:  $RUN_DIR
+- Run id:         $RUN_ID
+- Theme:          ${THEME:-watercolor}
+- Repair cap:     $REPAIR_MAX_ROUNDS round(s) (DECK_REPAIR_MAX_ROUNDS)
+- Title the PO gave: $TASK
+- Purpose:  ${PURPOSE:-(not given - ask)}
+- Audience: ${AUDIENCE:-(not given - ask)}
+- Meeting:  ${MEETING_WHEN:-(not given - ask)}
+- Source:   ${given_source:-(not given - ask)}
+- The PO launched deck from: ${INVOKED_FROM:-unknown}
+  A relative path they type in conversation - ./notes.md - is relative to
+  THAT directory, not to the deck workspace you are standing in.
+
+## The gates
+
+Run every gate through the helper, never by hand, so the run keeps its own
+record of what ran and what it said:
+
+    '$RUN_DIR/deck-gate' <gate> [args...]
+
+It returns the gate's own exit status, and deck's exit codes are a contract:
+
+    0  ran, and the verdict PASSED
+    1  ran, and the verdict FAILED - findings, a digest mismatch, a refusal
+    2  usage error
+    3  environment error (no Chrome, no poppler, no workspace)
+    4  the gate itself FAILED and has no verdict at all
+
+1 and 4 are different events and you must treat them differently. A lint that
+found violations is a successful run with a failing answer; a lint that died
+has no answer. NEVER report a 4 as if it were a verdict.
+
+The gates, in the order this job uses them:
+
+    source      was the material fully retrieved? A partial fetch BLOCKS.
+    ledger      does every quote really occur in the source?
+    agenda      is every open item on the agenda or explicitly excluded?
+    validate    schema and semantics of storyboard.yaml
+    copy        the readable Japanese copy sheet for the PO
+    fidelity    do the numbers, dates and table cells trace to the source?
+    approve agenda | approve content
+    render      storyboard -> HTML -> PDF -> PNGs (--release at the end)
+    lint        the layout gate on measured geometry
+    prompts --single    ONE pasteable illustration brief
+    inbox       import whatever the PO dropped in $DECK_DIR/inbox
+    export      verify and list the deliverable
+    status      phase, approvals, slots - re-derived from disk
+
+## Telling the PO you are waiting
+
+The PO is often not looking at this window, sometimes not at this machine. Mark
+the run as waiting whenever you hand control back to them:
+
+    '$RUN_DIR/await-po' mark '<short reason>'
+    '$RUN_DIR/await-po' clear
+    '$RUN_DIR/await-po' status
+
+- At the VERY START of every turn, before anything else, run:
+      '$RUN_DIR/await-po' clear
+  It is free when nothing is marked. This is what takes the badge down once the
+  PO has answered, including when they answered directly in this pane, so it
+  runs whether or not you think you were waiting.
+- BEFORE you ask a question or pause for an approval, run \`await-po mark\`
+  with a short reason. Run it BEFORE you write the question, not after: once
+  you have asked, you stop, and the marker is the only thing that tells the PO
+  they are the blocker.
+
+## Keeping the window honest
+
+After you know what this deck is about, and again whenever it materially
+changes, write two files and run one command:
+
+    cat > '$RUN_DIR/new-title.txt' <<'EOF'
+    (specific Japanese title, e.g. 野沢温泉 11月定例 次回MTG資料)
+    EOF
+    cat > '$RUN_DIR/new-short-name.txt' <<'EOF'
+    (two words, e.g. 野沢温泉MTG)
+    EOF
+    '$RUN_DIR/update-title' '$RUN_DIR/new-title.txt' '$RUN_DIR/new-short-name.txt'
+
+The short name is at most 20 display columns - about ten Japanese characters -
+because it sits in a window list beside other windows.
+
+## THE FLOW
+
+### 1. INTAKE - ask for what is missing, and nothing more
+
+Ask the PO, in Japanese, only for what you do not already have from the
+Environment block above: the deck's purpose, who is in the room, which meeting
+and when, and the source material. If the launch already gave you a source and
+a purpose, do NOT ask for them again, and do not interrogate them with a form
+when one question would do. One message, the missing things, then stop and wait.
+
+For the source, accept any of:
+  - a Notion URL          -> fetch it (step 2)
+  - a file path           -> read it
+  - text typed into this pane -> save it verbatim as a typed source
+
+Mark the run as waiting before you ask.
+
+### 2. SOURCE - fetch it, save it, and say so if it is partial
+
+For a Notion URL use the notion-personal MCP tools available in this session.
+Do NOT invent a shell command for Notion; there is none.
+
+    - resolve the URL to a page id, then walk its blocks
+    - FOLLOW EVERY PAGINATION CURSOR. A Notion block-children response carries
+      has_more and next_cursor; keep going until has_more is false.
+    - descend into nested blocks: toggles, columns, synced blocks, child pages
+      and callouts all hide content one level down
+    - read tables as tables - row by row, cell by cell
+    - if something cannot be read (a child page that errors, a database the
+      token cannot see), that is a MISSING PIECE, not a thing to skip quietly
+
+Save, under $DECK_DIR/sources/:
+    <id>.json   EVERY raw response of the retrieval, as a JSON ARRAY, in the
+                order you made the calls - the whole pagination chain and
+                every block-children call. Untouched.
+    <id>.txt    the flattened plain text, in source order
+
+Then record it:
+
+    '$RUN_DIR/record-source' <id> notion '<url>' sources/<id>.txt yes sources/<id>.json
+
+The block count, the page ids and the pagination record are DERIVED from that
+array; you are not asked for them, and the source gate re-derives them from
+the same bytes. This is deliberate: whether a fetch finished is not something
+a fetch should be trusted to say about itself. If the array shows a cursor
+left unfollowed, or a block reporting has_children whose children are not in
+the array, the gate blocks and names it.
+
+So save the chain. A single response object is accepted for a one-call fetch,
+but a toggle, a column, a synced block or a child page means more calls, and
+their responses belong in the array too.
+
+Add anything MISSING to sources/manifest.json by hand - a child page that
+errored, a database the token cannot read. That is the one field only you know.
+
+IF THE FETCH IS PARTIAL: record it with \`no\` instead of \`yes\`, fill in
+\`missing\` with what is absent and why, and TELL THE PO before you build
+anything. \`deck gate source\` will block, and that is correct: an agenda built
+on half the minutes looks exactly like one built on all of it, and nobody in
+the meeting can tell which they are looking at. Do not work around the block.
+
+Run \`'$RUN_DIR/deck-gate' source\` and require 0 before moving on.
+
+### 3. LEDGER - extraction, kept apart from reasoning
+
+ASK FOR THE SHAPE INSTEAD OF GUESSING AT IT:
+
+    '$RUN_DIR/deck-gate' schema ledger --example
+    '$RUN_DIR/deck-gate' schema agenda --example
+    '$RUN_DIR/deck-gate' schema sources --example
+    '$RUN_DIR/deck-gate' schema storyboard
+
+Each prints a valid document of that shape with every optional field in it,
+and \`deck gate schema\` with no argument lists them. These files all set
+additionalProperties: false - an unknown key is REFUSED and named, never
+accepted and dropped - so a near-miss on a key name is an error rather than
+silently lost content. Somebody once spent an afternoon binary-searching ten
+candidate keys against the gates to find that a ledger entry wants
+\`source_id\` and \`note\`, and that an EXCLUDED agenda item says \`reason\`
+where an included one says \`why\`. Run the command.
+
+Write $DECK_DIR/ledger.json. Pull out, each as its own entry:
+
+    decision        with status resolved | unresolved
+    open_question
+    action          with status done | pending, an owner, and a due date
+    number          with its value, its unit, and the period it describes
+
+EVERY entry carries \`quote\`: the EXACT source wording, copied, not
+paraphrased. \`deck gate ledger\` looks for each quote in the saved source text
+and refuses an entry whose quote is not there. This is checked, not trusted,
+so do not write a tidied-up version of a sentence into \`quote\`.
+
+Rules that matter more than they look:
+  - NEVER record an action as \`done\` because it sounds finished. Only the
+    source saying so makes it done.
+  - A number with no unit is not a number. A number with no period is not a
+    trend. The gate refuses both - but if the SOURCE genuinely does not state
+    one, say so with source_omits:
+
+        { "id": "a-03", "kind": "action", "status": "pending",
+          "quote": "...", "source_omits": ["owner"] }
+
+    That is the honest answer and the gate accepts it. Do NOT invent an owner,
+    infer a period or assume a unit to get past the check - inventing the very
+    thing the gate protects is the one failure that matters here. Every entry
+    with source_omits must then be raised at the agenda gate, in
+    missing_evidence or as an agenda item: a hole in the minutes is a question
+    for the room.
+  - When the source contradicts itself - two different figures for the same
+    thing - record BOTH entries and link them with \`conflicts_with\`. Do not
+    pick one silently. Raise it with the PO at gate 4.
+  - Do not summarise the source and then work from the summary. The ledger is
+    the working material from here on.
+
+Run \`'$RUN_DIR/deck-gate' ledger\` and require 0.
+
+### 4. AGENDA - FIRST APPROVAL GATE
+
+Write $DECK_DIR/agenda.json: what the NEXT meeting is for, and the items.
+Build it from the ledger - unresolved decisions, action follow-up, missing
+evidence, the things you want agreement on.
+
+\`excluded\` is not optional bookkeeping. Every still-open ledger item must be
+either on the agenda or in \`excluded\` with a reason, and the gate refuses an
+agenda that drops one in silence: nobody can see an absence. Put what you could
+not find in the source into \`missing_evidence\`.
+
+Put every ledger entry carrying source_omits into missing_evidence or onto an
+item, naming the entry id, or the gate will say so.
+
+Run \`'$RUN_DIR/deck-gate' agenda\` and require 0. Then:
+
+    '$RUN_DIR/await-po' mark 'アジェンダの確認'
+
+and show the PO, in Japanese prose in this pane:
+  - each agenda item, what it is for, and WHICH SOURCE WORDING it rests on
+  - what you are LEAVING OUT and why - say this out loud, do not bury it
+  - anything you could not find
+  - any conflicting numbers you found, with both figures
+
+Then stop. The PO approves, edits, or redirects. When they approve, run:
+
+    '$RUN_DIR/deck-gate' approve agenda
+
+Only run that after they have actually said so. Never record an approval the
+PO did not give.
+
+WHAT THAT RECORDS: agenda.json itself - the items, the reasons, the exclusions
+and the missing evidence, which is what the PO read. Writing the storyboard in
+the next step does NOT invalidate it. Editing agenda.json does, and then you
+must show the PO what changed and ask again.
+
+It also REFUSES while the source, ledger or agenda gate is failing, because an
+approval recorded over a failing gate is an approval the PO believes means the
+checks passed. Fix the gate. --force exists for a PO who has decided to accept
+a finding knowingly; it is recorded in the approval history, and it is theirs
+to ask for, not yours to reach for.
+
+### 5. STORYBOARD - SECOND APPROVAL GATE
+
+YOU write $DECK_DIR/storyboard.yaml. The PO never opens it.
+
+Build it from the ledger. You write the headings and the connective prose -
+that is your job - but:
+  - every number, date, name, quotation and table cell comes from the source,
+    VERBATIM
+  - never invent a number or a date
+  - never present an unresolved action as finished
+  - a table cell carrying a number must be verbatim: a table is where a number
+    goes to be read as data
+
+#### HOW MUCH ONE PAGE HOLDS
+
+A page is a fixed rectangle. These are MEASURED limits for the watercolor
+theme - rendered at each size until the content stopped fitting - and
+\`deck gate validate\` refuses a storyboard that exceeds them, before anything
+renders:
+
+    agenda      7 items          6 if the slide also has a footer banner
+    table       7 rows           6 with a footer banner
+    comparison  8 axes
+    standard-3col  3 cards   comparison 4 columns   process 5 steps
+    ecosystem 6 nodes / 3 layers      timeline 6 entries
+
+The footer banner costs a row because it takes 92 px off the bottom of the
+page and a row is about 90.
+
+WHEN CONTENT DOES NOT FIT, the design kit gives the order to try things in,
+and deck follows it:
+
+  1. tighten the layout - deck already does this where it can; an agenda
+     compresses its row spacing before it refuses
+  2. rework the wording so it is shorter, WITHOUT changing what it says
+  3. split across two slides, and tell the PO you are doing it
+
+What you may never do - all four are forbidden by name in the kit:
+無断要約 (summarising without being asked), 文言削除 (dropping words),
+読めない大きさへの縮小 (shrinking below readable), 無断のページ追加.
+
+LENGTH IS NOT CAPPED, and that is deliberate: how much text fits depends on
+how wide the box is, so the same sentence fits in a three-column table and
+overflows a six-column one. There is no number that is right for both. The
+render measures it exactly instead - \`lint\` names the characters that did
+not make it onto the page, under content-integrity. Treat that rule's findings
+as the most serious thing in the report: they mean the PO's words are missing
+from the delivered deck.
+
+#### DECLARE THE ILLUSTRATION SLOTS. Every page type that has one.
+
+deck generates no pictures. What it does is RESERVE the space and put the
+request into the brief the PO pastes into ChatGPT - and both halves only
+happen if you declare the slot in the storyboard.
+
+Which page types take one, and the size to declare:
+
+    cover             cover-art       760 x 941   (bleeds off the right edge)
+    agenda            agenda-art      620 x 871   (bleeds off the right edge)
+    section-divider   divider-art     700 x 941   (bleeds off the right edge)
+    standard-3col     col-1-art       474 x 210   one per column, all three
+                      col-2-art       474 x 210
+                      col-3-art       474 x 210
+    comparison        comparison-art  1562 x 220  a wide band under the figure
+    process           process-art     1562 x 220
+    timeline          timeline-art    1562 x 220
+    ecosystem         ecosystem-art   1562 x 220  LAYERS form only - a hub page
+                                                  is already the picture, and
+                                                  validate refuses it there
+    table, statement  none. A table fills its own space, and the design kit
+                      says a statement page is 不要なイラストで埋めない.
+
+A declared slot is reserved on the page whether or not the picture has
+arrived, so the page is composed either way. An UNdeclared slot is a page with
+a hole in it: the band still renders, but nothing asks the PO for the image
+and nothing checks it ever came.
+
+THE SAME IDS REPEAT ON EVERY SLIDE OF THAT PAGE TYPE. `col-1-art` means "the
+first column's picture", which every three-column slide has - so four
+three-column slides declare `col-1-art` four times, and that is correct. Do
+NOT invent per-slide ids like `decided-col-1-art`: the theme would not know
+them and validate refuses them by name.
+
+A slot is addressed by SLIDE and SLOT everywhere it is named outside the
+storyboard:
+
+    deck gate assets import decided:col-1-art <file>
+    the brief asks for        04-decided-col-1-art.png
+
+so twelve illustrations for four three-column slides come back under twelve
+distinct names and `inbox` places every one of them without guessing. A bare
+`cover-art` still works wherever only one slide has it.
+
+Write a real brief in each one - what the picture should DEPICT, in Japanese,
+ending 文字は一切入れない. It is pasted into the PO's prompt verbatim. Do not
+write "イラスト" and leave it at that.
+
+#### Choosing the page type: REACH FOR A DIAGRAM FIRST
+
+Before you write a slide, ask what SHAPE its content is. A deck that answers
+"table" every time is a deck that has given the reader a spreadsheet and asked
+them to reconstruct the relationship themselves - and that is what this tool
+did until these page types existed.
+
+Four shapes, with what each looks like in the ledger:
+
+  COMPARISON - two to four options, each answered on the same questions.
+    You can hear it: 「A案は…、B案は…」, or any list where every item has the
+    same attributes. If you can name the AXES the options are being judged on,
+    it is a comparison.
+
+  PROCESS - steps in order, where the order is the point.
+    「まず〜、次に〜、そのあと〜」. Phases, stages, a sequence of approvals.
+    If swapping two items would be wrong, it has order, and order wants arrows.
+
+  ECOSYSTEM - who does what, and what connects to what.
+    Either a hub: one thing in the middle that everything else talks to. Or
+    layers: things on top that all rest on something shared underneath.
+    「AがBに出し、CはBから受け取る」 is a hub. 「どちらにも〜が要る」 is layers.
+
+  TIMELINE - dated or sequenced events.
+    「10月に〜、年内に〜、年始に〜」. If the entries carry WHEN, it is a
+    timeline, even when some of the whens are vague.
+
+WORKED EXAMPLES. Neutral subject - a company choosing a payroll system - so
+you can see the shape without copying the words.
+
+  A comparison. Note the axes are named once and every column answers all of
+  them, in the same order:
+
+      page_type: comparison
+      title: "3つの候補と、その評価"
+      comparison:
+        axes: ["初期費用", "社内で運用できるか", "他システム連携"]
+        columns:
+          - label: "A社"
+            caption: "国内シェア最大"
+            cells: ["高い", "研修なしで可能", "会計のみ"]
+          - label: "B社"
+            caption: "海外製"
+            cells: ["安い", "英語の運用が要る", "ほぼ全て"]
+            emphasis: true
+        note: "連携範囲を優先するならB社になります。"
+
+  A process. The NUMBER is drawn from the position - never write 「①」 into
+  the heading - and a stage with several things keeps them as its items:
+
+      page_type: process
+      process:
+        direction: horizontal
+        steps:
+          - label: "9月"
+            heading: "候補を絞る"
+            items: ["3社に見積もり依頼", "現場の要件を確認"]
+          - label: "10月"
+            heading: "試用する"
+            items: ["1部署で1か月"]
+
+  An ecosystem, hub form. \`direction\` is which way the arrow runs, and it is
+  meaning - get it backwards and the picture is a false statement:
+
+      page_type: ecosystem
+      ecosystem:
+        layout: hub
+        centre: { label: "給与システム", caption: "人事が運用する" }
+        nodes:
+          - { label: "勤怠", caption: "打刻を渡す", direction: from }
+          - { label: "会計", caption: "仕訳を受け取る", direction: to }
+
+  An ecosystem, layers form. The LAST layer is drawn as the shared base:
+
+      page_type: ecosystem
+      ecosystem:
+        layout: layers
+        layers:
+          - label: "やりたいこと"
+            items: ["給与計算の自動化", "年末調整の電子化"]
+          - label: "共通の土台"
+            items: ["マスタの整備", "勤怠データの電子化"]
+
+  A timeline. Nothing is sorted - the array order IS the time order, and
+  \`when\` is the source's own wording:
+
+      page_type: timeline
+      timeline:
+        entries:
+          - when: "10月"
+            label: "試用の結果を見る"
+            items: ["現場の反応", "工数の実測"]
+          - when: "年内"
+            label: "契約するか決める"
+            emphasis: true
+
+WHEN A TABLE IS STILL RIGHT, and it genuinely often is:
+
+  - many rows of the SAME shape - a list of facilities, a set of line items -
+    where the reader scans down rather than across
+  - precise values meant to be READ OFF: prices, counts, dates in a schedule
+  - more than four things being compared, where columns would be unreadable
+
+A table is not a failure. A table standing in for a relationship is.
+
+WHAT YOU MAY NOT DO to make a diagram fit:
+
+  - never invent an axis, a step, a node or a date that the source does not
+    support. If the content does not have four comparable options, it is not a
+    comparison - say so and use what it is.
+  - never set \`emphasis\` yourself. It marks the author's recommendation, and
+    inventing a verdict is the thing every gate in this tool exists to stop.
+  - never reorder a timeline or a process to make it read better. The order IS
+    the content.
+  - never split one relationship across two slides to fit a shape.
+
+\`deck gate validate\` prints a composition note when most of a deck's content
+slides are tables, or when nothing in it draws a relationship. It is a NOTE,
+not a gate: validate still passes. Read it, look at the deck again, and decide.
+
+
+Then:
+
+    '$RUN_DIR/deck-gate' validate     # require 0
+    '$RUN_DIR/deck-gate' fidelity     # require 0
+    '$RUN_DIR/deck-gate' copy
+
+\`fidelity\` checks that the storyboard's numbers, dates and table cells occur
+in the source. It is not a proof: it catches digits that appear NOWHERE in the
+source, not arithmetic you performed, and not a real number used in the wrong
+claim. Do not treat a pass as permission to stop checking your own work.
+
+\`copy\` prints the copy sheet: every title, subtitle, body line and table
+cell, numbered by slide, each marked 【引用】 or 【作成】. The marks are
+COMPUTED from the source text, not declared by you.
+
+RENDER A DRAFT BEFORE YOU ASK FOR APPROVAL. This is not optional and it is
+not a nicety:
+
+    '$RUN_DIR/deck-gate' render        # a PREVIEW; always allowed
+
+A preview render is allowed at any time, needs no approval, and does not need
+the illustrations to exist - empty slots render as reserved frames. Run it,
+then show the PO BOTH:
+
+  - the PNGs in $DECK_DIR/out/png/ (give them the paths; they open them)
+  - the copy sheet, pasted in full
+
+WHY, in the PO's own words after the first real deck:
+「中身見れないほどに見た目がくそすぎて判断できない。中身見るレベルにない」
+They were shown a copy sheet for a deck whose cover title had broken into
+three huge lines, whose statement page split a word across the paper edge, and
+whose three-column pages were half empty. Nobody can judge wording on a page
+that looks broken. They got unstuck only by rendering first on their own
+initiative, and that is what this step makes standard.
+
+It is also the only defence against the errors no rule here can catch. On that
+same deck, these reached the page and every gate passed them:
+
+  - a slide saying 説得し when the meeting had concluded that persuasion does
+    not work - the deck asserting the opposite of its own source
+  - an internal note to the PO (「画面共有された資料が手元にない」) rendered as
+    a slide
+  - 「OYKOTから10/16に提案する流れになっています」 written INTO the 10/16
+    meeting's own material
+  - a village-wide figure of 85% used as the basis for a much narrower group
+  - a name nobody could verify, from a garbled automatic transcript
+  - a note ending 「データは大事なんだよっていうだけじゃやらばグダメ」 - raw
+    transcription noise, printed on a slide and shown to a room
+
+Read that last one again. It is not a judgement call or a subtle inference: it
+is mangled text that any reader would catch in a second, and it reached the
+page because nobody saw a readable page before it shipped. Every one of these
+was plainly visible in the copy sheet, and no linter will ever find them. A
+readable page in front of the PO, early, is the entire mechanism.
+
+So when you paste the copy sheet, READ IT YOURSELF FIRST, line by line, as a
+reader rather than as its author. Anything that does not parse as Japanese, or
+that you cannot trace to a source sentence, you raise before you show it.
+
+So when you show them, do not just ask 「承認しますか」. ページごとに、日本語で、
+その面が何を主張していて、その主張がどのソースのどの文に基づくのかを言う。
+Every one of the errors above has the form "this sentence does not follow from
+that source", and they surface the moment you say both halves out loud.
+
+Then:
+
+    '$RUN_DIR/await-po' mark '原稿の確認'
+
+The PO will say things like 「3枚目のタイトルをこう変えて」. Find that slide
+by its number in the copy sheet, edit storyboard.yaml yourself, re-run
+validate, fidelity and copy, and show them again. They never see YAML. If they
+ask to see the file, show it - but the flow must work without it.
+
+When they approve:
+
+    '$RUN_DIR/deck-gate' approve content
+
+That one also requires validate and fidelity to pass, for the same reason.
+
+### 6. BUILD AND SELF-REPAIR
+
+    '$RUN_DIR/build-cycle'
+
+One command per round: it renders, lints, and prints what happened. READ ITS
+OUTPUT; do not decide any of this yourself.
+
+    round=   this round's number        cap=  the limit
+    final_round=yes   this is the last round allowed
+    lint_verdict=     pass | fail
+    blocking=         how many findings block
+    rules=            which rules fired
+    slides=           which slides
+    content_digest_matches=  yes | no
+    slots_empty=      illustration slots with no image, out of slots_total
+    slots_awaiting_your_own=  slots marked reuse_unchanged the PO must supply
+    blocking_layout=  findings you can fix in THIS round
+    blocking_slots=   findings that are missing illustrations (step 7, not now)
+
+READ slots_empty EVERY ROUND. A deck shipped with lint_verdict=pass and
+fourteen of fifteen slots empty: every page was correctly aligned and had no
+pictures on it. slots_empty is not a warning you work around - it is the
+count \`render --release\` refuses on, and the illustrations are a gate 7 step
+you have to actually do.
+
+Exit 0 means there is no repair work left in THIS round. Exit 1 means FIX THE
+FINDINGS AND RUN IT AGAIN - that is what the linter is for, and fixing its
+findings is your job, not the PO's. Read $DECK_DIR/out/lint/report.json for
+the detail and the annotated PNG per finding.
+
+Exit 0 does NOT always mean the deck is finished. When every layout finding is
+cleared but illustration slots are still empty, lint_verdict stays \`fail\` and
+this exits 0 anyway, because empty slots are step 7 and not something another
+repair round can fix. Look at both lines: \`blocking_layout=0\` with
+\`slots_empty=6\` means go and get the illustrations, not that you are done.
+
+Exit 3 means the cap is spent. Do NOT run another round, and do NOT reach for
+build-cycle --reset: a reset is accepted only once the PO has approved a NEW
+revision of the wording, and a second reset for the same approved revision is
+refused. The cap is not yours to raise. Instead:
+
+    '$RUN_DIR/await-po' mark 'lint の修正上限に到達'
+
+and report to the PO, in Japanese: every outstanding finding, which slide and
+which rule, what you tried, and what you think is needed. Never raise the cap
+yourself.
+
+THE WORDING RULE. A layout fix - type size, line breaks, a slot's size, moving
+a block - does not touch approved words, and needs no new approval. A fix that
+changes WORDING does: shortening a title to stop it overflowing is a content
+change. After any edit, look at \`content_digest_matches\`. If it is \`no\`,
+you changed approved wording: go back to gate 5, show the copy sheet again, get
+approval again, and run \`approve content\` again. This is not advice -
+\`render --release\` refuses a deck whose content digest has moved away from
+the approved one, so skipping it only moves the failure later.
+
+### 7. ILLUSTRATIONS
+
+    '$RUN_DIR/deck-gate' prompts --single
+
+That writes ONE brief covering the whole deck, to $DECK_DIR/out/prompts-single.md.
+Paste its contents into this pane for the PO, and tell them exactly this:
+
+  - paste it into a SINGLE ChatGPT conversation and work down it; one
+    conversation is what keeps the style consistent between images
+  - save each returned image under the file name the brief gives it
+  - DROP THE FILES INTO: $DECK_DIR/inbox
+  - then say so here
+
+Then:
+
+    '$RUN_DIR/await-po' mark '画像の受け取り待ち'
+
+and stop. When they say the files are there:
+
+    '$RUN_DIR/deck-gate' inbox
+
+It maps the brief's file names back to slot ids and imports them. It lists
+anything it could not place, and any slot still empty - deal with those, do not
+ignore them. Then run build-cycle again.
+
+Slots marked \`reuse_unchanged\` are the PO's own photos, logos or screens. Ask
+for those by name; never generate them.
+
+### 8. DELIVER
+
+    '$RUN_DIR/deck-gate' render --release
+    '$RUN_DIR/deck-gate' lint
+    '$RUN_DIR/deck-gate' export
+
+Then tell the PO, in Japanese: where the PDF is, how many slides, the lint
+result, and anything still outstanding. Mark the run as awaiting them if
+anything is.
+
+## Rules
+
+- NEVER fabricate an approval, a lint result, a render result or a test result.
+  If a gate did not run, say it did not run. If it returned 4, say it failed to
+  complete. The PO is relying on these being real.
+- NEVER record an approval the PO did not actually give in this pane.
+- The PO must never have to open storyboard.yaml, ledger.json, agenda.json or
+  any report file. Show them the copy sheet and prose in this pane.
+- Japanese to the PO. English for your own notes and files.
+- NEVER commit, push, force-push, merge, rebase, or create a pull request
+  unless the PO explicitly asks for that Git operation. Editing files is fine.
+- NEVER create a git worktree, including .claude/worktree or .claude/worktrees.
+- NEVER run tmux kill-server, with or without -L or TMUX_TMPDIR. Never run
+  tmux kill-session, kill-window or kill-pane unless the PO explicitly asks for
+  that exact operation, including for test cleanup. If you start a temporary
+  tmux server for a test, LEAVE IT RUNNING and report the cleanup command.
+- Do not copy the PO's confidential source decks into a git repository.
+- Run gates through the deck-gate helper, not by calling deck directly, so the
+  run keeps its record.
+PROMPT
+}
+
+generate_resume_prompt() {
+  cat "$RUN_DIR/agent-prompt.md" > "$RUN_DIR/agent-resume-prompt.md"
+  cat >> "$RUN_DIR/agent-resume-prompt.md" << PROMPT
+
+## RESUMED (read this before any command)
+
+This run was closed and resumed. Your own transcript may contain commands and
+paths from before the resume; the HELPERS and the deck are still exactly where
+they were, so those paths are still valid - but your memory of where you had
+got to is not authoritative. The deck on disk is.
+
+Your first three commands are:
+
+    '$RUN_DIR/await-po' clear
+    '$RUN_DIR/deck-gate' status
+    '$RUN_DIR/build-cycle' --status
+
+\`status\` re-derives the phase from what is on disk rather than reading back a
+stored one, so it is the truth about which gates have been passed:
+
+    drafting          a storyboard exists, nothing approved
+    agenda-approved   the spine is signed off; wording may still move
+    content-approved  the exact words are signed off
+    rendered          output exists for the current content
+    released          a release render matched the content approval
+
+\`build-cycle --status\` tells you how much of the repair cap is already spent.
+A resume does NOT reset it, and you must not reset it to buy more rounds.
+
+A resume does NOT answer a question you had asked the PO, so an awaiting-PO
+marker deliberately survived into this window. Run clear, then look at whether
+they have actually replied, and mark again if you are still waiting.
+
+Pick up at the gate the phase says you are at. Do not re-run an approval the
+PO already gave, and do not silently redo work: tell them in one short Japanese
+line where you are resuming from.
+PROMPT
+}
+
+# --------------------------------------------------------------------- resume
+resume_run() {
+  local requested="${1:-}"
+  load_run "$requested" true
+  require_node_sources
+
+  if run_is_live "${LAUNCHER_PID:-}"; then
+    echo "Error: run $RUN_ID is still running (pid $LAUNCHER_PID)." >&2
+    echo "       Switch to its pane, or close it first with: deck close $RUN_ID" >&2
+    exit 1
+  fi
+  if [[ ! -f "$DECK_DIR/deck.yaml" ]]; then
+    echo "Error: the deck this run was building is gone: $DECK_DIR" >&2
+    echo "       Nothing can be resumed. Remove the run with: deck rm $RUN_ID" >&2
+    exit 1
+  fi
+
+  resolve_repair_max_rounds resume
+  RUN_STATUS="running"
+  LAUNCHER_PID="$$"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    AGENT_PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
+    WINDOW_ID="$(tmux display-message -p -t "$AGENT_PANE" '#{window_id}')"
+    CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$AGENT_PANE" '#W')"
+  else
+    AGENT_PANE=""
+    WINDOW_ID=""
+  fi
+
+  write_state
+  tag_pane "${AGENT_PANE:-}" agent
+  if [[ -n "${WINDOW_ID:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux set-option -w @deck_run_id "$RUN_ID" 2>/dev/null || true
+    tmux set-option -w @deck_state_file "$STATE_FILE" 2>/dev/null || true
+  fi
+
+  # Regenerated, not reused: a run created by an older deck gets the current
+  # helpers and the current prompt the moment it is resumed.
+  generate_helper_scripts
+  generate_agent_prompt
+  generate_resume_prompt
+
+  if [[ -n "${WINDOW_ID:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux rename-window "$("$RUN_DIR/window-name" display)" 2>/dev/null || true
+  fi
+
+  printf 'Resuming deck run %s\n' "$RUN_ID"
+  printf 'Deck:  %s\n' "$DECK_DIR"
+  printf 'Phase: %s\n' "$(run_phase "$DECK_DIR")"
+  printf 'Repair rounds used: %s of %s\n' \
+    "$(cat "$RUN_DIR/repair-round.txt" 2>/dev/null || printf 0)" "$REPAIR_MAX_ROUNDS"
+  echo ""
+
+  launch_agent resume
+}
+
+# --------------------------------------------------------------------- launch
+launch_agent() {
+  local mode="$1"
+  local prompt_file="$RUN_DIR/agent-prompt.md"
+  local agent_status=0
+  [[ "$mode" == "resume" ]] && prompt_file="$RUN_DIR/agent-resume-prompt.md"
+
+  cd "$DECK_DIR"
+
+  # The kill-guard, same shape and same reason as squad's: the agent gets a
+  # tmux on PATH that refuses the four destructive subcommands. deck's own
+  # close path resolves the real binary (see deck_real_tmux), so this does not
+  # weaken `deck close`.
+  local guard_bin="$RUN_DIR/agent-guard-bin"
+  mkdir -p "$guard_bin"
+  if DECK_REAL_TMUX="$(deck_real_tmux)"; then
+    export DECK_REAL_TMUX
+    cat > "$guard_bin/tmux" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    kill-server|kill-session|kill-window|kill-pane)
+      printf 'deck: blocked dangerous tmux command: %s\n' "$arg" >&2
+      exit 126
+      ;;
+  esac
+done
+exec "$DECK_REAL_TMUX" "$@"
+WRAPPER
+    chmod +x "$guard_bin/tmux"
+    export PATH="$guard_bin:$PATH"
+  fi
+
+  if ! command -v "$DECK_AGENT" >/dev/null 2>&1; then
+    echo "Error: the agent binary '$DECK_AGENT' is not on PATH." >&2
+    echo "       deck launches one Claude Code agent. Set DECK_AGENT to point at it." >&2
+    exit 2
+  fi
+
+  # --resume ON A RESUME, --session-id ON A FIRST LAUNCH.
+  #
+  # These are not interchangeable. --session-id NAMES a new session; it does
+  # not ask for an existing conversation back, and on a session that already
+  # exists it can fail outright. A resumed run that silently started a fresh
+  # conversation lost the whole interview: the purpose, the audience, the
+  # agenda discussion and every answer the PO had already given.
+  local -a session_args
+  if [[ "$mode" == "resume" ]]; then
+    session_args=(--resume "$AGENT_SESSION_ID")
+  else
+    session_args=(--session-id "$AGENT_SESSION_ID")
+  fi
+
+  set +e
+  printf '[%s] Agent prompt sent for deck: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(cat "$RUN_DIR/title.txt")"
+  CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 "$DECK_AGENT" --dangerously-skip-permissions \
+    --allowedTools "Bash Read Write Edit Glob Grep mcp__notion-personal" \
+    --append-system-prompt "$(cat "$prompt_file")" \
+    "${session_args[@]}" \
+    "$(initial_message "$mode")"
+  agent_status=$?
+  set -e
+
+  # The agent is gone, so nothing is waiting on the PO any more. Without this a
+  # run that ended with a question outstanding would leave the marker up
+  # forever: there is no agent turn left to clear it. This pane is still alive,
+  # so the window really is renameable and the badge really does come down.
+  clear_awaiting_po "$RUN_DIR"
+  # The launcher is about to exit, so the run is no longer live. Recorded
+  # before printing, so `deck list` in another window is right immediately.
+  LAUNCHER_PID=""
+  RUN_STATUS="closed"
+  write_state
+
+  echo ""
+  echo "Agent exited with status $agent_status."
+  echo "Deck retained at:      $DECK_DIR"
+  echo "Run artifacts at:      $RUN_DIR"
+  echo "Resume with:           deck resume $RUN_ID"
+  exit "$agent_status"
+}
+
+initial_message() {
+  if [[ "$1" == "resume" ]]; then
+    printf 'この資料作成を再開してください。まず await-po clear、deck-gate status、build-cycle --status を実行して、どこまで進んでいたか確認してから続けてください。資料のタイトル: %s' "$TASK"
+  else
+    printf '%s' "$TASK"
+  fi
+}
+
+# ONE --source VALUE, AS THE AGENT SHOULD SEE IT.
+#
+# A URL passes through untouched. Anything else is a path the PO typed in
+# THEIR shell, so it is resolved here, before any directory change, and
+# handed on absolute. A missing file is reported now rather than discovered by
+# the agent twenty minutes later - but it is a warning, not a refusal: the PO
+# may be about to save the file, and refusing the launch over it would be
+# worse than saying so.
+resolve_source_spec() {
+  local spec="$1" resolved
+  case "$spec" in
+    *://*) printf '%s' "$spec"; return 0 ;;
+  esac
+  if [[ "$spec" == /* ]]; then
+    resolved="$spec"
+  else
+    resolved="$(cd "$(dirname "$spec")" 2>/dev/null && pwd)/$(basename "$spec")" || resolved=""
+    if [[ -z "$resolved" || "$resolved" == "/$(basename "$spec")" && "$(dirname "$spec")" != "/" ]]; then
+      # The directory could not be entered, so there is nothing honest to
+      # resolve against. Keep what the PO typed and say so.
+      printf 'Warning: --source %s could not be resolved from %s; passing it on as typed.\n' \
+        "$spec" "$(pwd)" >&2
+      printf '%s' "$spec"
+      return 0
+    fi
+  fi
+  if [[ ! -e "$resolved" ]]; then
+    printf 'Warning: --source %s does not exist yet (looked at %s).\n' "$spec" "$resolved" >&2
+    printf '         The agent will be told this path and will ask you about it.\n' >&2
+  fi
+  printf '%s' "$resolved"
+}
+
+# An absolute path for something that does not exist yet.
+#
+# The obvious spelling - $(cd "$(dirname "$x")" && pwd)/$(basename "$x") -
+# collapses to "/<basename>" when the cd fails, and the surrounding `||` does
+# not fire because the ASSIGNMENT succeeded. deck then created a directory at
+# the filesystem ROOT. Found by the wiring tests, on a --dir whose parent had
+# not been created yet, which is the ordinary case.
+#
+# Missing parents are created, because both callers are about to create the
+# thing anyway; what is refused is a path that cannot be resolved at all.
+resolve_new_path() {
+  local target="$1" parent base resolved
+  parent="$(dirname "$target")"
+  base="$(basename "$target")"
+  mkdir -p "$parent" 2>/dev/null || true
+  if ! resolved="$(cd "$parent" 2>/dev/null && pwd)"; then
+    echo "Error: cannot resolve $target - its parent directory does not exist" >&2
+    echo "       and could not be created: $parent" >&2
+    exit 1
+  fi
+  # Belt and braces: whatever happens above, never hand back the root.
+  if [[ -z "$resolved" || -z "$base" || "$base" == "/" ]]; then
+    echo "Error: refusing to resolve $target to the filesystem root" >&2
+    exit 1
+  fi
+  printf '%s/%s' "$resolved" "$base"
+}
+
+# A deck directory name the PO can find later.
+#
+# Japanese characters are KEPT: the PO's own decks live under Japanese paths,
+# and a slug that transliterated or dropped them would produce directories
+# nobody can match to a meeting. Only genuinely path-hostile characters go.
+deck_dir_for_title() {
+  local title="$1" slug
+  slug="$(printf '%s' "$title" |
+    tr -d '\000-\037' |
+    sed -E 's#[/\\:*?"<>|]#-#g; s/[[:space:]]+/-/g; s/^[-.]+//; s/-+$//')"
+  slug="$(printf '%s' "$slug" | cut -c 1-80)"
+  [[ -n "$slug" ]] || slug="deck"
+  printf '%s/%s-%s' "$DECK_DECKS_ROOT" "$(date '+%Y%m%d')" "$slug"
+}
+
+# ------------------------------------------------------------------- dispatch
+
+case "${1:-}" in
+  ''|-h|--help|help)
+    [[ "${1:-}" == "" ]] && usage 1
+    usage 0
+    ;;
+  --version|version)
+    printf 'deck 0.2.0\n'
+    exit 0
+    ;;
+  gate)
+    shift
+    require_node_sources
+    # The deterministic layer, verbatim. `deck gate` with no arguments prints
+    # the gate layer's own usage, which is the Node CLI's.
+    exec "$NODE_BIN" "$DECK_HOME/src/cli.js" "${@:---help}"
+    ;;
+  list)
+    list_runs
+    exit 0
+    ;;
+  close)
+    close_run "${2:-}"
+    exit 0
+    ;;
+  resume)
+    resume_run "${2:-}"
+    exit 0
+    ;;
+  rm)
+    shift
+    [[ $# -ge 1 ]] || { echo "Error: deck rm needs at least one run id" >&2; exit 1; }
+    status=0
+    for id in "$@"; do
+      remove_run "$id" || status=1
+    done
+    exit "$status"
+    ;;
+  clean)
+    clean_runs
+    exit 0
+    ;;
+  gen-helpers)
+    [[ -n "${2:-}" ]] || {
+      echo "Error: deck gen-helpers requires a target directory" >&2
+      exit 1
+    }
+    # Writes the WHOLE generated surface - helpers and both prompts - so all of
+    # it can be inspected or tested without an agent, a tmux server or a deck.
+    # The placeholder values below only ever reach the generated text.
+    require_own_gen_dir "$2"
+    RUN_DIR="$(resolve_new_path "$2")"
+    mkdir -p "$RUN_DIR"
+    RUN_ID="${DECK_GEN_RUN_ID:-gen-helpers}"
+    STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+    TASK="${DECK_GEN_TASK:-gen-helpers}"
+    DECK_DIR="${DECK_GEN_DECK_DIR:-$(pwd)}"
+    AGENT_SESSION_ID="${DECK_GEN_SESSION_ID:-00000000-0000-0000-0000-000000000000}"
+    THEME="${DECK_GEN_THEME:-watercolor}"
+    PURPOSE="${DECK_GEN_PURPOSE:-}"
+    AUDIENCE="${DECK_GEN_AUDIENCE:-}"
+    MEETING_WHEN="${DECK_GEN_WHEN:-}"
+    SOURCE_SPECS="${DECK_GEN_SOURCE:-}"
+    WINDOW_SHORT_NAME="$(placeholder_window_name)"
+    resolve_repair_max_rounds
+    printf '%s\n' "$TASK" > "$RUN_DIR/title.txt"
+    printf '%s\n' "$WINDOW_SHORT_NAME" > "$RUN_DIR/short-name.txt"
+    generate_helper_scripts
+    generate_agent_prompt
+    generate_resume_prompt
+    printf 'Generated helpers and prompts in %s\n' "$RUN_DIR"
+    exit 0
+    ;;
+  --)
+    # Everything after -- is a title, even if it reads like a gate name. This
+    # is the escape hatch for a deck genuinely called "render".
+    shift
+    [[ $# -ge 1 ]] || usage 1
+    FORCE_TASK=true
+    ;;
+esac
+
+# ---------------------------------------------------------------- launch path
+
+TASK=""
+FORCE_TASK="${FORCE_TASK:-false}"
+# WHERE THE PO WAS STANDING. Captured before anything changes directory, so a
+# relative --source can be resolved and so the agent can say where a path came
+# from if it turns out to be wrong.
+INVOKED_FROM="$(pwd)"
+PURPOSE=""
+AUDIENCE=""
+MEETING_WHEN=""
+SOURCE_SPECS=""
+THEME="watercolor"
+DECK_DIR_ARG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --source)
+      [[ -n "${2:-}" ]] || { echo "Error: --source requires a value" >&2; exit 1; }
+      # A LOCAL PATH IS RESOLVED HERE, against the directory the PO is
+      # standing in, because launch_agent cds into the deck workspace before
+      # starting the agent. `--source ./notes.md` used to reach the agent
+      # verbatim and resolve against the DECK, where no such file exists.
+      SOURCE_ONE="$(resolve_source_spec "$2")"
+      # Repeatable: minutes in Notion plus a spreadsheet on disk is one deck.
+      if [[ -n "$SOURCE_SPECS" ]]; then
+        SOURCE_SPECS="$SOURCE_SPECS"$'\n'"$SOURCE_ONE"
+      else
+        SOURCE_SPECS="$SOURCE_ONE"
+      fi
+      shift 2
+      ;;
+    --purpose)
+      [[ -n "${2:-}" ]] || { echo "Error: --purpose requires a value" >&2; exit 1; }
+      PURPOSE="$2"; shift 2 ;;
+    --audience)
+      [[ -n "${2:-}" ]] || { echo "Error: --audience requires a value" >&2; exit 1; }
+      AUDIENCE="$2"; shift 2 ;;
+    --when)
+      [[ -n "${2:-}" ]] || { echo "Error: --when requires a value" >&2; exit 1; }
+      MEETING_WHEN="$2"; shift 2 ;;
+    --dir)
+      [[ -n "${2:-}" ]] || { echo "Error: --dir requires a value" >&2; exit 1; }
+      DECK_DIR_ARG="$2"; shift 2 ;;
+    --theme)
+      [[ -n "${2:-}" ]] || { echo "Error: --theme requires a value" >&2; exit 1; }
+      THEME="$2"; shift 2 ;;
+    -*)
+      echo "Error: unknown option $1" >&2
+      echo "       See: deck --help" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$TASK" ]]; then
+        TASK="$TASK $1"
+      else
+        TASK="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$TASK" ]] || {
+  echo "Error: deck needs a title for the deck." >&2
+  echo "       Example: deck \"野沢温泉 次回MTG資料\"" >&2
+  exit 1
+}
+
+# A GATE NAME IS NOT A DECK TITLE.
+#
+# The deterministic commands moved behind `deck gate`, so `deck render` now
+# parses as a deck titled "render" - and launching an agent is a loud, slow,
+# token-spending thing to do to someone who typed the old spelling out of
+# habit. Refusing by name costs one line and turns a silent agent launch into
+# an instruction. -- is the escape hatch for a deck really called "render".
+if [[ "$FORCE_TASK" != "true" ]]; then
+  case "${TASK%% *}" in
+    init|doctor|source|ledger|agenda|copy|fidelity|inbox|validate|approve|status|prompts|assets|render|lint|export)
+      echo "Error: \"${TASK%% *}\" is a deck GATE, not a deck title." >&2
+      echo "       The deterministic commands live behind \"deck gate\" now:" >&2
+      echo "         deck gate $TASK" >&2
+      echo "" >&2
+      echo "       deck <title> starts an agent that drives those gates for you." >&2
+      echo "       If this deck is really called \"${TASK%% *}\", say: deck -- $TASK" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+require_node_sources
+resolve_repair_max_rounds
+
+RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
+STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+
+if command -v uuidgen >/dev/null 2>&1; then
+  AGENT_SESSION_ID="$(uuidgen | tr 'A-Z' 'a-z')"
+else
+  # The session id only has to be unique per run; claude accepts any uuid.
+  AGENT_SESSION_ID="$("$NODE_BIN" -e 'process.stdout.write(require("node:crypto").randomUUID())')"
+fi
+
+# WHERE THE DECK GOES.
+#
+# Standing inside a deck already means working on THAT deck - the PO cd'd there
+# on purpose. Otherwise a new workspace under DECK_DECKS_ROOT, named so they
+# can find it next month.
+if [[ -n "$DECK_DIR_ARG" ]]; then
+  DECK_DIR="$(resolve_new_path "$DECK_DIR_ARG")"
+elif existing_root="$("$NODE_BIN" -e '
+const { findWorkspace } = await import(process.argv[1] + "/src/workspace.js");
+const r = findWorkspace(process.cwd());
+if (r) process.stdout.write(r); else process.exit(1);
+' "$DECK_HOME" 2>/dev/null)"; then
+  DECK_DIR="$existing_root"
+  printf 'Using the deck you are standing in: %s\n' "$DECK_DIR"
+else
+  DECK_DIR="$(deck_dir_for_title "$TASK")"
+fi
+
+if [[ ! -f "$DECK_DIR/deck.yaml" ]]; then
+  mkdir -p "$(dirname "$DECK_DIR")"
+  "$NODE_BIN" "$DECK_HOME/src/cli.js" init "$DECK_DIR" --theme "$THEME" || {
+    echo "Error: could not scaffold a deck workspace at $DECK_DIR" >&2
+    exit 1
+  }
+fi
+# The drop directory for returned illustrations, so gate 7 can say "put them
+# here" and mean a directory that exists.
+mkdir -p "$DECK_DIR/inbox"
+
+RUN_DIR="$DECK_RUN_ROOT/$(basename "$DECK_DIR")/$RUN_ID"
+mkdir -p "$RUN_DIR"
+
+WINDOW_SHORT_NAME="$(placeholder_window_name)"
+printf '%s\n' "$TASK" > "$RUN_DIR/title.txt"
+printf '%s\n' "$WINDOW_SHORT_NAME" > "$RUN_DIR/short-name.txt"
+
+if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  AGENT_PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
+  WINDOW_ID="$(tmux display-message -p -t "$AGENT_PANE" '#{window_id}')"
+  CURRENT_WINDOW_NAME="$(tmux display-message -p -t "$AGENT_PANE" '#W')"
+else
+  AGENT_PANE=""
+  WINDOW_ID=""
+  CURRENT_WINDOW_NAME=""
+fi
+
+RUN_STATUS="running"
+LAUNCHER_PID="$$"
+write_state
+tag_pane "${AGENT_PANE:-}" agent
+if [[ -n "${WINDOW_ID:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  tmux rename-window "$WINDOW_SHORT_NAME" 2>/dev/null || true
+  tmux set-option -w @deck_run_id "$RUN_ID" 2>/dev/null || true
+  tmux set-option -w @deck_state_file "$STATE_FILE" 2>/dev/null || true
+  tmux select-pane -T "$TASK" 2>/dev/null || true
+fi
+
+generate_helper_scripts
+generate_agent_prompt
+generate_resume_prompt
+
+cat > "$RUN_DIR/run-info.txt" <<INFO
+Deck title:     $TASK
+Run id:         $RUN_ID
+Started at:     $STARTED_AT
+Deck workspace: $DECK_DIR
+Run artifacts:  $RUN_DIR
+Theme:          $THEME
+Agent session:  $AGENT_SESSION_ID
+Repair rounds:  $REPAIR_MAX_ROUNDS maximum
+Purpose:        ${PURPOSE:-(the agent will ask)}
+Audience:       ${AUDIENCE:-(the agent will ask)}
+Meeting:        ${MEETING_WHEN:-(the agent will ask)}
+Source:         ${SOURCE_SPECS:-(the agent will ask)}
+INFO
+cat "$RUN_DIR/run-info.txt"
+echo ""
+
+launch_agent initial

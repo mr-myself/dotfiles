@@ -1,0 +1,26 @@
+# THE FIXTURE DECK'S REQUEST FILE.
+#
+# Invented content throughout - a fictional municipality choosing a payroll
+# system. Nothing here comes from any real deck, so this file can be read,
+# copied and published freely, which is the point: the PO's own decks are
+# confidential and could never serve as the worked example.
+schema: deck.request/1
+
+request:
+  project_name: "架空市 給与システム更新"
+  purpose: "deck の全ページ型が実際にどう出るかを、一本の資料として見られるようにする"
+  audience: "deck でストーリーボードを書こうとしている人"
+  theme: watercolor
+  language: ja-JP
+
+  content_source_files: []
+
+  preserve_title_and_subtitle_verbatim: true
+  preserve_body_verbatim: true
+
+  output:
+    formats: [pdf, png]
+    png_scale: 2
+    page_numbers: true
+
+  additional_instructions: ""

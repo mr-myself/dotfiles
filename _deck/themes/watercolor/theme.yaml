@@ -1,0 +1,638 @@
+schema: deck.theme/1
+name: watercolor
+version: "1.0"
+language: ja-JP
+
+derived_from: >-
+  Measured from a client hearing-report deck of the PO's: 23 slides, each one
+  full-bleed 1672x941 PNG plus a white `folio-cover` rectangle and a real
+  `page-number` text box. The source deck is confidential and is deliberately
+  NOT named here or bundled anywhere in this repository; the PO knows which
+  one it is. Its images are GENERATED RASTERS, not renders, so colours sampled
+  from them are approximate by construction.
+provenance_note: >-
+  Two classes of value live here, and the difference matters.
+
+  EXACT: #03224F comes from the deck's own page-number XML - it is vector, not
+  raster, so it is the one colour in this theme that is known rather than
+  sampled. The folio geometry is likewise exact, converted from EMU.
+
+  MEASURED: every colour marked `measured: true` was sampled from a generated
+  raster by averaging glyph cores (a pixel counts only when it and all eight
+  neighbours are below the luminance threshold, which removes anti-alias
+  darkening). Those are good to a few units per channel and have been rounded
+  to sensible tokens. Do not treat them as the author's intent; treat them as
+  the closest honest reading of the artwork.
+
+  DIVERGENCE FROM THE DESIGN KIT, recorded deliberately: the kit
+  (02_デザイン仕様.yaml) specifies safe margins {left 80, right 80, top 60,
+  bottom 65} on a 2016x1134 canvas and a bare page number with no total. The
+  reference deck measures {left 60, right 50, top 42, bottom 35} on 1672x941
+  and its folio carries the total ("05/23"). This theme follows the DECK,
+  because it is derived from the deck. Both sets of margins are vertically
+  asymmetric, which is the property that makes a declared centring reference
+  necessary.
+
+canvas:
+  width: 1672
+  height: 941
+  aspect_ratio: "1672:941"
+  # Delivery PNGs are rasterized at 2x. Measurement is ALWAYS in authored
+  # pixels, so the render scale cannot move a lint result.
+  render_scale: 2
+  # Measured across all 23 slides: the accent bar, the title glyph, the first
+  # column and every rule agree on left = 60. Right is 50 because the artwork
+  # bleeds off that edge by design.
+  #
+  # top 42 and bottom 35 are NOT equal, so:
+  #   canvas centre y = 470.5
+  #   safe   centre y = (42 + 906) / 2 = 474.0
+  # Those differ by 3.5 px, more than the 2 px centring tolerance. An element
+  # centred against the wrong one FAILS, which is exactly why a placement
+  # contract has to name its reference instead of assuming one.
+  safe_margins_px:
+    left: 60
+    right: 50
+    top: 42
+    bottom: 35
+
+colors:
+  page_bg:
+    hex: "#FDFDFB"
+    use: "Page background. A warm off-white, not pure white: sampled at #FEFEFC / #FDFDFC across clean areas of several slides."
+    measured: true
+  heading_navy:
+    hex: "#03224F"
+    use: "Titles, eyebrow labels, the folio. EXACT: this value is in the deck's page-number XML, not sampled from a raster."
+    measured: false
+  title_navy:
+    hex: "#05205A"
+    use: "Measured title ink, kept as a separate token so the exact brand navy and the artwork's rendering of it stay distinguishable. Within 6 ΔRGB of heading_navy."
+    measured: true
+  body_navy:
+    hex: "#132C64"
+    use: "Card body and ordinary body copy."
+    measured: true
+  subtitle_navy:
+    hex: "#334A7D"
+    use: "Subtitles. A desaturated navy, roughly 65% of the title's weight."
+    measured: true
+  accent_teal:
+    hex: "#0F8A9A"
+    use: "The eyebrow accent bar and solid icon circles. Sampled #0C899A..#198988 across the deck."
+    measured: true
+  rule_teal:
+    hex: "#0F7784"
+    use: "Section rules under card headings and divider rules."
+    measured: true
+  rule_orange:
+    hex: "#F56C21"
+    use: "The second accent. In the reference deck the middle column of a three-column page is always the orange one."
+    measured: true
+  footer_text_teal:
+    hex: "#06796E"
+    use: "Footer banner text. Sampled #047066 / #06867C / #05776E on three different slides."
+    measured: true
+  footer_banner_bg:
+    hex: "#F1F8F5"
+    use: "Footer banner wash. In the artwork this is a soft translucent watercolour gradient, not a flat rectangle; this is its representative colour."
+    measured: true
+  table_header_navy:
+    hex: "#10436D"
+    use: "Flat navy table header band, with white text."
+    measured: true
+  table_header_pale:
+    hex: "#E3F4F7"
+    use: "The pale-teal alternative table header, with navy text. Used on the densest table page."
+    measured: true
+  table_alt_row:
+    hex: "#EDF7F9"
+    use: "Alternating row fill. Odd rows are page white, even rows take this."
+    measured: true
+  table_rule:
+    hex: "#C1D1E1"
+    use: "Row rules on navy-header tables."
+    measured: true
+  table_label_bg:
+    hex: "#EAF5FD"
+    use: "Tinted first-column label cells."
+    measured: true
+  decor_far:
+    hex: "#BFD8E6"
+    use: "The palest ridge in the watercolour wash - the furthest mountain, barely separated from the page."
+    measured: true
+  decor_mid:
+    hex: "#8FB8CE"
+    use: "The middle ridge band of the wash."
+    measured: true
+  decor_near:
+    hex: "#5E93AE"
+    use: "The nearest ridge, where the wash has the most pigment."
+    measured: true
+  decor_foliage:
+    hex: "#A9C6A4"
+    use: "The green band of trees and the bottom-left botanical."
+    measured: true
+  decor_deep:
+    hex: "#44708C"
+    use: "Roofs, stones and the few darkest marks in the wash."
+    measured: true
+  icon_teal:
+    hex: "#198791"
+    use: "Saturated icon circle, the deck's dominant form."
+    measured: true
+  icon_orange:
+    hex: "#EF7B2D"
+    use: "Saturated icon circle, the second accent."
+    measured: true
+  icon_blue:
+    hex: "#DCF4FC"
+    use: "Pale icon circle variant."
+    measured: true
+  icon_peach:
+    hex: "#FCECDC"
+    use: "Pale icon circle variant."
+    measured: true
+  icon_mint:
+    hex: "#E8F8F0"
+    use: "Pale icon circle variant."
+    measured: true
+  folio_rule:
+    hex: "#8096B0"
+    use: "The short dash to the left of the folio."
+    measured: true
+  note_grey:
+    hex: "#5A6B80"
+    use: "Notes and secondary annotations. Darkened from the artwork's #B9BFCB, which does not reach 4.5:1 on this background."
+    measured: false
+  agenda_active:
+    hex: "#111111"
+    use: "The agenda's current item. From the design kit."
+    measured: false
+  agenda_inactive:
+    hex: "#B8B8B8"
+    use: "The agenda's non-current items. From the design kit, and DELIBERATELY low contrast - see lint.contrast_exceptions."
+    measured: false
+  white:
+    hex: "#FFFFFF"
+    use: "Text on a saturated fill."
+    measured: false
+
+fonts:
+  stack:
+    - "Noto Sans JP deck"
+    - "Hiragino Kaku Gothic ProN"
+    - "BIZ UDPGothic"
+    - sans-serif
+  pinned:
+    # Pinned as a LOCAL FILE with a recorded hash, not borrowed from the
+    # system. Hiragino is installed on the author's Mac, which is precisely
+    # why it cannot be the strategy: the same storyboard has to lay out
+    # identically on a machine that does not have it.
+    #
+    # One variable file covers weights 100-900, so there is a single hash to
+    # record and a single licence to ship. It is 9.6 MB, which is a real cost
+    # in a dotfiles repository and is stated here rather than hidden.
+    - family: "Noto Sans JP deck"
+      file: "fonts/NotoSansJP-Variable.ttf"
+      sha256: "c2f3b4d463500a2ddcd3849cded1fceeb9fd6d1c32e6cbecd568453ba50fc68f"
+      weights: [100, 200, 300, 400, 500, 600, 700, 800, 900]
+      variable: true
+      bytes: 9589900
+      license: "SIL Open Font License 1.1"
+      license_file: "fonts/OFL.txt"
+      source: "https://github.com/google/fonts/raw/main/ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf"
+
+typography:
+  # Role -> [min, max] px on the authored canvas. Bands rather than scalars,
+  # following the design kit: when content does not fit, the author may re-wrap
+  # and re-compose but must not shrink the text out of its band.
+  size_bands_px:
+    cover-title: [96, 128]
+    divider-title: [84, 128]
+    statement-title: [60, 104]
+    agenda-title: [74, 92]
+    title: [54, 68]
+    divider-subtitle: [34, 48]
+    subtitle: [24, 44]
+    section-label: [21, 29]
+    card-heading: [31, 41]
+    card-body: [21, 29]
+    body: [21, 35]
+    bullet: [21, 33]
+    table-header: [25, 41]
+    table-cell: [21, 35]
+    agenda-text: [29, 37]
+    agenda-num: [23, 33]
+    footer-text: [27, 37]
+    footer-label: [19, 29]
+    note: [17, 25]
+    page-number: [20, 27]
+    # THE DIAGRAM ROLES ARE BANDED TOO.
+    #
+    # Without an entry here a role is simply not checked, so naming a new role
+    # was a way to put 18 px text on a slide and have the gate say nothing.
+    # These are the bands the four diagram page types draw in, and they are
+    # deliberately a little tighter than body copy: a diagram is read as a
+    # whole, so its parts are denser - but never below the readable floor.
+    comparison-label: [26, 34]
+    comparison-caption: [19, 25]
+    comparison-axis: [20, 27]
+    comparison-cell: [20, 27]
+    step-label: [19, 25]
+    step-num: [19, 25]
+    step-heading: [24, 32]
+    ecosystem-label: [22, 31]
+    ecosystem-caption: [18, 24]
+    ecosystem-item: [19, 25]
+    timeline-when: [20, 26]
+    timeline-label: [22, 30]
+  line_height:
+    heading: [1.2, 1.4]
+    body: [1.35, 1.55]
+    table: [1.3, 1.5]
+  prohibitions:
+    - "text shadow"
+    - "outline or stroke on text"
+    - "perspective or 3D transforms on text"
+    - "letter-spacing wide enough to read as a gap"
+    - "justified Japanese body copy"
+
+spacing:
+  # Measured vertical rhythm on a standard page: eyebrow bottom 72 -> title top
+  # 108 is 36 px; title bottom 166 -> subtitle top 190 is 24 px.
+  eyebrow_to_title: 36
+  title_to_subtitle: 24
+  subtitle_to_content: 42
+  # Proximity contracts, as DATA. The component templates read these rather
+  # than carrying numbers of their own, so a theme that spaces a card
+  # differently moves the contract with it and the gate stays truthful.
+  # Each is the measured intended gap plus a small allowance.
+  headline_internal_max: 40
+  divider_internal_max: 62
+  statement_internal_max: 40
+  agenda_internal_max: 26
+  # heading -> rule (19) -> body (30) plus the rule itself. The accent rule is
+  # part of the card in the reference, and a group maximum that predates it
+  # reported every card on every page as broken.
+  card_internal_max: 76
+  card_external_min: 24
+  # 3 x 474 + 2 x 70 = 1562, which is exactly the measured content width.
+  column_width: 474
+  column_gap: 70
+  card_padding: 0
+  card_heading_to_rule: 19
+  rule_to_card_body: 30
+  agenda_row_pitch: 115.5
+  # The floor the row pitch compresses to when an agenda has more items than
+  # the measured pitch fits: the 78 px badge plus enough that two badges do
+  # not touch. Type size is unaffected - only the space between rows moves.
+  agenda_row_floor: 92
+  footer_bar_width: 13
+  footer_bar_height: 62
+  eyebrow_bar_width: 8
+  eyebrow_bar_height: 31
+  eyebrow_bar_to_text: 20
+  icon_circle_diameter: 74
+  # Measured on the reference: the illustration frame runs from just under the
+  # subtitle to y=545, the icon circle and lead sit on one line beneath it,
+  # the accent rule follows, then three lines of body, then the footer band.
+  #
+  # 210 rather than the reference's 268 because this theme's headline band is
+  # taller than the reference's. The frame is FIXED at one height so the icon
+  # circles and accent rules line up across the three columns and across every
+  # slide; a flexible frame fixed the overflow and broke that alignment, which
+  # is the more visible of the two.
+  column_art_height: 210
+  column_art_to_icon: 22
+  icon_to_lead: 20
+  # THE DIAGRAM PAGES' RESERVED ILLUSTRATION BAND.
+  #
+  # A process page put four step boxes in a band and left the bottom 41% of
+  # the content region empty; a layers page left 30%. Measured, not guessed -
+  # see the audit in test/geometry/fixture-deck.test.js. The reference deck
+  # has no such holes: its process and relationship pages are illustrated
+  # across their whole width, and the design kit's own worked example puts a
+  # picture in every panel.
+  #
+  # THE BAND TAKES THE SLACK, WITH A FLOOR.
+  #
+  # A FIXED height was tried first, so that the slot's declared size and its
+  # rendered box would be the same number. It does not survive real content:
+  # these figures grow with what is in them - a three-axis comparison is 368 px
+  # tall and a four-axis one is nearer 450 - so a 220 px band fitted a process
+  # page and overflowed the bottom margin of a comparison by 61 px. A reserved
+  # band that pushes itself off the page is worse than the hole it replaced.
+  #
+  # So the band is `flex: 1 1 auto` and absorbs exactly what the figure above
+  # it did not use. The page is full by construction, whatever the figure's
+  # height, and nothing overflows. The slot's declared size is therefore a
+  # REPRESENTATIVE band rather than an exact box, and the brief says so in
+  # those words: a wide landscape strip, cropped to the band's height. That is
+  # true, and it is the honest version of the claim - a brief that promised an
+  # exact box deck cannot guarantee would be the lie.
+  diagram_art_min_height: 130
+  # The note belongs to the figure above it, not to the page. The design kit
+  # orders a page タイトル / 副題 / 図解 / 必要な注記 / ページ番号, and the note
+  # sat at the very bottom of the page instead - separated from its figure by
+  # the whole empty band, which is why the PO could not tell what it was.
+  figure_to_note: 18
+  note_to_diagram_art: 30
+  footer_band_height: 92
+  table_header_height: 77
+  table_row_min_height: 56
+
+page_types:
+  cover:
+    composition: >-
+      Left text column, right watercolour hero bleeding off the canvas. The
+      title is left-aligned on the content margin, never centred: the artwork
+      balances it, not the page centre.
+    # The kit allows 0.5-0.6 of the width for cover text. 0.48 is used so the
+    # text column clears the full-bleed hero with room to spare: at 0.55 the
+    # two overlapped by 7 px, which the collision rule reported.
+    text_area_ratio: [0.48, 0.48]
+    slots:
+      # `zone: bleed` says this slot runs off the canvas ON PURPOSE, so the
+      # safe-margins rule permits it instead of reporting three breaches.
+      cover-art: { right: 0, top: 0, zone: bleed }
+  agenda:
+    composition: >-
+      Numbered badges in a left column, item text in a second column, a hairline
+      separator between them, and a rule under each row. One item is active;
+      the rest take the design kit's deliberately pale grey.
+    row_pitch: 115.5
+    badge_diameter: 78
+    slots:
+      agenda-art: { right: 0, top: 70, zone: bleed }
+    # HOW MANY ITEMS THIS LAYOUT ACTUALLY HOLDS.
+    #
+    # MEASURED, by rendering an agenda at 3..12 items with short text and
+    # finding where it first stops being clean: 3,4,5 clean; 6 puts the list
+    # 23.56 px past the bottom safe margin; 7 gives 14 findings, 12 gives 69.
+    #
+    # The storyboard schema declares no maximum here at all, which is the
+    # defect this exists to close: a count the schema permits but the page
+    # cannot lay out used to render and then be reported as a wall of geometry
+    # findings. Compare the diagram page types, whose maxItems WERE measured
+    # when they were built and which hold their caps exactly.
+    capacity:
+      agenda.items: { max: 7, max_with_footer: 6 }
+  section-divider:
+    composition: >-
+      A large chapter numeral in pale teal, with the eyebrow, title, rule and
+      subtitle stacked and centred on the SAFE CONTENT REGION - not on the
+      canvas, whose vertical centre is 3.5 px higher.
+    slots:
+      divider-art: { right: 0, top: 0, zone: bleed }
+  standard-3col:
+    composition: >-
+      Headline block, then three equal columns of 474 px separated by 70 px
+      gutters. Each column is an illustration frame, then an icon circle set
+      INLINE to the left of a bold lead line, then an accent rule at full
+      column width, then body copy. Optional footer banner.
+
+      THE ILLUSTRATION FRAME IS RESERVED WHETHER OR NOT AN IMAGE EXISTS. The
+      reference's three-column pages are two thirds picture by area, and a
+      column that collapses to text alone leaves the bottom half of the page
+      empty - which is precisely what the first real deck looked like. An
+      empty frame renders as a soft wash with a hairline rather than as a
+      broken box.
+
+      AND THAT ONLY CARRIES AS FAR AS A DECK WITH NO PICTURES IN IT YET. This
+      used to claim the empty frame "reads as a reserved space rather than a
+      rendering fault", full stop. The PO disproved it on a real deck: beside a
+      cover and an agenda that DID have artwork, the empty frames read as
+      places where an image had failed to load, and the reviewer asked whether
+      those pages were simply unfinished. The wash buys time while a deck is
+      uniformly unillustrated; it does not survive being mixed with real
+      pictures. The thing that has to hold is `slot-fill`, which blocks the
+      lint verdict and refuses a release while any declared slot is empty.
+    columns: 3
+    column_art_height: 210
+    slots:
+      # POSITIONED BY THE CARD, NOT BY THESE COORDINATES.
+      #
+      # These three carried `left`/`top` absolute coordinates with top: 277,
+      # which is inside the card body box. The cards are flow content and do
+      # not wrap around an absolutely positioned box, so a deck that used the
+      # theme's own flagship layout - a picture above each column - got the
+      # picture printed THROUGH the text. The PO measured 38 collision
+      # findings and shipped without column illustrations; lowering `top` did
+      # not help, because the card box runs the full height of the row.
+      #
+      # `flow: card-art` says the illustration is laid out BY the card, in the
+      # frame the card already reserves above its heading. There are no
+      # coordinates here to disagree with that frame, which is the point:
+      # shipping coordinates that are guaranteed to collide is worse than
+      # shipping no slot at all.
+      col-1-art: { flow: card-art, card: 1 }
+      col-2-art: { flow: card-art, card: 2 }
+      col-3-art: { flow: card-art, card: 3 }
+  table:
+    composition: >-
+      Headline block, then a table on the content grid with a header band and
+      alternating row fills. Row heights follow content; the decoration stays
+      minimal so the comparison reads.
+    header_style: navy
+    # MEASURED at 4..12 rows with short cells: 4,5,6,7 clean; 8 is the first
+    # with a finding, 12 gives 53. Rows are capped and COLUMNS ARE NOT: swept
+    # 2..14 columns and every one was clean, so this theme has no measured
+    # column boundary and declaring one would be inventing a number. What does
+    # go wrong with many columns is that cells become too narrow to read, and
+    # nothing here measures readability - saying so is more honest than a cap
+    # that looks like evidence.
+    capacity:
+      table.rows: { max: 7, max_with_footer: 6 }
+  comparison:
+    composition: >-
+      Two to four options on shared axes, as ONE grid: the axes are rows that
+      span every column, so corresponding cells sit at the same height by
+      construction rather than by anyone aligning them. A column the author
+      marked as their recommendation takes a tinted fill and the orange rule;
+      deck never marks one itself. A two-column comparison gets the
+      reference's chevron between the halves.
+    slots:
+      # POSITIONED BY THE TEMPLATE, not by coordinates - see standard-3col's
+      # col-N-art for why a slot that declares both can disagree with itself.
+      # The columns answer the axes and stop; the band below them is where the
+      # page gets a picture instead of a hole.
+      comparison-art: { flow: diagram-art }
+    # MEASURED at 2..10 axes with short cells: clean to 8, 9 is the first with
+    # a finding. The schema caps COLUMNS at 4 - a design-kit judgement about
+    # readability, and correct - but left axes unbounded, which is the page's
+    # vertical dimension and the one that runs out.
+    capacity:
+      comparison.axes: 8
+  process:
+    composition: >-
+      Ordered steps with forward arrows. The number is drawn from the step's
+      position in the storyboard, never read out of the text, and the arrow
+      lives in the gap between two steps as its own element. A step that
+      contains several items keeps them inside the step box - they are never
+      promoted to steps of their own, which would change the count.
+    slots:
+      # POSITIONED BY THE TEMPLATE, not by coordinates - see standard-3col's
+      # col-N-art for why a slot that declares both can disagree with itself.
+      # The step row is one band across the middle. Everything under it was empty.
+      process-art: { flow: diagram-art }
+  ecosystem:
+    composition: >-
+      Either a hub with its periphery, or upper function layers over a shared
+      base. In the hub form the node boxes sit on a ring computed once and the
+      connectors are drawn from the SAME positions, so a line always runs from
+      the centre's edge to a node's edge. Every label is inside an opaque box
+      above the connector layer: nothing is ever written on a line.
+    slots:
+      # THE LAYERS FORM ONLY, and `deck gate validate` refuses it on a hub.
+      #
+      # A layers page is two or three bands of text across the top and was
+      # leaving 30% of the page empty beneath them. A HUB page is already the
+      # picture - its nodes ring the whole canvas and it measured a 10% gap -
+      # so reserving a band there would squeeze the figure to buy space the
+      # page does not have spare. The design kit agrees: 中心と周辺 is the
+      # composition, not a composition plus an illustration.
+      ecosystem-art: { flow: diagram-art, layout: layers }
+  timeline:
+    composition: >-
+      Dated entries along an axis, in the author's order. Nothing is sorted:
+      `when` is free text the source wrote, and sorting it would reorder the
+      facts. Several things at one time stay inside one entry.
+    slots:
+      # POSITIONED BY THE TEMPLATE, not by coordinates - see standard-3col's
+      # col-N-art for why a slot that declares both can disagree with itself.
+      # The axis and its entries occupy a band; the rest of the page was empty.
+      timeline-art: { flow: diagram-art }
+  statement:
+    composition: >-
+      A large LEFT-ALIGNED claim on the content margin, held in the upper half
+      of the page with deliberate whitespace below it. The reference does this
+      well and it is not a centred poster: every other page in the deck hangs
+      its type off the left margin, and a statement that centres itself reads
+      as a different document. The whitespace is intentional and must not be
+      treated as an error by any occupancy heuristic.
+
+pagination:
+  # The reference deck's folio, reproduced as DOM. "05/23", zero-padded to the
+  # width of the total.
+  format: "{nn}/{total}"
+  avoid_format: "{n}"
+  note: >-
+    The design kit says the opposite - a bare page number, explicitly avoiding
+    "14/19". This theme follows the reference deck, which carries the total.
+    Recorded here so the divergence is a decision rather than an accident.
+    Note also WHY the deck's author had to overlay real text at all: the folio
+    was baked into every raster, the deck grew from 22 pages to 23, all 23
+    numbers became wrong at once, and the fix was a white rectangle painted
+    over the artwork. Here the number is derived from the slide's index, so
+    inserting a slide re-numbers the deck and nothing is re-rendered.
+  position:
+    # Converted from EMU: the page-number box is at x 11382375, y 6438900,
+    # 571500 x 304800, on a 12191695 x 6858000 slide. Right edge lands at
+    # x 1639.38, i.e. 32.62 px in from the canvas edge; box bottom at
+    # y 925.32, i.e. 15.68 px up from the canvas bottom.
+    right_px: 32.62
+    bottom_px: 15.68
+    width_px: 78.38
+    height_px: 41.82
+  # NO RULE BESIDE THE FOLIO.
+  #
+  # This was reproduced from the artwork, where the dash is 56 px of a longer
+  # rule with the rest hidden under the white folio patch. The comment here
+  # used to say "a clipped artifact is not a design element worth inheriting"
+  # and then inherited it anyway. Every page of the reference deck sets its
+  # folio as the number alone, and the PO read the dash as one of the lines
+  # that is there because a line looks like design. It separates the number
+  # from nothing and groups nothing.
+  #
+  # `null` means the template draws no rule. The CSS and the geometry below
+  # remain, so a theme that genuinely wants one says so and gets one.
+  rule: null
+  omit_for: []
+
+lint:
+  # The PO's calibration decision.
+  centring_tolerance_px: 2
+  anchor_tolerance_px: 0.5
+  alignment_near_miss_px: 3
+  margin_slack_px: 0.5
+  collision_min_area_px2: 4
+  repetition_tolerance_px: 1.5
+  repetition_roles:
+    - section-label
+    - title
+    - subtitle
+    - card
+    - icon-circle
+    - footer-banner
+    - page-number
+  # OCCUPANCY: how much of the content region a page actually uses.
+  #
+  # THE EXEMPTION WAS WRITTEN HERE BEFORE THE RULE EXISTED. `statement` below
+  # has always said its whitespace "must not be treated as an error by any
+  # occupancy heuristic". There was no occupancy heuristic. Meanwhile a
+  # three-column page with its bottom four tenths blank passed every gate.
+  #
+  # WHERE THESE NUMBERS COME FROM. Both are derived from MEASUREMENTS of real
+  # renders with the rule's own occupancyOf() and trailingGapOf(). The goods
+  # are test/fixtures/full-deck and deck's own `init` scaffold; the bads were
+  # built by stripping content out of the fixture:
+  #
+  #                            coverage   trailing gap
+  #   scaffold agenda   (good)    33.6%          37.4%
+  #   fixture agenda    (good)    82.6%           0.0%
+  #   fixture process   (good)    41.1%           0.0%
+  #   fixture table     (good)    70.8%           1.2%
+  #   sparse 3col        (bad)    53.5%          29.0%
+  #   sparse table       (bad)    31.9%          51.7%
+  #   sparse comparison  (bad)    22.4%          61.2%
+  #
+  # Each threshold sits just outside the worst GOOD page, which is the only
+  # placement the evidence supports: 0.30 is under the scaffold agenda's
+  # 33.6%, and 0.42 is above its 37.4%. Together they report two of the three
+  # bad pages and none of the good ones.
+  #
+  # BOTH TIERS ARE SUGGESTIONS, AND THERE IS NO BLOCKING FLOOR. A per-page-type
+  # blocking floor was built first and it failed deck's own scaffold - the
+  # good and bad pages above OVERLAP on both metrics, and no line through that
+  # data separates them. The thing that really does mean "unfinished" is an
+  # illustration slot with no picture in it, and that blocks in slot-fill,
+  # where it can be stated without a threshold at all.
+  #
+  # test/geometry/fixture-deck.test.js re-measures the fixture and fails if
+  # these drift away from the deck they were derived from.
+  occupancy:
+    grid: 48
+    # PAGE TYPES WHOSE EMPTINESS IS THE DESIGN. Each is a few words on a field
+    # of white on purpose - the fixture's statement page leaves 54% of its
+    # height empty under the words - and a missing picture on one of them is
+    # the slot-fill rule's finding to report.
+    exempt: [statement, cover, section-divider]
+    advise_below: 0.30
+    trailing_gap_above: 0.42
+  absolute_min_font_px: 16
+  contrast_min: 4.5
+  contrast_min_large: 3.0
+  contrast_exceptions:
+    # THE DECLARED EXCEPTION. The design kit's agenda grey is #B8B8B8, which
+    # scores 1.93:1 on this background - far under 4.5:1 and under 3:1 too.
+    #
+    # The PO's decision was to record it as an explicit, REPORTED exception
+    # rather than silently darken it, because the low contrast is the design:
+    # the inactive agenda items are meant to recede. So the value stays, the
+    # exception is written down, and `deck doctor` and `deck lint` both print
+    # it. What is forbidden is the third option - letting it pass unremarked.
+    agenda-text: 1.9
+    agenda-num: 1.9
+  exception_notes:
+    agenda-text: >-
+      The design kit's agenda_inactive #B8B8B8 scores 1.93:1 on #FDFDFB. The
+      low contrast is intentional - inactive items recede so the current one
+      reads - and the PO chose to record it rather than darken the kit's
+      colour. Reported on every lint run; never silent.
+    agenda-num: >-
+      Same colour, same reason: the white numeral inside a pale grey badge.
+
+slots:
+  style_brief_file: style-brief.md
+  reference_images: []

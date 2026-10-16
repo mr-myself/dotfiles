@@ -1,0 +1,1387 @@
+/*
+ * watercolor - the stylesheet.
+ *
+ * ONE stylesheet, no media queries, on purpose. Chrome's PDF path renders
+ * under PRINT media, so a rule that applies only on screen would make the
+ * measured layout and the exported layout two different things - and the
+ * geometry deck lints would not be the geometry it ships. Keeping screen and
+ * print identical removes that class of bug entirely rather than trying to
+ * keep two sets of rules in agreement.
+ *
+ * Every colour and dimension comes from --deck-* custom properties, which
+ * src/theme/css.js generates from theme.yaml. The theme is data; this file is
+ * the arrangement of that data, and neither hard-codes the other's values.
+ */
+
+/* --- page box --------------------------------------------------------- */
+
+@page {
+  size: var(--deck-canvas-w) var(--deck-canvas-h);
+  margin: 0;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  background: #ffffff;
+  /* Backgrounds must print. Without this Chrome drops every fill in the PDF
+   * and the deck arrives as black text on white paper. */
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+/* No animation, no transition, anywhere. A transition that has not settled
+ * when the PDF is taken produces a half-moved element, and the measurement
+ * and the export could disagree. */
+*,
+*::before,
+*::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+.deck-page {
+  width: var(--deck-canvas-w);
+  height: var(--deck-canvas-h);
+  overflow: hidden;
+  position: relative;
+  break-after: page;
+  page-break-after: always;
+}
+
+.deck-page:last-child {
+  break-after: auto;
+  page-break-after: auto;
+}
+
+.deck-canvas {
+  position: relative;
+  width: var(--deck-canvas-w);
+  height: var(--deck-canvas-h);
+  background: var(--deck-color-page_bg);
+  font-family: var(--deck-font-stack);
+  font-feature-settings: "palt" 1;
+  color: var(--deck-color-body_navy);
+  overflow: hidden;
+}
+
+/* --- regions ---------------------------------------------------------- */
+/*
+ * Measured, never painted. The content region IS the theme's safe rectangle,
+ * and a placement contract names it by this attribute.
+ */
+.region {
+  position: absolute;
+  pointer-events: none;
+}
+
+.region--content {
+  left: var(--deck-margin-left);
+  top: var(--deck-margin-top);
+  width: calc(var(--deck-canvas-w) - var(--deck-margin-left) - var(--deck-margin-right));
+  height: calc(var(--deck-canvas-h) - var(--deck-margin-top) - var(--deck-margin-bottom));
+}
+
+.region--cover-text {
+  left: var(--deck-margin-left);
+  top: var(--deck-margin-top);
+  width: calc((var(--deck-canvas-w) - var(--deck-margin-left) - var(--deck-margin-right)) * var(--deck-cover-text-ratio));
+  height: calc(var(--deck-canvas-h) - var(--deck-margin-top) - var(--deck-margin-bottom));
+}
+
+.content {
+  position: absolute;
+  left: var(--deck-margin-left);
+  top: var(--deck-margin-top);
+  width: calc(var(--deck-canvas-w) - var(--deck-margin-left) - var(--deck-margin-right));
+  height: calc(var(--deck-canvas-h) - var(--deck-margin-top) - var(--deck-margin-bottom));
+  display: flex;
+  flex-direction: column;
+}
+
+/* --- decoration ------------------------------------------------------- */
+/*
+ * THE WATERCOLOUR WASH. Drawn as inline SVG (see src/render/decor.js), placed
+ * absolutely and never in flow, so it cannot move a single measured box. It
+ * is under everything in paint order because it is emitted first and nothing
+ * here raises it.
+ */
+.decor-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.decor--topright {
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+.decor--hero {
+  position: absolute;
+  right: 0;
+  top: 0;
+  height: var(--deck-canvas-h);
+}
+
+.decor--leaves {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+}
+
+/* --- slots ------------------------------------------------------------ */
+/*
+ * A slot is a box. The PO's image is placed inside it with
+ * object-fit: contain, so the file is never cropped or distorted - only the
+ * box moves. That is what makes "the container moved" different from "the
+ * brief changed", and only the second re-requests an illustration.
+ */
+.slot {
+  position: absolute;
+  overflow: hidden;
+}
+
+/*
+ * An inline <img> sits on the text baseline, which leaves a few pixels of
+ * descender space under it: a 941 px image in a 941 px slot scrolled to 946
+ * and the overflow rule reported the bottom 5 px as unrendered. It was right.
+ */
+.slot img {
+  display: block;
+}
+
+.slot--empty .slot-empty {
+  width: 100%;
+  height: 100%;
+  /*
+   * A RESERVED FRAME, NOT A RENDERING FAULT.
+   *
+   * This was a grey diagonal hatch, and on the cover - where the slot is 40%
+   * of the page - it read as a broken image. The design kit forbids writing
+   * "insert image here" or dropping a stand-in illustration into a reserved
+   * frame, so the frame says nothing; it is simply a soft wash in the theme's
+   * own palette with a hairline, which looks like part of the design until
+   * the picture arrives.
+   */
+  background:
+    radial-gradient(120% 90% at 78% 18%, color-mix(in srgb, var(--deck-color-decor_far) 42%, transparent) 0%, transparent 62%),
+    radial-gradient(90% 70% at 30% 86%, color-mix(in srgb, var(--deck-color-decor_foliage) 34%, transparent) 0%, transparent 66%),
+    linear-gradient(170deg, color-mix(in srgb, var(--deck-color-decor_far) 18%, transparent) 0%, transparent 70%);
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--deck-color-decor_near) 24%, transparent);
+}
+
+/* --- headline block --------------------------------------------------- */
+
+.headline {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.eyebrow {
+  position: relative;
+  padding-left: calc(var(--deck-space-eyebrow_bar_width) + var(--deck-space-eyebrow_bar_to_text));
+  font-size: 25px;
+  font-weight: 700;
+  line-height: 1.24;
+  color: var(--deck-color-heading_navy);
+  min-height: var(--deck-space-eyebrow_bar_height);
+  display: flex;
+  align-items: center;
+}
+
+.eyebrow-rule {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--deck-space-eyebrow_bar_width);
+  height: var(--deck-space-eyebrow_bar_height);
+  background: var(--deck-color-accent_teal);
+}
+
+.title {
+  margin-top: var(--deck-space-eyebrow_to_title);
+  font-size: 61px;
+  font-weight: 700;
+  line-height: 1.37;
+  letter-spacing: 0.005em;
+  color: var(--deck-color-title_navy);
+}
+
+.subtitle {
+  margin-top: var(--deck-space-title_to_subtitle);
+  font-size: 27px;
+  font-weight: 400;
+  line-height: 1.44;
+  color: var(--deck-color-subtitle_navy);
+}
+
+/* --- cover ------------------------------------------------------------ */
+
+.cover-text {
+  position: absolute;
+  left: var(--deck-margin-left);
+  top: var(--deck-margin-top);
+  width: calc((var(--deck-canvas-w) - var(--deck-margin-left) - var(--deck-margin-right)) * var(--deck-cover-text-ratio));
+  height: calc(var(--deck-canvas-h) - var(--deck-margin-top) - var(--deck-margin-bottom));
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.eyebrow--cover {
+  font-size: 26px;
+  color: var(--deck-color-accent_teal);
+  /* The rule is on the cover too: every page type in the reference opens with
+   * the same mark, and the cover was the one that did not. */
+  padding-left: calc(var(--deck-space-eyebrow_bar_width) + var(--deck-space-eyebrow_bar_to_text));
+}
+
+.cover-title {
+  margin-top: 28px;
+  font-size: 104px;
+  font-weight: 700;
+  line-height: 1.26;
+  color: var(--deck-color-title_navy);
+}
+
+.cover-subtitle {
+  margin-top: 32px;
+  font-size: 34px;
+  font-weight: 400;
+  line-height: 1.45;
+  color: var(--deck-color-subtitle_navy);
+}
+
+/* --- section divider / statement -------------------------------------- */
+/*
+ * The stack is centred by flexbox INSIDE a box that is exactly the safe
+ * content rectangle, so its centre is the safe region's centre - which is 3.5
+ * px below the canvas centre on this theme. The placement contract names
+ * content-region, and the two agree by construction rather than by luck.
+ */
+/*
+ * GAP, NOT MARGINS, inside a centred stack.
+ *
+ * A flex container centres its items INCLUDING their margins, so a 24 px
+ * margin-top on the first child moves the visible ink 12 px below the
+ * container's centre while the container itself stays perfectly centred. The
+ * centring rule measures the ink, caught exactly that, and was right to.
+ * `gap` sits BETWEEN items and has no such leading or trailing edge.
+ */
+.divider-stack,
+.statement-stack {
+  position: absolute;
+  left: var(--deck-margin-left);
+  top: var(--deck-margin-top);
+  width: calc(var(--deck-canvas-w) - var(--deck-margin-left) - var(--deck-margin-right));
+  height: calc(var(--deck-canvas-h) - var(--deck-margin-top) - var(--deck-margin-bottom));
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 28px;
+}
+
+/*
+ * THE DIVIDER HANGS OFF THE LEFT MARGIN, like every other page.
+ *
+ * It was centred on both axes, which made the chapter pages read as a
+ * different document from the content pages either side of them - and it is
+ * what made the repetition rule compare the measured extent of
+ * variable-length centred titles across slides.
+ */
+.divider-stack {
+  align-items: flex-start;
+  text-align: left;
+  /* The hero wash occupies the right; the text column stops clear of it. */
+  width: calc((var(--deck-canvas-w) - var(--deck-margin-left) - var(--deck-margin-right)) * 0.72);
+}
+
+/*
+ * A STATEMENT IS A LEFT-ALIGNED CLAIM, NOT A CENTRED POSTER.
+ *
+ * Held in the upper half with deliberate space beneath it: the reference uses
+ * that emptiness as emphasis, and centring the block destroyed it.
+ */
+/*
+ * A STATEMENT PAGE SITS IN THE MIDDLE OF THE PAGE. A TITLE PAGE SITS AT THE TOP.
+ *
+ * This was top-aligned with a 118 px lead-in, which is where a cover title
+ * starts, and the PO read it exactly that way arriving mid-deck: なんで急に
+ * タイトルみたいなのが出てきてるのか謎. Nothing on the page said why the deck
+ * had stopped.
+ *
+ * The whitespace was never the problem - the design kit asks for it by name,
+ * 余白を広く取る, and forbids filling the page with decoration to compensate.
+ * What was missing was the FRAMING that every other content page has and this
+ * one did not: the eyebrow saying which part of the argument we are in (now
+ * required by `deck gate validate`), and the conclusion banner at the foot
+ * (the page type could not carry one at all - `footer` was not in its field
+ * list). With both, and with the claim sitting on the page's centre line
+ * rather than at its top, the page reads as a deliberate pause.
+ */
+.statement-stack {
+  align-items: flex-start;
+  text-align: left;
+  justify-content: center;
+  width: calc((var(--deck-canvas-w) - var(--deck-margin-left) - var(--deck-margin-right)) * 0.78);
+  gap: 34px;
+}
+
+/* The banner is absolutely positioned at the foot; centre on what is left. */
+.statement-stack--with-footer {
+  padding-bottom: calc(var(--deck-space-footer_band_height) + 30px);
+}
+
+.divider-stack > *,
+.statement-stack > * {
+  margin: 0;
+}
+
+/*
+ * THE CHAPTER NUMERAL. Very large, very pale, in the left margin beside the
+ * title - the single most recognisable thing about the reference's chapter
+ * pages. Decorative and ignored by the geometry checks: it is a watermark,
+ * not a heading, and treating it as type would have it fail every rule it
+ * touched.
+ */
+/*
+ * A PAGE WITH A CONCLUSION BANNER RESERVES ITS BAND.
+ *
+ * Without this the three-column grid grew into the footer: the cards finished
+ * 1.7 px above it and the two read as one block, which the proximity rule
+ * reported and a reader would have felt without being able to say why.
+ */
+.content--with-footer {
+  /* box-sizing is border-box here, so this really does shorten the column the
+   * cards grow into rather than pushing it past the bottom margin. */
+  padding-bottom: calc(var(--deck-space-footer_band_height) + 30px);
+}
+
+.content--with-footer .cards {
+  /* The grid is `flex: 1 1 auto` and would otherwise stretch into the band
+   * the padding just reserved. */
+  min-height: 0;
+}
+
+.content--eyebrow-only {
+  height: auto;
+  display: block;
+}
+
+.divider-body {
+  display: flex;
+  align-items: center;
+  gap: 54px;
+}
+
+.divider-numeral {
+  font-size: 232px;
+  font-weight: 700;
+  line-height: 0.86;
+  letter-spacing: -0.02em;
+  color: color-mix(in srgb, var(--deck-color-accent_teal) 26%, transparent);
+  flex: 0 0 auto;
+}
+
+.divider-text {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.divider-title {
+  font-size: 84px;
+  font-weight: 700;
+  line-height: 1.22;
+  color: var(--deck-color-title_navy);
+}
+
+/*
+ * THE CHAPTER PAGE HAS NO RULE UNDER ITS SUBTITLE.
+ *
+ * The reference deck does carry one there - and under it sits the chapter's
+ * contents list, which is what the rule separates the title block FROM. This
+ * template draws no contents list, so the rule had nothing on its far side:
+ * a 300 px stroke hanging in white space below the last line of text. A
+ * separator with one side is not a separator.
+ *
+ * If section-divider ever grows a contents list, the rule comes back with it,
+ * because then it will mean something.
+ */
+
+.divider-subtitle {
+  font-size: 34px;
+  font-weight: 400;
+  line-height: 1.4;
+  color: var(--deck-color-subtitle_navy);
+}
+
+.statement-title {
+  font-size: 76px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--deck-color-title_navy);
+}
+
+.statement-body {
+  max-width: 1180px;
+  font-size: 32px;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--deck-color-body_navy);
+}
+
+.statement-subtitle {
+  font-size: 30px;
+  color: var(--deck-color-subtitle_navy);
+}
+
+/* --- agenda ----------------------------------------------------------- */
+
+.agenda {
+  position: relative;
+  margin-top: 44px;
+  list-style: none;
+  flex: 1 1 auto;
+  /* The hero wash runs down the right of this page; the rows stop clear of
+   * it rather than running their separators underneath it. */
+  width: 72%;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * THE PITCH COMPRESSES BEFORE THE PAGE REFUSES.
+ *
+ * At a fixed 115.5 px pitch the list filled to the bottom margin at exactly 5
+ * items - measured, 0.0 px of slack - and a sixth ran 23.56 px past it. Five
+ * is a thin allowance for a page whose item count is the deck's chapter
+ * count, which an author does not freely choose.
+ *
+ * The design kit's remedy ladder puts reflow before refusal: 装飾を減らし、図と
+ * 本文の配置を整理する first, and only ページ分割 when it still does not fit.
+ * Capping at 5 implements the second half and skips the first.
+ *
+ * So the rows share the room: `flex: 1 1 0` with the measured pitch as a
+ * MAXIMUM, so three items look exactly as they did, and a FLOOR of 92 px,
+ * which is the 78 px badge plus the space it needs to not touch its
+ * neighbours. The type size never changes - 読めない大きさへの縮小 is forbidden
+ * and is not what this does. Below the floor the rows would collide, and the
+ * theme's measured `capacity` refuses the deck before that happens.
+ */
+.agenda-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 0;
+  max-height: var(--deck-space-agenda_row_pitch);
+  min-height: var(--deck-space-agenda_row_floor);
+}
+
+.agenda-badge {
+  flex: 0 0 auto;
+  width: 78px;
+  height: 78px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/*
+ * EVERY BADGE IS COLOURED, ALTERNATING TEAL AND ORANGE.
+ *
+ * The design kit asks for a deliberately pale grey on the items that are not
+ * the current one, and that is a rule from the KIT. This theme is derived
+ * from the PPTX, and the PPTX colours all four badges and sets every line in
+ * navy - the agenda is a map of the whole meeting, not a progress bar. Pale
+ * grey made four of five rows look disabled.
+ */
+.agenda-row:nth-child(odd) .agenda-badge {
+  background: var(--deck-color-icon_teal);
+}
+
+.agenda-row:nth-child(even) .agenda-badge {
+  background: var(--deck-color-icon_orange);
+}
+
+/* The current item keeps the accent it already has and gains a ring, which
+ * reads as "we are here" without turning the others off. */
+.agenda-badge--active {
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--deck-color-accent_teal) 22%, transparent);
+}
+
+.agenda-num {
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--deck-color-white);
+}
+
+/* Measured in the reference deck at canvas x 99; the row sits inside .content,
+ * whose left edge is the theme's left margin, so the offset is relative. */
+.agenda-rule {
+  position: absolute;
+  left: calc(99px - var(--deck-margin-left));
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--deck-color-table_rule);
+}
+
+.agenda-text {
+  margin-left: 46px;
+  font-size: 33px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--deck-color-heading_navy);
+}
+
+/* Both states are navy and readable; the active one is simply the darkest. */
+.agenda-text--active {
+  color: var(--deck-color-title_navy);
+}
+
+.agenda-text--inactive {
+  color: color-mix(in srgb, var(--deck-color-heading_navy) 82%, transparent);
+}
+
+/* --- three-column cards ----------------------------------------------- */
+
+.lead {
+  margin-top: 26px;
+  font-size: 28px;
+  line-height: 1.5;
+  color: var(--deck-color-body_navy);
+}
+
+.lead-bullets {
+  margin-top: 26px;
+  padding-left: 1.4em;
+  font-size: 26px;
+  line-height: 1.5;
+}
+
+.cards {
+  margin-top: var(--deck-space-subtitle_to_content);
+  display: grid;
+  grid-template-columns: repeat(var(--deck-cards-count, 3), var(--deck-space-column_width));
+  gap: var(--deck-space-column_gap);
+  flex: 1 1 auto;
+  /*
+   * THE CARD IS AS TALL AS ITS CONTENT, not as tall as the space.
+   *
+   * Stretching made a card on a page WITHOUT a conclusion banner 122 px
+   * taller than the same card on a page with one, because the space differed.
+   * The repetition rule was right to report it: the three-column pages of one
+   * deck should not have two different card heights. Hugging the content
+   * makes every one of them the same.
+   */
+  align-content: start;
+  grid-auto-rows: auto;
+  min-height: 0;
+}
+
+.card {
+  position: relative;
+  width: var(--deck-space-column_width);
+  display: flex;
+  flex-direction: column;
+}
+
+.card-bg {
+  position: absolute;
+  inset: 0;
+  background: transparent;
+}
+
+/*
+ * THE ILLUSTRATION FRAME.
+ *
+ * Reserved on every column. The reference's three-column pages are mostly
+ * picture by area, and the single biggest reason the first real deck did not
+ * look like them was that this did not exist: the columns collapsed to a
+ * band of text across the middle and left the bottom half of the page blank.
+ */
+.card-art {
+  width: 100%;
+  border-radius: 10px;
+  overflow: hidden;
+  /*
+   * THE PICTURE ABSORBS THE SQUEEZE, NOT THE TEXT.
+   *
+   * On a page that also carries a conclusion banner there is less room than
+   * the full frame wants, and a fixed height made the column overflow into
+   * the banner - the cards finished 1.7 px above it. Letting the frame shrink
+   * toward its minimum keeps the body copy and the rule exactly where they
+   * were and costs a little picture, which is the right trade on a slide.
+   */
+  /*
+   * ONE HEIGHT, THE SAME IN EVERY COLUMN AND ON EVERY SLIDE.
+   *
+   * Letting the frame flex did stop the overflow, but it also gave each
+   * column a different picture height, so the icon circles and the accent
+   * rules no longer lined up across the row - the single most visible
+   * alignment in the reference. The frame is therefore fixed, and sized so
+   * that the longest column on a page that also carries a conclusion banner
+   * still fits: 210 + lead + rule + four lines of body + the banner is the
+   * content height.
+   */
+  flex: 0 0 auto;
+  height: var(--deck-space-column_art_height);
+}
+
+.card {
+  height: auto;
+}
+
+.card-art img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+}
+
+.card-art--empty {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--deck-color-decor_near) 20%, transparent);
+  background: color-mix(in srgb, var(--deck-color-decor_far) 8%, transparent);
+}
+
+.card-art-wash {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/*
+ * THE ICON SITS INLINE, TO THE LEFT OF THE LEAD LINE.
+ *
+ * The reference does it both ways - above the heading on some pages, beside
+ * it on others - and beside is the one that works whether or not the column
+ * has a picture, because it costs no vertical space of its own.
+ */
+.card-lead {
+  display: flex;
+  align-items: center;
+  gap: var(--deck-space-icon_to_lead);
+  margin-top: var(--deck-space-column_art_to_icon);
+  flex: 0 0 auto;
+}
+
+.icon-circle {
+  width: var(--deck-space-icon_circle_diameter);
+  height: var(--deck-space-icon_circle_diameter);
+  min-width: var(--deck-space-icon_circle_diameter);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/*
+ * The reference puts a topical pictogram here. The storyboard does not carry
+ * one - `icon` names a colour role, not a subject - so the circle takes the
+ * column's number rather than a pictogram this tool would have to invent.
+ */
+.icon-num {
+  font-size: 27px;
+  font-weight: 700;
+  line-height: 1;
+  color: #FFFFFF;
+  letter-spacing: 0.02em;
+}
+
+.icon-circle--teal { background: var(--deck-color-icon_teal); }
+.icon-circle--orange { background: var(--deck-color-icon_orange); }
+.icon-circle--blue { background: var(--deck-color-icon_blue); }
+.icon-circle--peach { background: var(--deck-color-icon_peach); }
+.icon-circle--mint { background: var(--deck-color-icon_mint); }
+
+.card-heading {
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1.26;
+  color: var(--deck-color-heading_navy);
+}
+
+/*
+ * The accent rule is its own element now, not a border on the heading.
+ *
+ * As a border it was pinned to the bottom of a heading box whose height
+ * varies with the number of lines, so the rule - and everything under it -
+ * sat at a different height in each column. The reference aligns the rule
+ * across all three. A separate element in a flex column with the heading
+ * block above it does that.
+ */
+.card-rule {
+  height: 2px;
+  width: 100%;
+  margin-top: var(--deck-space-card_heading_to_rule);
+  background: var(--deck-color-rule_teal);
+  flex: 0 0 auto;
+}
+
+.card:nth-child(2) .card-rule {
+  background: var(--deck-color-rule_orange);
+}
+
+.card-body,
+.card-list {
+  margin-top: var(--deck-space-rule_to_card_body);
+  font-size: 23px;
+  line-height: 1.52;
+  color: var(--deck-color-body_navy);
+}
+
+.card-list {
+  padding-left: 1.3em;
+}
+
+/* --- table ------------------------------------------------------------ */
+
+.data-table {
+  margin-top: var(--deck-space-subtitle_to_content);
+  width: 100%;
+  border-collapse: collapse;
+  /* `fixed` makes the per-column widths the templates emit authoritative;
+   * with `auto` the browser would re-apportion them by content and the
+   * storyboard's width_fr would be a suggestion rather than a setting. */
+  table-layout: fixed;
+  font-size: 26px;
+}
+
+.data-table th {
+  height: var(--deck-space-table_header_height);
+  padding: 14px 20px;
+  background: var(--deck-color-table_header_navy);
+  color: var(--deck-color-white);
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.3;
+  vertical-align: middle;
+}
+
+.data-table td {
+  padding: 18px 20px;
+  font-size: 26px;
+  line-height: 1.4;
+  color: var(--deck-color-body_navy);
+  border-bottom: 2px solid var(--deck-color-table_rule);
+  vertical-align: top;
+}
+
+.data-table tr.alt td {
+  background: var(--deck-color-table_alt_row);
+}
+
+.data-table tbody td:first-child {
+  font-weight: 700;
+  color: var(--deck-color-heading_navy);
+}
+
+/* The table's note is a .figure-note too; see the class above. */
+
+/*
+ * THE RESERVED ILLUSTRATION BAND on a diagram page.
+ *
+ * `flex: 1 1 auto` is the whole design: the band is whatever the figure above
+ * it did not use, so the dead space at the foot of a process or layers page
+ * BECOMES the picture rather than staying a hole. A fixed height would just
+ * be a second block with its own leftover gap under it.
+ *
+ * Empty it is a soft wash with a hairline, the same treatment a three-column
+ * frame gets, so a reserved space reads as deliberate until the illustration
+ * arrives.
+ */
+.diagram-art {
+  margin-top: var(--deck-space-note_to_diagram_art);
+  flex: 1 1 auto;
+  min-height: var(--deck-space-diagram_art_min_height);
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  position: relative;
+}
+
+.diagram-art img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+}
+
+.diagram-art svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.diagram-art--empty {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--deck-color-decor_near) 20%, transparent);
+}
+
+/* --- footer banner ---------------------------------------------------- */
+
+.footer-banner {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 30px;
+  height: var(--deck-space-footer_band_height);
+  display: flex;
+  align-items: center;
+  padding-left: var(--deck-margin-left);
+  /* A soft wash that fades out to the right, as in the artwork, rather than a
+   * flat rectangle. The contrast rule resolves text over a gradient as
+   * UNSUPPORTED unless the component declares its backing, so the footer text
+   * declares it. */
+  background: linear-gradient(
+    90deg,
+    var(--deck-color-footer_banner_bg) 0%,
+    var(--deck-color-footer_banner_bg) 55%,
+    rgba(255, 255, 255, 0) 92%
+  );
+}
+
+/*
+ * THE TEAL RULE IS A REAL ELEMENT, not a ::before.
+ *
+ * The lint rules measure DOM. A pseudo-element has no box in the geometry, so
+ * the bar that is the most recognisable part of this banner was invisible to
+ * every check and to the annotated evidence PNGs.
+ */
+.footer-bar {
+  width: var(--deck-space-footer_bar_width);
+  height: var(--deck-space-footer_bar_height);
+  background: var(--deck-color-accent_teal);
+  flex: 0 0 auto;
+}
+
+.footer-mark {
+  margin-left: 34px;
+  flex: 0 0 auto;
+}
+
+/*
+ * NO HAIRLINE BETWEEN THE MARK AND THE LABEL.
+ *
+ * A 1x42 px stroke sat between the lamp and the word. Two things already
+ * 30 px apart in a single row do not need a stroke to say they are different
+ * things, and the reference's own footer is a teal bar and a line of text
+ * with nothing between them. Removed; the gap does the work.
+ */
+
+.footer-label {
+  margin-left: 30px;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--deck-color-accent_teal);
+}
+
+.footer-text {
+  margin-left: 30px;
+  font-size: 31px;
+  font-weight: 700;
+  line-height: 1.32;
+  color: var(--deck-color-footer_text_teal);
+  /* The banner runs to the page edge; the words stop at the right margin. */
+  padding-right: var(--deck-margin-right);
+}
+
+.footer-label + .footer-text {
+  margin-left: 24px;
+}
+
+/* --- folio ------------------------------------------------------------ */
+/*
+ * Real text, derived from the slide's index. The reference deck baked this
+ * number into 23 rasters; when the deck grew to 23 pages every one of them was
+ * wrong and the author painted a white rectangle over the artwork to overlay
+ * the correct text. Nothing here is baked, so there is nothing to paint over.
+ */
+.folio {
+  position: absolute;
+  right: var(--deck-folio-right);
+  bottom: var(--deck-folio-bottom);
+  width: var(--deck-folio-width);
+  height: var(--deck-folio-height);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 23.5px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--deck-color-heading_navy);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * THE FOLIO HAS NO RULE BESIDE IT.
+ *
+ * A 56 px dash sat to the left of the page number on all eleven pages. The
+ * reference deck's folio is the number alone - checked against every page of
+ * it - and the dash separated the number from nothing, pointed at nothing and
+ * grouped nothing. It was a tick that looked like design.
+ *
+ * The declaration stays here, unused by the template, ONLY as the record of
+ * why: a theme that wants a folio rule sets pagination.rule and gets one.
+ */
+.folio-rule {
+  position: absolute;
+  right: var(--deck-folio-rule-right);
+  top: var(--deck-folio-rule-y);
+  width: var(--deck-folio-rule-width);
+  height: var(--deck-folio-rule-height);
+  background: var(--deck-color-folio_rule);
+}
+
+/* --- diagrams ---------------------------------------------------------- */
+/*
+ * Drawn, not generated. An arrow's direction and a column's membership are
+ * meaning; see src/render/diagrams.js for why that line matters.
+ *
+ * All four share the page's existing language: navy headings, teal accents,
+ * the same 2px rules and the same radius as the three-column cards, so a
+ * diagram page sits in the deck rather than looking like it came from a
+ * different tool.
+ */
+
+/*
+ * THE FIGURE'S NOTE, attached to the figure.
+ *
+ * One class for every page type that has one - a table's caveat and a
+ * diagram's qualifier are the same register and were two classes drifting
+ * apart. The design kit gives 注記 its own size band, 20-24 px against the
+ * body's 30-38, and orders it directly after 図解.
+ *
+ * `margin-top` is small and `flex: 0 0 auto` keeps it from being pushed
+ * anywhere: it reads as part of the figure above it, which is the whole fix.
+ * It used to be the last thing in a column whose figure was pinned to the top,
+ * so it fell to the foot of the page and sat where the footer banner sits on
+ * every other page - small, unlabelled, attached to nothing.
+ */
+.figure-note {
+  margin-top: var(--deck-space-figure_to_note);
+  flex: 0 0 auto;
+  font-size: 22px;
+  line-height: 1.5;
+  color: var(--deck-color-note_grey);
+}
+
+/* --- comparison -------------------------------------------------------- */
+/*
+ * ONE GRID, so corresponding cells share a row by construction. Laying the
+ * columns out as independent stacks and trusting them to line up is exactly
+ * the failure the design kit's 左右で項目・尺度・ラベル位置を対応させる warns
+ * about.
+ */
+.cmp {
+  margin-top: var(--deck-space-subtitle_to_content);
+  display: grid;
+  grid-template-columns: 196px repeat(var(--deck-cmp-cols, 2), 1fr);
+  column-gap: 20px;
+  row-gap: 0;
+  align-items: stretch;
+}
+
+.cmp-col-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 22px 18px;
+  border-radius: 12px 12px 0 0;
+  background: color-mix(in srgb, var(--deck-color-table_header_pale) 60%, transparent);
+  border-bottom: 3px solid var(--deck-color-rule_teal);
+}
+
+/* The author's recommendation, when they made one. deck never sets this. */
+.cmp-col-head--pick {
+  background: color-mix(in srgb, var(--deck-color-accent_teal) 16%, transparent);
+  border-bottom-color: var(--deck-color-rule_orange);
+}
+
+.cmp-label {
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--deck-color-heading_navy);
+}
+
+.cmp-caption {
+  font-size: 21px;
+  line-height: 1.35;
+  color: var(--deck-color-subtitle_navy);
+}
+
+.cmp-axis {
+  display: flex;
+  align-items: center;
+  padding: 18px 16px 18px 0;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--deck-color-heading_navy);
+  border-top: 1px solid var(--deck-color-table_rule);
+}
+
+.cmp-axis--corner {
+  border-top: 0;
+  padding: 0;
+}
+
+.cmp-cell {
+  padding: 18px 22px;
+  font-size: 22px;
+  line-height: 1.5;
+  color: var(--deck-color-body_navy);
+  border-top: 1px solid var(--deck-color-table_rule);
+}
+
+.cmp-cell--pick {
+  background: color-mix(in srgb, var(--deck-color-accent_teal) 7%, transparent);
+}
+
+/* Only drawn for exactly two columns - see diagrams.js. */
+.cmp-chevron {
+  position: absolute;
+  left: calc(50% + 46px);
+  top: 54%;
+}
+
+/* --- process ----------------------------------------------------------- */
+
+.process {
+  margin-top: var(--deck-space-subtitle_to_content);
+  display: flex;
+  align-items: stretch;
+  gap: 14px;
+  /*
+   * CONTENT HEIGHT, BAND CENTRED. Stretching the step boxes to fill the page
+   * filled them with empty box rather than with content: a two-item step at
+   * 440 px tall is mostly background. Sitting the band in the middle of the
+   * room it has is what the reference does with a short figure, and it is the
+   * same treatment the timeline gets.
+   */
+  flex: 0 0 auto;
+}
+
+.process--vertical {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.step {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 22px 24px 24px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--deck-color-table_header_pale) 42%, transparent);
+  /*
+   * NO RULE ON THE TOP EDGE. It carried a 3 px teal line, and the line said
+   * nothing: the steps are already ordered by their numerals and joined by
+   * arrows, and a stroke along the top of a box is not a boundary between two
+   * things - the box edge already is one. The PO named exactly this as the
+   * tell that a page was machine-made: ボックスの上とか横になぞに線引きたがる.
+   */
+}
+
+.process--vertical .step {
+  flex: 0 0 auto;
+}
+
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+/*
+ * The number comes from the step's position in the storyboard, never from the
+ * text, so a reordered deck cannot disagree with its own picture.
+ */
+.step-num {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  min-width: 46px;
+  border-radius: 50%;
+  background: var(--deck-color-accent_teal);
+  color: #FFFFFF;
+  font-size: 21px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.step-label {
+  font-size: 21px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--deck-color-accent_teal);
+}
+
+.step-heading {
+  font-size: 27px;
+  font-weight: 700;
+  line-height: 1.28;
+  color: var(--deck-color-heading_navy);
+}
+
+.step-items {
+  margin: 0;
+  padding-left: 1.25em;
+  font-size: 21px;
+  line-height: 1.55;
+  color: var(--deck-color-body_navy);
+}
+
+/* The arrow sits in the GAP between two steps, as its own element. */
+.step-arrow {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+/* --- ecosystem --------------------------------------------------------- */
+
+.eco {
+  margin-top: var(--deck-space-subtitle_to_content);
+}
+
+
+
+/*
+ * THE HUB IS THE PICTURE. It rings the whole canvas and measured a 10% gap,
+ * so it gets no reserved illustration band - see theme.yaml's ecosystem slot.
+ * It keeps `margin-bottom: auto` because nothing below it wants the slack.
+ */
+.eco--hub {
+  position: relative;
+  width: 100%;
+  margin-bottom: auto;
+}
+
+.diagram-connectors {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+/*
+ * EVERY LABEL IS IN A BOX. The boxes are opaque and sit above the connector
+ * layer, so a line is never read through a word - the kit's
+ * 交差とラベルへの重なりを避け, made structural rather than hoped for.
+ */
+.eco-centre,
+.eco-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 14px 20px;
+  border-radius: 14px;
+  text-align: center;
+  background: var(--deck-color-page_bg);
+  box-sizing: border-box;
+}
+
+.eco-centre {
+  background: var(--deck-color-table_header_navy);
+  box-shadow: 0 2px 14px color-mix(in srgb, var(--deck-color-heading_navy) 18%, transparent);
+}
+
+.eco-centre-label {
+  font-size: 29px;
+  font-weight: 700;
+  line-height: 1.24;
+  color: #FFFFFF;
+}
+
+.eco-centre-caption {
+  font-size: 20px;
+  line-height: 1.35;
+  color: color-mix(in srgb, #FFFFFF 82%, transparent);
+}
+
+.eco-node {
+  border: 2px solid color-mix(in srgb, var(--deck-color-accent_teal) 45%, transparent);
+}
+
+.eco-node-label {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.26;
+  color: var(--deck-color-heading_navy);
+}
+
+.eco-node-caption {
+  font-size: 19px;
+  line-height: 1.35;
+  color: var(--deck-color-subtitle_navy);
+}
+
+/* LAYERS: the last band is the shared base, and is drawn as one. */
+.eco--layers {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  /*
+   * NOT PINNED TO THE TOP. Two bands of text stacked in the upper half with
+   * dead space under them is the page type failing at its job - a page type
+   * has to compose the whole canvas. The reserved illustration band below
+   * takes the slack now, so the figure sits where it falls and the page is
+   * full either way.
+   */
+  flex: 0 0 auto;
+}
+
+.eco--layers .eco-layer {
+  min-height: 150px;
+}
+
+/*
+ * THE LABEL ON THE LEFT, THE ITEMS ACROSS THE REST.
+ *
+ * The label sat on its own line with the items wrapping under it, so a band
+ * 1562 px wide carried its content in the left third and the other two thirds
+ * were empty inside the panel. The reference's own base band reads left to
+ * right - what this layer IS, then what is in it - and that is both better
+ * composed and the way the row is actually read.
+ */
+.eco-layer {
+  display: grid;
+  grid-template-columns: minmax(200px, 22%) 1fr;
+  align-items: center;
+  column-gap: 32px;
+  padding: 20px 26px 22px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--deck-color-table_header_pale) 48%, transparent);
+  /*
+   * NO BAR DOWN THE LEFT EDGE. Six pixels of teal on one side of a panel is
+   * not containment, not order and not hierarchy - the panel's own tint
+   * already separates it from the page, and the bar merely decorated an edge
+   * that needed no decorating. Which layer is the shared base is said by the
+   * tint below and by its position at the bottom, both of which carry the
+   * meaning the bar was pretending to.
+   */
+}
+
+.eco-layer--base {
+  background: color-mix(in srgb, var(--deck-color-table_header_navy) 10%, transparent);
+}
+
+.eco-layer-head {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.eco-layer-label {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--deck-color-heading_navy);
+}
+
+.eco-layer-caption {
+  font-size: 20px;
+  line-height: 1.4;
+  color: var(--deck-color-subtitle_navy);
+}
+
+.eco-layer-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 14px;
+}
+
+.eco-chip {
+  padding: 9px 18px;
+  border-radius: 999px;
+  background: var(--deck-color-page_bg);
+  border: 1px solid color-mix(in srgb, var(--deck-color-accent_teal) 40%, transparent);
+  font-size: 21px;
+  line-height: 1.3;
+  color: var(--deck-color-body_navy);
+}
+
+/* --- timeline ---------------------------------------------------------- */
+
+.timeline {
+  margin-top: var(--deck-space-subtitle_to_content);
+  /*
+   * NOT STRETCHED AND NOT PINNED. Four short entries do not need the whole
+   * page; what sits under them is the reserved illustration band, which takes
+   * the slack. `margin-bottom: auto` used to push the figure up and drop the
+   * note to the foot of the page.
+   */
+  flex: 0 0 auto;
+}
+
+/* The entries hang under the axis and grow downward into the space. */
+.tl-entries > * {
+  min-height: 230px;
+}
+
+.timeline-axis {
+  display: block;
+}
+
+.tl-entries {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(var(--deck-tl-count, 3), 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.tl-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 20px 20px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--deck-color-table_header_pale) 40%, transparent);
+}
+
+.tl-entry--pick {
+  background: color-mix(in srgb, var(--deck-color-accent_teal) 12%, transparent);
+}
+
+.tl-when {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--deck-color-accent_teal);
+}
+
+.tl-label {
+  font-size: 25px;
+  font-weight: 700;
+  line-height: 1.28;
+  color: var(--deck-color-heading_navy);
+}
+
+.tl-items {
+  margin: 0;
+  padding-left: 1.25em;
+  font-size: 21px;
+  line-height: 1.5;
+  color: var(--deck-color-body_navy);
+}
