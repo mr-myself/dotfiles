@@ -1759,34 +1759,67 @@ mkdir -p "$AP"
 "$SQUAD" gen-helpers "$AP" >/dev/null 2>&1
 check_file "gen-helpers writes the await-po helper" "$AP/await-po"
 
-# A stub notifier first on PATH, so no real notification is posted and every
-# call is counted. terminal-notifier is deliberately NOT stubbed: the helper
-# prefers it when present, and stubbing only osascript proves the fallback path
-# that every machine has.
-cat > "$ROOT/bin/osascript" <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$NOTIFY_STUB_LOG"
-exit 0
-STUB
-chmod +x "$ROOT/bin/osascript"
+# BOTH notifiers are stubbed, each tagging the shared log with its own name.
+#
+# Stubbing only osascript made this suite environment-dependent and it passed
+# for the wrong reason: the helper prefers terminal-notifier, so on a machine
+# that has it - a GitHub macOS runner does - the osascript stub is correctly
+# never reached and every count came back 0.
+#
+# PATH is also narrowed to the stub directory plus the system directories for
+# these checks. That is what makes the FALLBACK case decidable: nothing named
+# terminal-notifier can be found unless this suite put it there, because brew
+# installs it outside /usr/bin and /bin.
 export NOTIFY_STUB_LOG="$ROOT/notify.log"
 : > "$NOTIFY_STUB_LOG"
 
+make_notifier_stub() {
+  local name="$1" rc="${2:-0}"
+  cat > "$ROOT/bin/$name" <<STUB
+#!/usr/bin/env bash
+printf '$name %s\n' "\$*" >> "\$NOTIFY_STUB_LOG"
+exit $rc
+STUB
+  chmod +x "$ROOT/bin/$name"
+}
+
+# tmux is reached through the stub in $ROOT/bin; everything else await-po uses
+# (head, tr, sed, cut, date, mv, rm) lives in /usr/bin or /bin.
+NOTIFY_PATH="$ROOT/bin:/usr/bin:/bin"
+await_po() { PATH="$NOTIFY_PATH" "$AP/await-po" "$@"; }
+
+notify_count() { grep -c . "$NOTIFY_STUB_LOG" 2>/dev/null || true; }
+notify_count_of() { grep -c "^$1 " "$NOTIFY_STUB_LOG" 2>/dev/null || true; }
+
 printf 'TEST | 通知のタイトル\n' > "$AP/title.txt"
 
-notify_count() { grep -c 'display notification' "$NOTIFY_STUB_LOG" 2>/dev/null || true; }
+# --- the preferred path, when terminal-notifier is installed ------------------
+make_notifier_stub terminal-notifier
+make_notifier_stub osascript
+rm -f "$AP/awaiting-po.env"
+await_po mark 'plan approval' >/dev/null 2>&1
+check_eq "terminal-notifier is preferred when it is installed" "1" "$(notify_count_of terminal-notifier)"
+check_eq "and osascript is not also called" "0" "$(notify_count_of osascript)"
+check_contains "terminal-notifier is told to bring iTerm forward" \
+  "$(cat "$NOTIFY_STUB_LOG")" 'com.googlecode.iterm2'
+
+# --- the fallback path, on a machine without it ------------------------------
+rm -f "$ROOT/bin/terminal-notifier"
+make_notifier_stub osascript
+: > "$NOTIFY_STUB_LOG"
 
 rm -f "$AP/awaiting-po.env"
-"$AP/await-po" mark 'plan approval' >/dev/null 2>&1
+await_po mark 'plan approval' >/dev/null 2>&1
 check_eq "the first mark notifies" "1" "$(notify_count)"
+check_eq "and it falls back to osascript" "1" "$(notify_count_of osascript)"
 
-"$AP/await-po" mark 'plan approval' >/dev/null 2>&1
+await_po mark 'plan approval' >/dev/null 2>&1
 check_eq "a re-mark inside the same wait does not notify again" "1" "$(notify_count)"
 
-"$AP/await-po" clear >/dev/null 2>&1
+await_po clear >/dev/null 2>&1
 check_eq "clear itself never notifies" "1" "$(notify_count)"
 
-"$AP/await-po" mark 'review round cap reached' >/dev/null 2>&1
+await_po mark 'review round cap reached' >/dev/null 2>&1
 check_eq "the next wait notifies again" "2" "$(notify_count)"
 
 check_contains "the notification carries the reason" \
@@ -1796,22 +1829,28 @@ check_contains "the notification carries the run title as the subtitle" \
 
 # A notifier that fails must not fail the squad: the Manager would have to read
 # the error, and the marker file - the durable truth - is already written.
-cat > "$ROOT/bin/osascript" <<'STUB'
-#!/usr/bin/env bash
-exit 3
-STUB
-chmod +x "$ROOT/bin/osascript"
-"$AP/await-po" clear >/dev/null 2>&1
-"$AP/await-po" mark 'notifier is broken' >/dev/null 2>&1
+make_notifier_stub osascript 3
+await_po clear >/dev/null 2>&1
+await_po mark 'notifier is broken' >/dev/null 2>&1
 check_eq "a failing notifier still leaves mark successful" "0" "$?"
 check_file "the marker is written even when the notification fails" "$AP/awaiting-po.env"
 
-# A title.txt that does not exist yet (a run marking before the title lands).
-rm -f "$AP/title.txt" "$AP/awaiting-po.env"
-"$AP/await-po" mark 'no title yet' >/dev/null 2>&1
-check_eq "a missing title.txt still leaves mark successful" "0" "$?"
-
+# A notifier that is missing ENTIRELY, which is every non-macOS machine.
 rm -f "$ROOT/bin/osascript"
+await_po clear >/dev/null 2>&1
+await_po mark 'no notifier at all' >/dev/null 2>&1
+check_eq "no notifier at all still leaves mark successful" "0" "$?"
+check_file "the marker is written with no notifier present" "$AP/awaiting-po.env"
+
+# A title.txt that does not exist yet (a run marking before the title lands).
+make_notifier_stub osascript
+: > "$NOTIFY_STUB_LOG"
+rm -f "$AP/title.txt" "$AP/awaiting-po.env"
+await_po mark 'no title yet' >/dev/null 2>&1
+check_eq "a missing title.txt still leaves mark successful" "0" "$?"
+check_contains "and the subtitle falls back to 'squad'" "$(cat "$NOTIFY_STUB_LOG")" 'squad'
+
+rm -f "$ROOT/bin/osascript" "$ROOT/bin/terminal-notifier"
 
 echo ""
 check_absent "nothing in this suite ever killed a window" "$(cat "$TMUX_STUB_LOG")" "kill-window"

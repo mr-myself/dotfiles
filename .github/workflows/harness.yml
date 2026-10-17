@@ -78,11 +78,15 @@ jobs:
           git config --global user.name 'harness'
           git config --global user.email 'harness@example.invalid'
 
+      # Before the harness, not after it: `deck gate --help` refuses to say
+      # anything while _deck/node_modules is missing ("deck's dependencies are
+      # not installed"), and the wiring assertions read that help text.
+      - name: Install the renderer's dependencies
+        run: npm ci --prefix _deck
+
       - name: deck wiring
         run: ./test-deck-wiring.sh
 
       # The geometry fixtures: the measurements themselves, against real Chrome.
       - name: deck renderer tests
-        run: |
-          npm ci --prefix _deck
-          npm test --prefix _deck
+        run: npm test --prefix _deck
