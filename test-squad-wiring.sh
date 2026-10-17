@@ -1542,6 +1542,88 @@ check_eq "should_fix is unioned across lenses" \
 
 echo ""
 
+# ================================================================ the extra gate ==
+#
+# The third gate, and the only one that is not a Ruby tool. RuboCop and Brakeman
+# both resolve to the empty command outside Ruby, so before this gate existed a
+# TypeScript or Go squad ran with NO gate at all - which is the entire reason it
+# is here. These assertions cover the two ways it could quietly stop being a
+# gate: a helper that lets a failing command look like a pass, and a Manager
+# prompt that never runs it.
+echo "the extra gate (in a non-Ruby project, the only gate there is)"
+
+check_file "the extra gate helper is generated" "$GEN/run-extra-gate"
+check_eq "the generated run-extra-gate is valid bash" "0" \
+  "$(bash -n "$GEN/run-extra-gate" >/dev/null 2>&1; echo $?)"
+
+GATE_DIR="$(mktemp -d "$ROOT/gate.XXXXXX")"
+
+# Runs the generated helper the way the Coder pane does, and prints its exit
+# status. The result and status files are named after the case, so each one
+# stays readable when it fails.
+run_gate() {
+  local name="$1" command="$2"
+  printf '%s\n' "$command" > "$GATE_DIR/$name.cmd"
+  (
+    cd "$GATE_DIR" &&
+      "$GEN/run-extra-gate" "$GATE_DIR/$name.cmd" "$GATE_DIR/$name.result" \
+        "$GATE_DIR/$name.status" "squad-test-extra-gate-$name" "$GATE_DIR/title.txt"
+  ) >/dev/null 2>&1
+  printf '%s' "$?"
+}
+
+check_eq "a passing command passes the gate" "0" "$(run_gate pass 'exit 0')"
+check_eq "a passing command records status 0" "0" "$(cat "$GATE_DIR/pass.status")"
+
+check_eq "a failing command fails the gate" "3" "$(run_gate fail 'exit 3')"
+check_eq "the recorded status is the COMMAND's own" "3" "$(cat "$GATE_DIR/fail.status")"
+
+# The helper pipes the command through tee and a logging loop. Both exit 0, so
+# without PIPESTATUS a noisy failure would be reported as a pass - the one bug
+# that would make this gate worse than having none.
+check_eq "output on the way out cannot launder a failure into a pass" \
+  "1" "$(run_gate noisy 'echo lots of output; exit 1')"
+check_eq "the noisy failure records status 1" "1" "$(cat "$GATE_DIR/noisy.status")"
+check_contains "the failing command's output is kept for the Manager" \
+  "$(cat "$GATE_DIR/noisy.result")" "lots of output"
+check_contains "the result file records the exit status" \
+  "$(cat "$GATE_DIR/noisy.result")" "Extra gate exit status: 1"
+
+# No command configured is a SKIP, never a block: that is what keeps this gate
+# invisible in the Ruby projects that already have two.
+check_eq "an unconfigured extra gate skips instead of failing" "0" "$(run_gate none '')"
+check_eq "the skip records status 0" "0" "$(cat "$GATE_DIR/none.status")"
+check_contains "the skip says it skipped" \
+  "$(cat "$GATE_DIR/none.result")" "Extra gate skipped"
+
+# The command reaches the helper through a file, so gen-helpers has to write it.
+GEN_GATE="$ROOT/gen-extra-gate"
+SQUAD_GEN_EXTRA_GATE_COMMAND='pnpm run ci:gates' "$SQUAD" gen-helpers "$GEN_GATE" >/dev/null 2>&1
+check_eq "the configured command lands in extra-gate-command.txt" \
+  "pnpm run ci:gates" "$(cat "$GEN_GATE/extra-gate-command.txt" 2>/dev/null)"
+check_eq "with nothing configured the command file is empty" \
+  "" "$(cat "$GEN/extra-gate-command.txt" 2>/dev/null)"
+
+check_contains "the prompt runs the extra gate before the review lenses" \
+  "$PROMPT" "After Brakeman and BEFORE the review lenses, ALWAYS run the extra gate helper"
+check_contains "the prompt requires status 0 from it" \
+  "$PROMPT" "Extra gate status must be 0."
+check_contains "the prompt invokes the generated helper" "$PROMPT" "run-extra-gate"
+check_contains "the prompt keeps it a gate, not a third lens" \
+  "$PROMPT" "The extra gate is a GATE too, never a review lens"
+check_contains "the prompt forbids narrowing the command to get past a failure" \
+  "$PROMPT" "never edit it, never run only part of it"
+check_contains "the workflow numbers the extra gate as its own step" \
+  "$PROMPT" "8. Run the mandatory extra gate helper and require status 0."
+check_contains "a gate failure is a fix round, like the other two" \
+  "$PROMPT" "RuboCop, Brakeman or the extra gate failed"
+check_contains "the resume prompt carries the extra gate too" \
+  "$RESUME_PROMPT" "Extra gate status must be 0."
+check_contains "the extra gate is documented in the usage text" \
+  "$("$SQUAD" --help 2>&1)" "SQUAD_EXTRA_GATE_COMMAND"
+
+echo ""
+
 # =================================================================== squad-herdr ==
 #
 # squad-herdr carries a near-copy of this review flow and the two are meant not
@@ -1575,8 +1657,13 @@ else
     fi
   done
   check_file "squad-herdr generates the lens-result writer" "$HGEN/write-lens-result"
+  check_file "squad-herdr generates the extra gate helper" "$HGEN/run-extra-gate"
 
   HPROMPT="$(cat "$HGEN/manager-prompt.md")"
+  check_contains "squad-herdr runs the extra gate before the review lenses" \
+    "$HPROMPT" "After Brakeman and BEFORE the review lenses, ALWAYS run the extra gate helper"
+  check_contains "squad-herdr requires status 0 from the extra gate" \
+    "$HPROMPT" "Extra gate status must be 0."
   check_absent "squad-herdr no longer commands pasting the checklist" \
     "$HPROMPT" "Paste its contents"
   check_absent "squad-herdr no longer commands running both lenses every round" \
@@ -1656,6 +1743,77 @@ fi
 
 echo ""
 
+# ======================================================== await-po notifies ==
+#
+# The window-name badge only reaches a PO who is looking at tmux. The marker
+# exists for the opposite case - the PO walked away because the squad was busy -
+# so `mark` also posts a desktop notification. What has to be pinned here is the
+# ONCE PER WAIT rule: mark is idempotent and the Manager may call it more than
+# once inside a single wait, and a notification per call would train the PO to
+# ignore them.
+echo ""
+echo "await-po (the desktop notification, once per wait)"
+
+AP="$ROOT/awaitpo"
+mkdir -p "$AP"
+"$SQUAD" gen-helpers "$AP" >/dev/null 2>&1
+check_file "gen-helpers writes the await-po helper" "$AP/await-po"
+
+# A stub notifier first on PATH, so no real notification is posted and every
+# call is counted. terminal-notifier is deliberately NOT stubbed: the helper
+# prefers it when present, and stubbing only osascript proves the fallback path
+# that every machine has.
+cat > "$ROOT/bin/osascript" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$NOTIFY_STUB_LOG"
+exit 0
+STUB
+chmod +x "$ROOT/bin/osascript"
+export NOTIFY_STUB_LOG="$ROOT/notify.log"
+: > "$NOTIFY_STUB_LOG"
+
+printf 'TEST | 通知のタイトル\n' > "$AP/title.txt"
+
+notify_count() { grep -c 'display notification' "$NOTIFY_STUB_LOG" 2>/dev/null || true; }
+
+rm -f "$AP/awaiting-po.env"
+"$AP/await-po" mark 'plan approval' >/dev/null 2>&1
+check_eq "the first mark notifies" "1" "$(notify_count)"
+
+"$AP/await-po" mark 'plan approval' >/dev/null 2>&1
+check_eq "a re-mark inside the same wait does not notify again" "1" "$(notify_count)"
+
+"$AP/await-po" clear >/dev/null 2>&1
+check_eq "clear itself never notifies" "1" "$(notify_count)"
+
+"$AP/await-po" mark 'review round cap reached' >/dev/null 2>&1
+check_eq "the next wait notifies again" "2" "$(notify_count)"
+
+check_contains "the notification carries the reason" \
+  "$(cat "$NOTIFY_STUB_LOG")" 'review round cap reached'
+check_contains "the notification carries the run title as the subtitle" \
+  "$(cat "$NOTIFY_STUB_LOG")" 'TEST | 通知のタイトル'
+
+# A notifier that fails must not fail the squad: the Manager would have to read
+# the error, and the marker file - the durable truth - is already written.
+cat > "$ROOT/bin/osascript" <<'STUB'
+#!/usr/bin/env bash
+exit 3
+STUB
+chmod +x "$ROOT/bin/osascript"
+"$AP/await-po" clear >/dev/null 2>&1
+"$AP/await-po" mark 'notifier is broken' >/dev/null 2>&1
+check_eq "a failing notifier still leaves mark successful" "0" "$?"
+check_file "the marker is written even when the notification fails" "$AP/awaiting-po.env"
+
+# A title.txt that does not exist yet (a run marking before the title lands).
+rm -f "$AP/title.txt" "$AP/awaiting-po.env"
+"$AP/await-po" mark 'no title yet' >/dev/null 2>&1
+check_eq "a missing title.txt still leaves mark successful" "0" "$?"
+
+rm -f "$ROOT/bin/osascript"
+
+echo ""
 check_absent "nothing in this suite ever killed a window" "$(cat "$TMUX_STUB_LOG")" "kill-window"
 check_absent "nothing in this suite ever killed a session" "$(cat "$TMUX_STUB_LOG")" "kill-session"
 check_absent "nothing in this suite ever killed a server" "$(cat "$TMUX_STUB_LOG")" "kill-server"

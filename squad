@@ -59,6 +59,12 @@ Environment:
                             bundled _vet/checklist.md.
   SQUAD_RUBOCOP_COMMAND     Override the detected RuboCop command.
   SQUAD_BRAKEMAN_COMMAND    Override the detected Brakeman command.
+  SQUAD_EXTRA_GATE_COMMAND  One extra gate command, run over the WHOLE
+                            repository and required to exit 0. This is the gate
+                            for projects the Ruby gates cannot see. When unset,
+                            it is detected from a ci:gates script in
+                            package.json; set it to the empty string to turn the
+                            gate off.
   SQUAD_STATE_ROOT          Where run state is kept. Default
                             ~/.local/state/squad.
   SQUAD_WORKTREE_ROOT       Where squad worktrees are created. Default
@@ -187,6 +193,10 @@ write_state() {
     # existed has no such key in state.env, and resume sources that file before
     # calling write_state. Without the default, set -u would abort the resume.
     printf 'BRAKEMAN_COMMAND=%q\n' "${BRAKEMAN_COMMAND:-}"
+    # Defaulted for the same reason BRAKEMAN_COMMAND is: a run created before
+    # the extra gate existed has no such key in state.env, and resume sources
+    # that file before calling write_state.
+    printf 'EXTRA_GATE_COMMAND=%q\n' "${EXTRA_GATE_COMMAND:-}"
     printf 'WAIT_TIMEOUT_SECONDS=%q\n' "$WAIT_TIMEOUT_SECONDS"
     # Defaulted for the same reason BRAKEMAN_COMMAND is: a run created before
     # the review round cap existed has no such key in state.env.
@@ -1263,10 +1273,59 @@ sanitize_reason() {
     cut -c 1-120
 }
 
+# Tell the PO on the DESKTOP, not only in the tmux window name.
+#
+# The window-name badge is the right signal while the PO is looking at tmux, and
+# the wrong one for the case this marker exists for: the Manager has a question,
+# and the PO left for another task precisely because the squad was busy. iTerm
+# is not the frontmost app then, so the badge is unreadable and the squad idles
+# until the PO happens to come back.
+#
+# Best effort, exactly like apply_window_name. A squad must never fail, and must
+# never make the Manager read an error, because a notification could not be
+# posted - so every path here ends in success.
+notify_po() {
+  local reason="$1" title message
+  title="$(head -c 160 "$SQUAD_DIR/title.txt" 2>/dev/null | tr -d '\n\r' || true)"
+  [[ -n "$title" ]] || title='squad'
+  message="${reason:-PO の確認待ちです}"
+
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    # -activate brings iTerm forward when the notification is clicked, which
+    # makes the notification itself the way back into the run.
+    terminal-notifier \
+      -title 'squad: PO 待ち' \
+      -subtitle "$title" \
+      -message "$message" \
+      -group "squad-$SQUAD_DIR" \
+      -activate com.googlecode.iterm2 >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # osascript fallback. sanitize_reason has already stripped control characters
+  # from the reason; backslashes and double quotes still have to be escaped
+  # because these values land inside AppleScript string literals.
+  local as_title as_message
+  as_title="$(printf '%s' "$title" | sed 's/[\\"]/\\&/g')"
+  as_message="$(printf '%s' "$message" | sed 's/[\\"]/\\&/g')"
+  osascript -e "display notification \"$as_message\" with title \"squad: PO 待ち\" subtitle \"$as_title\"" \
+    >/dev/null 2>&1 || true
+  return 0
+}
+
 case "${1:-}" in
   mark)
     shift
     REASON="$(sanitize_reason "${*:-}")"
+    # Whether this mark is a TRANSITION into awaiting, decided BEFORE the write.
+    # mark is idempotent and the Manager may call it more than once inside a
+    # single wait; the desktop notification has to fire once per wait, not once
+    # per call, or a long review round turns into a stream of notifications.
+    if [[ -e "$MARKER" ]]; then
+      WAS_MARKED=1
+    else
+      WAS_MARKED=0
+    fi
     # Written to a temp file and RENAMED, so a reader (cockpit polling, or the
     # window-name helper) never observes a half-written marker. $$ keeps two
     # concurrent marks from sharing a temp path; rename is atomic within the
@@ -1281,6 +1340,9 @@ case "${1:-}" in
     } > "$TMP"
     mv -f "$TMP" "$MARKER"
     apply_window_name >/dev/null || true
+    if [[ "$WAS_MARKED" -eq 0 ]]; then
+      notify_po "$REASON"
+    fi
     if [[ -n "$REASON" ]]; then
       printf 'Awaiting PO: %s\n' "$REASON"
     else
@@ -3312,6 +3374,92 @@ fi
 log ">>> Brakeman passed with 0 warnings (whole-application scan)."
 HELPER
   chmod +x "$SQUAD_DIR/run-brakeman"
+
+  # The extra gate: ONE project-defined command, run over the whole repository.
+  # A GATE like Brakeman - no verdict, no merge-reviews, just exit 0 - and in a
+  # non-Ruby project it is usually the only one that actually runs.
+  #
+  # WHOLE REPOSITORY, never the changed files. What the command covers is the
+  # project's decision, and squad has no idea which files a typechecker, a
+  # dependency audit or a secret scan needs to see; narrowing it here is exactly
+  # how a gate reports confident green over a broken build.
+  cat > "$SQUAD_DIR/run-extra-gate" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+COMMAND_FILE="$1"
+RESULT_FILE="$2"
+STATUS_FILE="$3"
+EVENT="$4"
+TITLE_FILE="$5"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+set_title() {
+  # See run-rubocop: without -t this retitles the active (Manager) pane.
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux select-pane -t "$TMUX_PANE" -T "Coder: $1"
+  else
+    tmux select-pane -T "Coder: $1"
+  fi
+}
+
+finish() {
+  rc=$?
+  trap - EXIT
+  printf '%s\n' "$rc" > "$STATUS_FILE"
+  if [[ "$rc" -eq 0 ]]; then
+    set_title "Extra gate passed $(date '+%H:%M:%S')"
+  else
+    set_title "Extra gate failed($rc) $(date '+%H:%M:%S')"
+  fi
+  tmux wait-for -S "$EVENT"
+  exit "$rc"
+}
+trap finish EXIT
+
+# Same stale-status protection as every other helper: cleared AFTER the trap is
+# installed, so a failure from here on still records a status.
+rm -f "$STATUS_FILE"
+
+set_title "Extra gate since $(date '+%H:%M:%S')"
+log ">>> Extra gate starting..."
+
+BASE_COMMAND="$(cat "$COMMAND_FILE")"
+if [[ -z "$BASE_COMMAND" ]]; then
+  {
+    log ">>> Extra gate skipped: no extra gate command is configured for this project."
+    printf 'Extra gate skipped: no extra gate command configured.\n'
+  } | tee "$RESULT_FILE"
+  exit 0
+fi
+
+{
+  printf 'Extra gate command: %s\n' "$BASE_COMMAND"
+  printf 'Working directory: %s\n\n' "$PWD"
+} > "$RESULT_FILE"
+log ">>> Extra gate command: $BASE_COMMAND"
+
+# PIPESTATUS, not the pipeline's status: tee and the logging loop must never be
+# able to turn a failing gate into a pass, and the status the Manager reads has
+# to be the COMMAND's own exit code.
+set +e
+bash -lc "$BASE_COMMAND" 2>&1 |
+  tee -a "$RESULT_FILE" |
+  while IFS= read -r line; do log "$line"; done
+GATE_STATUS="${PIPESTATUS[0]}"
+set -e
+
+printf '\nExtra gate exit status: %s\n' "$GATE_STATUS" >> "$RESULT_FILE"
+if [[ "$GATE_STATUS" -eq 0 ]]; then
+  log ">>> Extra gate passed."
+else
+  log ">>> Extra gate FAILED with status $GATE_STATUS."
+fi
+exit "$GATE_STATUS"
+HELPER
+  chmod +x "$SQUAD_DIR/run-extra-gate"
 }
 
 # --- Manager system prompt ----------------------------------------------------
@@ -3322,6 +3470,7 @@ generate_manager_prompt() {
   local coder_event="squad-$RUN_ID-coder"
   local rubocop_event="squad-$RUN_ID-rubocop"
   local brakeman_event="squad-$RUN_ID-brakeman"
+  local extra_gate_event="squad-$RUN_ID-extra-gate"
   # One event per review lens. The two lenses run one after the other in the
   # same pane, and reusing a single event name for both would let the second
   # run-wait return on the first lens's signal.
@@ -3414,6 +3563,14 @@ likewise takes a role, not a pane ID.
   Brakeman, so a non-zero status always means a real finding or a real failure.
 - Brakeman is a GATE, not a third review lens. Never pass its files to
   merge-reviews and never treat it as a review verdict.
+- After Brakeman and BEFORE the review lenses, ALWAYS run the extra gate helper
+  and require exit status 0. It runs ONE project-defined command over the whole
+  repository. RuboCop and Brakeman are Ruby tools and skip everywhere else, so
+  outside a Ruby project this is usually the ONLY gate that runs at all. It
+  skips with status 0 when the project configures no such command.
+- The extra gate is a GATE too, never a review lens: never pass its output to
+  merge-reviews. Never work around a failure by narrowing the command or by
+  running a part of it; fix the code, or ask PO.
 - The Coder MUST run relevant automated tests for the task. If tests cannot run,
   report the exact blocker to PO and do not claim completion.
 - RuboCop success is required independently of the Coder's report.
@@ -3456,8 +3613,8 @@ likewise takes a role, not a pane ID.
   When classify-diff reports final_round=yes, this is the last review round: do
   NOT start another Coder fix round after it. Run
   '$SQUAD_DIR/await-po' mark 'review round cap reached'
-  and report the outstanding findings, the test results and the RuboCop and
-  Brakeman gate results to PO instead.
+  and report the outstanding findings, the test results and the RuboCop,
+  Brakeman and extra gate results to PO instead.
 - NEVER commit, push, force-push, merge, rebase, or create a pull request unless
   PO explicitly asks for that Git operation. Editing files is allowed.
 - NEVER create additional git worktrees, including Claude Code default locations
@@ -3482,6 +3639,9 @@ applies a $WAIT_TIMEOUT_SECONDS second timeout as a final fallback.
 - $SQUAD_DIR/brakeman-result.json - the raw Brakeman JSON report. Both lenses may
   cite it as evidence; the SECURITY lens must read it. It is a GATE result, not
   a review verdict, and it is never an input to merge-reviews.
+- $SQUAD_DIR/extra-gate-result.txt - the extra gate command, its output and its
+  exit status. A GATE result as well: citable as evidence, never a verdict and
+  never an input to merge-reviews.
 - $SQUAD_DIR/review-scope.txt     - which lenses this round needs, which round
   it is, and whether this round reviews the full diff or only the delta. Written
   by classify-diff. Read it, never guess it.
@@ -3580,10 +3740,11 @@ criteria, identify relevant tests, and call out risks. Then run:
 
 Write an English request to $SQUAD_DIR/coder-task.txt. Include the approved plan
 and acceptance criteria. Require Coder to inspect project rules, implement the
-change, run relevant automated tests, run RuboCop and Brakeman, and return the
-structured verification report. Its rubocop_status and brakeman_status fields
-are self-reports: the authoritative results are the helper runs you do yourself
-in the steps below. For broad or uncertain changes, require Coder to use
+change, run relevant automated tests, run RuboCop and Brakeman and the project's
+own gate command when it has one (see $SQUAD_DIR/extra-gate-command.txt), and
+return the structured verification report. Its rubocop_status and
+brakeman_status fields are self-reports: the authoritative results are the
+helper runs you do yourself in the steps below. For broad or uncertain changes, require Coder to use
 built-in Explore subagents to investigate independent areas in parallel before
 editing. Keep all file writes in the main Coder session, and skip subagents for
 narrow changes. Explicitly prohibit commit, push, force-push, merge, rebase, and
@@ -3630,6 +3791,23 @@ Ruby project, has no Brakeman installed, or contains no Rails application, so a
 non-zero status is always a real finding or a real failure - never a missing
 tool. Never work around a failure by narrowing the scan; either fix the warning
 or ask PO about the ignore file.
+
+### Run the mandatory extra gate
+
+Always run this after Brakeman and BEFORE the review lenses, and again after
+each fix:
+
+  '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/extra-gate-status.txt' coder '$SQUAD_DIR/run-extra-gate $SQUAD_DIR/extra-gate-command.txt $SQUAD_DIR/extra-gate-result.txt $SQUAD_DIR/extra-gate-status.txt $extra_gate_event $SQUAD_DIR/title.txt'
+  '$SQUAD_DIR/run-wait' '$extra_gate_event' '$SQUAD_DIR/extra-gate-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Extra gate'
+  cat '$SQUAD_DIR/extra-gate-status.txt'
+  cat '$SQUAD_DIR/extra-gate-result.txt'
+
+Extra gate status must be 0. It is ONE command the project defines - typically
+lint, typecheck, its own security checks and tests bundled together - run over
+the WHOLE repository. The helper returns 0 when the project configures no such
+command, so a non-zero status is always a real failure. The command is the
+project's, not yours: never edit it, never run only part of it, and never
+narrow it to the changed files to get past a failure.
 
 ### The output contract (put it FIRST in every review task file)
 
@@ -3769,11 +3947,11 @@ Run this when review-scope.txt says correctness=run and you are not carrying the
 lens forward. The first of two independent lenses. Write an English request to
 $SQUAD_DIR/review-correctness-task.txt. Tell Advisor to inspect the change
 against the approved acceptance criteria, the Coder's test report, and the
-mandatory RuboCop and Brakeman results, and to cover correctness, data
-integrity, tests, compatibility, performance, and the project's own conventions.
-Report findings only. A pass verdict is allowed only when relevant tests ran and
-both the RuboCop and Brakeman statuses are 0. The lens may cite the Brakeman
-result as evidence.
+mandatory RuboCop, Brakeman and extra gate results, and to cover correctness,
+data integrity, tests, compatibility, performance, and the project's own
+conventions. Report findings only. A pass verdict is allowed only when relevant
+tests ran and the RuboCop, Brakeman and extra gate statuses are ALL 0. The lens
+may cite the Brakeman and extra gate results as evidence.
 
 Scope the task from review_mode, as described above:
 
@@ -3909,16 +4087,16 @@ anything is still outstanding, do NOT ask Coder for another fix round. Instead:
 
 then report to PO in Japanese: the outstanding must_fix, should_fix and
 test_gaps findings from both lens result files with the lens that raised each,
-the tests that were run and their results, and the RuboCop and Brakeman gate
-results. Say plainly that the round cap stopped the loop and ask PO how to
+the tests that were run and their results, and the RuboCop, Brakeman and extra
+gate results. Say plainly that the round cap stopped the loop and ask PO how to
 proceed. Never raise the cap yourself.
 
 ### Ask Coder to fix review findings
 
 Write an English request to $SQUAD_DIR/coder-task.txt. Include the UNION of the
 must_fix findings from BOTH lens result files, saying which lens raised each
-one, plus any RuboCop or Brakeman failure, and require updated tests, RuboCop
-and Brakeman. When Brakeman failed, quote the offending warnings from
+one, plus any RuboCop, Brakeman or extra gate failure, and require updated
+tests and all three gates green. When Brakeman failed, quote the offending warnings from
 $SQUAD_DIR/brakeman-result.txt and require a real fix - never a narrowed scan. Reiterate that Coder must not
 create additional git worktrees and must keep all work in $WORKDIR. Reiterate
 that Coder must not run tmux kill-server, tmux kill-session, tmux kill-window,
@@ -3941,25 +4119,28 @@ or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
 5. Read Coder status and structured verification report.
 6. Run the mandatory RuboCop helper and require status 0.
 7. Run the mandatory Brakeman helper and require status 0.
-8. Run classify-diff to get this round's scope, round number and review_mode.
-9. Ask Advisor for the CORRECTNESS review at the scope review_mode gives - the
+8. Run the mandatory extra gate helper and require status 0.
+9. Run classify-diff to get this round's scope, round number and review_mode.
+10. Ask Advisor for the CORRECTNESS review at the scope review_mode gives - the
    full diff in round 1, the delta plus that lens's own previous findings later
    - unless the scope file skips it or it is genuinely carried forward. Record a
    skip or a carry with write-lens-result.
-10. Ask Advisor for the SECURITY review of the same change, independently, under
+11. Ask Advisor for the SECURITY review of the same change, independently, under
    the same rule. It runs even when the correctness lens returned must_fix, and
    its task text never mentions the correctness result or its findings.
-11. Run merge-reviews to write the aggregate files for the GUI.
-12. Run capture-review-baseline for this round, so the next round can review
+12. Run merge-reviews to write the aggregate files for the GUI.
+13. Run capture-review-baseline for this round, so the next round can review
    only what changes from here.
-13. If either lens status is non-zero, either lens verdict is must_fix, or
-   RuboCop or Brakeman failed, ask Coder to fix the issues - UNLESS classify-diff
-   reported final_round=yes, in which case mark and report to PO instead of
-   starting another fix round. Pass the union of the findings from both lenses.
-14. After every fix, repeat from step 5.
-15. Report completion to PO in Japanese. Include the squad worktree path, branch,
-   test commands and results, the mandatory RuboCop and Brakeman results, and
-   any lens that was skipped, carried forward, or reviewed at delta scope.
+14. If either lens status is non-zero, either lens verdict is must_fix, or
+   RuboCop, Brakeman or the extra gate failed, ask Coder to fix the issues -
+   UNLESS classify-diff reported final_round=yes, in which case mark and report
+   to PO instead of starting another fix round. Pass the union of the findings
+   from both lenses.
+15. After every fix, repeat from step 5.
+16. Report completion to PO in Japanese. Include the squad worktree path, branch,
+   test commands and results, the mandatory RuboCop, Brakeman and extra gate
+   results, and any lens that was skipped, carried forward, or reviewed at delta
+   scope.
 PROMPT
 }
 
@@ -4077,6 +4258,9 @@ resume_run() {
   # for a run created before the Brakeman gate did (where it resolves to the
   # empty command, i.e. skip) and so launch and resume stay idempotent.
   printf '%s\n' "${BRAKEMAN_COMMAND:-}" > "$SQUAD_DIR/brakeman-command.txt"
+  # Same reason, for a run created before the extra gate existed: it resolves to
+  # the empty command, which the helper reports as a skip.
+  printf '%s\n' "${EXTRA_GATE_COMMAND:-}" > "$SQUAD_DIR/extra-gate-command.txt"
   # Same reason: a squad created before the review round cap existed has no
   # REVIEW_MAX_ROUNDS in state.env, and the Manager prompt interpolates it. The
   # recorded value wins over the environment, exactly as WAIT_TIMEOUT_SECONDS
@@ -4247,6 +4431,7 @@ case "$1" in
     set -o noclobber
     printf '%s\n' "${SQUAD_GEN_RUBOCOP_COMMAND:-}" > "$SQUAD_DIR/rubocop-command.txt"
     printf '%s\n' "${SQUAD_GEN_BRAKEMAN_COMMAND:-}" > "$SQUAD_DIR/brakeman-command.txt"
+    printf '%s\n' "${SQUAD_GEN_EXTRA_GATE_COMMAND:-}" > "$SQUAD_DIR/extra-gate-command.txt"
     printf '%s\n' "$SQUAD_TITLE" > "$SQUAD_DIR/title.txt"
     generate_schemas
     generate_review_checklist
@@ -4462,6 +4647,65 @@ else
   BRAKEMAN_COMMAND=""
 fi
 
+# The THIRD gate, and the only language-agnostic one: ONE project-defined
+# command, run over the whole repository, required to exit 0.
+#
+# It exists because the other two gates are Ruby tools. In a TypeScript, Go or
+# Python repository both resolve to the empty command and skip, and the squad
+# then runs with NO quality gate at all - the two review lenses are a review,
+# not a gate. squad deliberately does not know what a non-Ruby project should
+# check: the project bundles its own checks behind one script, and squad
+# requires exit status 0 from it.
+#
+# Detection has the same shape as the other two, with one deliberate
+# difference: the override is honoured even when EMPTY (tested with +x, not
+# -n). Setting SQUAD_EXTRA_GATE_COMMAND to the empty string is how a project
+# that HAS a ci:gates script turns this gate off for a run; for the Ruby gates
+# the equivalent is simply not having the tool installed.
+extra_gate_script_declared() {
+  # A non-empty `ci:gates` entry under "scripts". jq when it is available,
+  # because a regex over JSON is a guess; the grep fallback only has to be right
+  # about a key the project itself wrote.
+  local package_json="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -e '(.scripts["ci:gates"] // empty) | select(. != "")' "$package_json" >/dev/null 2>&1
+  else
+    grep -qE '"ci:gates"[[:space:]]*:' "$package_json"
+  fi
+}
+
+if [[ -n "${SQUAD_EXTRA_GATE_COMMAND+x}" ]]; then
+  EXTRA_GATE_COMMAND="$SQUAD_EXTRA_GATE_COMMAND"
+elif [[ ! -f "$REPO_ROOT/package.json" ]] ||
+  ! extra_gate_script_declared "$REPO_ROOT/package.json"; then
+  # Nothing declared: run-extra-gate reports the step as skipped instead of
+  # failing the squad, exactly as the two Ruby gates do outside Ruby.
+  EXTRA_GATE_COMMAND=""
+elif [[ -f "$REPO_ROOT/pnpm-lock.yaml" ]] && command -v pnpm >/dev/null 2>&1; then
+  EXTRA_GATE_COMMAND="pnpm run ci:gates"
+elif [[ -f "$REPO_ROOT/yarn.lock" ]] && command -v yarn >/dev/null 2>&1; then
+  EXTRA_GATE_COMMAND="yarn run ci:gates"
+elif [[ -f "$REPO_ROOT/bun.lockb" || -f "$REPO_ROOT/bun.lock" ]] &&
+  command -v bun >/dev/null 2>&1; then
+  EXTRA_GATE_COMMAND="bun run ci:gates"
+elif [[ -f "$REPO_ROOT/package-lock.json" ]] && command -v npm >/dev/null 2>&1; then
+  EXTRA_GATE_COMMAND="npm run ci:gates"
+elif command -v pnpm >/dev/null 2>&1; then
+  EXTRA_GATE_COMMAND="pnpm run ci:gates"
+elif command -v npm >/dev/null 2>&1; then
+  EXTRA_GATE_COMMAND="npm run ci:gates"
+else
+  # A declared ci:gates script with nothing to run it is a broken toolchain, not
+  # an absent gate - and in a non-Ruby project it is the ONLY gate there is.
+  # Fail at LAUNCH, where the PO sees it immediately, rather than reporting
+  # green every round. Brakeman skips instead because a Ruby project still has
+  # RuboCop; here there is nothing left.
+  echo "Error: package.json declares a ci:gates script but no package manager was found to run it." >&2
+  echo "Install pnpm, yarn or npm, or set SQUAD_EXTRA_GATE_COMMAND to the project-specific command." >&2
+  echo "Set SQUAD_EXTRA_GATE_COMMAND to the empty string to turn the extra gate off." >&2
+  exit 1
+fi
+
 if [[ "$HAS_COMMITS" == "true" ]]; then
   # Record the fork point BEFORE creating the worktree. `worktree add ... HEAD`
   # branches from exactly this commit, so it IS the base of every diff for this
@@ -4507,6 +4751,7 @@ Manager session:   $MANAGER_SESSION_ID
 Coder session:     $CODER_SESSION_ID
 RuboCop command:   ${RUBOCOP_COMMAND:-(none: not a Ruby project, RuboCop step is skipped)}
 Brakeman command:  ${BRAKEMAN_COMMAND:-(none: not a Ruby project or Brakeman not installed, Brakeman step is skipped)}
+Extra gate:        ${EXTRA_GATE_COMMAND:-(none: no ci:gates script and no SQUAD_EXTRA_GATE_COMMAND, extra gate is skipped)}
 Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
 Review rounds:     $REVIEW_MAX_ROUNDS maximum
 INFO
@@ -4545,6 +4790,7 @@ generate_schemas
 
 printf '%s\n' "$RUBOCOP_COMMAND" > "$SQUAD_DIR/rubocop-command.txt"
 printf '%s\n' "$BRAKEMAN_COMMAND" > "$SQUAD_DIR/brakeman-command.txt"
+printf '%s\n' "$EXTRA_GATE_COMMAND" > "$SQUAD_DIR/extra-gate-command.txt"
 
 # --- Generated helper scripts and Manager prompt ------------------------------
 # All three are regenerated verbatim by resume_run, so they must never contain a
