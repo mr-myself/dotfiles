@@ -40,6 +40,15 @@ jobs:
           git config --global user.name 'harness'
           git config --global user.email 'harness@example.invalid'
 
+      # The install step README documents, and the one the vet harness depends
+      # on: it copies vet to a path containing a space, where the bundled
+      # _vet/checklist.md is no longer beside the script, so the resolution
+      # falls through to ~/.vet/checklist.md. Without it vet correctly refuses
+      # to review against an empty checklist and the spaced-path assertions
+      # fail - which is CI exercising the documented installation, not a bug.
+      - name: Install the review checklist (~/.vet)
+        run: ln -s "$PWD/_vet" "$HOME/.vet"
+
       - name: shellcheck the launchers
         run: shellcheck -S error squad squad-herdr vet deck whatdid tmux-pick-window tmux-pick-session
 
@@ -59,7 +68,7 @@ jobs:
   # downloaded for it.
   deck:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -87,6 +96,20 @@ jobs:
       - name: deck wiring
         run: ./test-deck-wiring.sh
 
-      # The geometry fixtures: the measurements themselves, against real Chrome.
-      - name: deck renderer tests
-        run: npm test --prefix _deck
+      # The measurements themselves, against real Chrome. Split by suite rather
+      # than run through `npm test`, because only one of them needs a different
+      # deadline and the repo's own test script should not be bent to CI.
+      - name: deck renderer tests (unit)
+        run: npm run test:unit --prefix _deck
+
+      - name: deck renderer tests (geometry)
+        run: npm run test:geometry --prefix _deck
+
+      # The full pipeline - render, rasterize, lint - clears package.json's five
+      # minutes locally and does not on a cold runner that has just installed
+      # Chrome. 576 of the 577 tests passed there; this one timed out. The
+      # deadline is raised HERE, so the PO's own `npm test` keeps the shorter
+      # one that is right for a warm machine.
+      - name: deck renderer tests (end-to-end pipeline)
+        run: node --test --test-timeout=1200000 "test/e2e/*.test.js"
+        working-directory: _deck

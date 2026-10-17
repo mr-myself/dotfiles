@@ -1032,13 +1032,26 @@ SPACE_OUT="$ROOT/space-run.out"
   VET_FIXTURE_DIR="$FIXTURES" \
   VET_DRY_RUN=1 "$SPACE_HOME/bin dir/vet" --dry-run 42
 ) > "$SPACE_OUT" 2>&1
-check_eq "a dry run succeeds from a path with a space" "0" "$?"
+SPACE_RC=$?
+
+# The reason goes in the MESSAGE, not into a file path. $ROOT is removed by the
+# EXIT trap, and on a CI runner the whole machine goes with it, so "see
+# $SPACE_OUT" names a file nobody can ever open. vet's own error - a missing
+# ~/.vet/checklist.md, say, which this spaced copy has to fall through to - is
+# one line, and one line is what a failure here needs to carry.
+if [[ "$SPACE_RC" -eq 0 ]]; then
+  ok "a dry run succeeds from a path with a space"
+else
+  no "a dry run succeeds from a path with a space" \
+    "exit $SPACE_RC: $(tr '\n' ' ' < "$SPACE_OUT" | cut -c 1-300)"
+fi
 
 SPACE_RUN_DIR="$(find "$SPACE_HOME/state root/runs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)"
 if [[ -n "$SPACE_RUN_DIR" ]]; then
   ok "a run directory is created under a spaced path"
 else
-  no "a run directory is created under a spaced path" "see $SPACE_OUT"
+  no "a run directory is created under a spaced path" \
+    "$(tr '\n' ' ' < "$SPACE_OUT" | cut -c 1-300)"
 fi
 
 if [[ -n "$SPACE_RUN_DIR" ]]; then
