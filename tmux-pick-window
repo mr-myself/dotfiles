@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ==============================================================================
+# tmux-pick-window - fuzzy-jump to any tmux window in any session
+# ==============================================================================
+#
+# This exists because `squad` and `deck` put each run in its OWN tmux window and
+# rename it to the run's title plus the awaiting-PO badge. That makes the window
+# NAME the most informative index of what is in flight - and tmux's built-in
+# `choose-window` only ever shows the current session, so finding a run meant
+# `tmux ls`, reading session numbers, attaching, then hunting windows by hand.
+#
+# Bound to `prefix w`, which shadows choose-window on purpose: this is the same
+# operation across all sessions.
+
+if [[ -z "${TMUX:-}" ]]; then
+  printf 'tmux-pick-window: not inside tmux.\n' >&2
+  exit 1
+fi
+
+# The window the PO is already looking at is dropped: picking it is a no-op.
+# Compared as a whole FIELD rather than by a regex, because a session named
+# after a repo can contain dots and a regex would then match too much.
+current="$(tmux display-message -p '#{session_name}:#{window_index}')"
+
+# The target id, the awaiting-PO badge and the title all stay visible: the badge
+# is the reason to look at this list at all, and typing `3:` narrows to one
+# session.
+selection="$(
+  tmux list-windows -a -F '#{session_name}:#{window_index}#{?window_active,*, } #{window_name}' |
+    awk -v cur="$current" '{ id = $1; sub(/\*$/, "", id); if (id != cur) print }' |
+    fzf --reverse \
+        --no-sort \
+        --prompt 'window > ' \
+        --header 'enter: jump   esc: cancel   [?] = PO 待ち'
+)" || exit 0
+
+[[ -n "$selection" ]] || exit 0
+
+# The target is the first field with the active marker stripped. switch-client
+# moves the attached client, so this works from a popup as well as from a pane.
+target="${selection%% *}"
+target="${target%\*}"
+tmux switch-client -t "$target"

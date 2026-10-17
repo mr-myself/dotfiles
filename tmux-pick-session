@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ==============================================================================
+# tmux-pick-session - fuzzy-create-or-attach a tmux session (sesh + fzf)
+# ==============================================================================
+#
+# One list over three sources: running tmux sessions, configured sesh projects,
+# and the zoxide frecency history. Picking a directory that has no session yet
+# CREATES one named after the git repo or the directory, so there is no separate
+# "new session" step and no session named `0`.
+#
+# Bound to `prefix f`.
+
+if ! command -v sesh >/dev/null 2>&1; then
+  printf 'tmux-pick-session: sesh is not installed (brew install sesh).\n' >&2
+  exit 1
+fi
+
+selection="$(
+  sesh list --icons |
+    fzf --reverse \
+        --no-sort \
+        --ansi \
+        --prompt 'session > ' \
+        --header 'enter: attach or create   esc: cancel'
+)" || exit 0
+
+[[ -n "$selection" ]] || exit 0
+
+sesh connect "$selection"
