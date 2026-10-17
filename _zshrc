@@ -116,10 +116,10 @@ source "/opt/homebrew/opt/kube-ps1/share/kube-ps1.sh"
 PS1='$(kube_ps1)'$PS1
 
 # Google Cloud SDK
-if [ -f '/Users/keisuke/mr-myself/google-cloud-sdk/path.zsh.inc' ]; then 
+if [ -f '/Users/keisuke/mr-myself/google-cloud-sdk/path.zsh.inc' ]; then
   . '/Users/keisuke/mr-myself/google-cloud-sdk/path.zsh.inc'
 fi
-if [ -f '/Users/keisuke/mr-myself/google-cloud-sdk/completion.zsh.inc' ]; then 
+if [ -f '/Users/keisuke/mr-myself/google-cloud-sdk/completion.zsh.inc' ]; then
   . '/Users/keisuke/mr-myself/google-cloud-sdk/completion.zsh.inc'
 fi
 
@@ -154,4 +154,99 @@ function peco-vim {
 # ==============================================================================
 if [ -f "$HOME/.local/bin/env" ]; then
   . "$HOME/.local/bin/env"
+fi
+
+# ==============================================================================
+# 1Password (op) credentials
+# ==============================================================================
+# シェル起動時に op read すると、タブを開くたびに認証ポップアップが出る。
+# 必要なときだけ手で呼ぶ。1シェルにつき1回で、そのシェルの間は維持される。
+oykot-env() {
+  local token account
+  token="$(op read 'op://OYKOT/Cloudflare-Pages-Deploy/password')" || return 1
+  account="$(op read 'op://OYKOT/Cloudflare-Pages-Deploy/username')" || return 1
+  export CLOUDFLARE_API_TOKEN="$token"
+  export CLOUDFLARE_ACCOUNT_ID="$account"
+}
+
+# ==============================================================================
+# Modern CLI stack (2026)
+# ==============================================================================
+# Every block is guarded, so a machine without the tool still starts a shell.
+# Nothing here is sourced from the network and nothing authenticates, so shell
+# startup stays as fast and as quiet as the 1Password rule above wants it.
+
+# --- fzf: fuzzy find for everything -------------------------------------------
+if (( $+commands[fzf] )); then
+  # ctrl-r (history), ctrl-t (files), alt-c (cd). fzf >= 0.48 ships this itself.
+  source <(fzf --zsh) 2>/dev/null
+
+  export FZF_DEFAULT_OPTS='--height 60% --layout=reverse --border --info=inline'
+
+  # fd respects .gitignore, which is what makes ctrl-t usable inside a repo the
+  # size of the organization checkouts.
+  if (( $+commands[fd] )); then
+    export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+    export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+    export FZF_ALT_C_COMMAND='fd --type d --hidden --follow --exclude .git'
+  fi
+  if (( $+commands[bat] )); then
+    export FZF_CTRL_T_OPTS="--preview 'bat --color=always --style=numbers --line-range=:200 {}'"
+  fi
+fi
+
+# --- zoxide: cd that remembers ------------------------------------------------
+# Added as `z` / `zi` rather than replacing cd, so muscle memory keeps working
+# and the long `cd mr-myself/organization/oykot/...` paths become `z oykot`.
+if (( $+commands[zoxide] )); then
+  eval "$(zoxide init zsh)"
+fi
+
+# --- yazi: terminal file manager with real image previews ---------------------
+# iTerm2 renders inline images, so `y` inside a deck's out/png shows the actual
+# slides instead of a list of filenames. `y` (not `yazi`) because the wrapper
+# has to cd the SHELL to wherever the browsing ended up, which the binary
+# cannot do by itself.
+if (( $+commands[yazi] )); then
+  y() {
+    local tmp cwd
+    tmp="$(mktemp -t yazi-cwd.XXXXXX)" || return 1
+    yazi "$@" --cwd-file="$tmp"
+    if cwd="$(command cat -- "$tmp" 2>/dev/null)" && [[ -n "$cwd" && "$cwd" != "$PWD" ]]; then
+      builtin cd -- "$cwd" || true
+    fi
+    command rm -f -- "$tmp"
+  }
+
+  # Pick a deck run and browse its rendered slides as thumbnails. This replaces
+  # the `open ~/decks/<run>/out/png/` round trip through Finder.
+  dpng() {
+    local run dir
+    run="$(command ls -t "$HOME/decks" 2>/dev/null | fzf --prompt 'deck > ')" || return 0
+    [[ -n "$run" ]] || return 0
+    dir="$HOME/decks/$run/out/png"
+    if [[ ! -d "$dir" ]]; then
+      printf 'No rendered slides yet: %s\n' "$dir" >&2
+      return 1
+    fi
+    y "$dir"
+  }
+fi
+
+# --- bat / eza: cat and ls with syntax highlighting ---------------------------
+# `cat` and `ls` themselves are left alone: scripts and the existing l/ll/sl
+# aliases depend on their exact output.
+if (( $+commands[bat] )); then
+  alias catp='bat --paging=never'
+  export PAGER='less -FRX'
+  export BAT_THEME='ansi'
+fi
+if (( $+commands[eza] )); then
+  alias lt='eza --tree --level=2 --git-ignore'
+  alias lg='eza -la --git --group-directories-first'
+fi
+
+# --- lazygit ------------------------------------------------------------------
+if (( $+commands[lazygit] )); then
+  alias lzg='lazygit'
 fi
