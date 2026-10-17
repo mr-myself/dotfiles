@@ -1,0 +1,88 @@
+name: harness
+
+# The four wiring harnesses in this repo assert the surface that squad, vet and
+# deck GENERATE - prompts, checklists, gates, helper scripts. They are the only
+# thing standing between a one-character edit to a 4,800-line generator and a
+# squad that silently reviews the wrong diff, so they must not depend on anyone
+# remembering to run them.
+#
+# macOS, not ubuntu, on purpose: these are macOS tools. They shell out to
+# osascript, reattach-to-user-namespace and BSD date, and `deck` renders through
+# the installed Google Chrome. A green ubuntu run would not mean anything about
+# the machine the PO actually works on.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: harness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The hermetic suites: `gen-helpers` writes the whole generated surface
+  # without a tmux server, a worktree or an agent, so these need nothing but
+  # jq, shellcheck and a git identity.
+  squad-and-vet:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: brew install jq shellcheck
+
+      # The harnesses create throwaway git repos and commit in them.
+      - name: Configure a git identity
+        run: |
+          git config --global user.name 'harness'
+          git config --global user.email 'harness@example.invalid'
+
+      - name: shellcheck the launchers
+        run: shellcheck -S error squad squad-herdr vet deck whatdid tmux-pick-window tmux-pick-session
+
+      - name: squad wiring
+        run: ./test-squad-wiring.sh
+
+      - name: vet wiring
+        run: ./test-vet-wiring.sh
+
+      - name: vet autoclose
+        run: ./test-vet-autoclose.sh
+
+  # deck's harness runs `deck gate doctor`, which REPORTS on the real
+  # environment rather than stubbing it, so this job has to supply the
+  # environment: Chrome to render, poppler to rasterize, node to run the
+  # renderer. The pinned font is vendored in _deck/themes, so nothing is
+  # downloaded for it.
+  deck:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: brew install jq shellcheck poppler
+
+      - name: Install Google Chrome
+        run: brew install --cask google-chrome
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configure a git identity
+        run: |
+          git config --global user.name 'harness'
+          git config --global user.email 'harness@example.invalid'
+
+      - name: deck wiring
+        run: ./test-deck-wiring.sh
+
+      # The geometry fixtures: the measurements themselves, against real Chrome.
+      - name: deck renderer tests
+        run: |
+          npm ci --prefix _deck
+          npm test --prefix _deck
