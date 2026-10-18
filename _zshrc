@@ -250,3 +250,23 @@ fi
 if (( $+commands[lazygit] )); then
   alias lzg='lazygit'
 fi
+
+# --- history: 週次ワークフロー棚卸し(weekly-workflow-review)の母数を確保 --------
+# /etc/zshrc が HISTSIZE=2000 / SAVEHIST=1000 で履歴を切ってしまい、
+# 2週間分しか残らなかった。ここで上書きして長期の癖が見えるようにする。
+HISTFILE=$HOME/.zsh_history
+HISTSIZE=200000
+SAVEHIST=200000
+setopt EXTENDED_HISTORY        # `: <epoch>:<duration>;cmd` 形式で実行時刻を残す（集計に必須）
+setopt INC_APPEND_HISTORY      # シェル終了を待たず即追記。tmuxで複数paneを使うため
+setopt HIST_REDUCE_BLANKS
+setopt HIST_IGNORE_SPACE       # 先頭にスペースを付けたコマンドは記録しない（秘匿したい時用）
+# HIST_IGNORE_DUPS は意図的に入れない: 同じコマンドの反復回数そのものが棚卸しの材料
+
+# --- t: tmux への入口 ---------------------------------------------------------
+# `tmux a` の代わり。tmux の外から打つと、走っているセッション・sesh のプロジェクト・
+# zoxide の履歴を1つのリストから選んでアタッチ（無ければ repo 名で作成）する。
+# 中に入ってからは prefix w でウィンドウを横断する、という二段構えになる。
+if (( $+commands[sesh] )); then
+  alias t='tmux-pick-session'
+fi
