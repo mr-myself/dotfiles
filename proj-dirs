@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ==============================================================================
+# proj-dirs - the directories worth jumping to, and only those
+# ==============================================================================
+#
+# This exists because `fd --type d` from $HOME does not finish. Not "is slow" -
+# it ran for over three minutes without producing a list, because $HOME holds
+# Library, Dropbox, every node_modules and 65 squad run directories. Pointing a
+# directory picker at $HOME is therefore not a usable idea on this machine, and
+# fzf's own ALT_C default does exactly that.
+#
+# The places actually moved between are about a hundred, they are all at a known
+# depth, and a shell glob reaches them with no traversal at all - so this is
+# instant and stays instant as the disk fills up.
+#
+# Used by the ctrl-g / alt-c directory picker, through FZF_ALT_C_COMMAND.
+# Add a root here when a new kind of workspace appears.
+
+shopt -s nullglob
+
+emit() {
+  local d
+  for d in "$@"; do
+    # A trailing slash would show up in the picker and in the chosen path.
+    [[ -d "$d" ]] && printf '%s\n' "${d%/}"
+  done
+}
+
+# Ordered roughly by how often each is the answer: the repositories first, then
+# the things made from them.
+emit "$HOME"/mr-myself/organization/*/*/
+emit "$HOME"/mr-myself/organization/*/
+emit "$HOME"/mr-myself/project/*/
+emit "$HOME"/.local/share/squad/worktrees/*/
+emit "$HOME"/decks/*/
+emit "$HOME"/mr-myself/setup/dotfiles
+emit "$HOME"

@@ -187,7 +187,27 @@ if (( $+commands[fzf] )); then
   if (( $+commands[fd] )); then
     export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
     export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
-    export FZF_ALT_C_COMMAND='fd --type d --hidden --follow --exclude .git'
+  fi
+
+  # ディレクトリ移動は fd ではなく proj-dirs。
+  #
+  # fzf の既定（fd --type d を cwd から）は、ホームで走らせると終わりません。
+  # 遅いのではなく、3分以上かけて一覧が出てこない。Library・Dropbox・無数の
+  # node_modules・squad の run ディレクトリを全部掘るからです。
+  # 実際に移動したい先は約110個で深さも決まっているので、glob で即座に出せます。
+  if (( $+commands[proj-dirs] )); then
+    export FZF_ALT_C_COMMAND='proj-dirs'
+    export FZF_ALT_C_OPTS="--prompt 'dir > ' --preview 'eza -la --git --group-directories-first {} 2>/dev/null || ls -la {}' --preview-window right,55%"
+  fi
+
+  # ctrl-g にも同じものを割り当てる。
+  #
+  # alt-c は iTerm2 の Option キーが「Esc+」を送る設定になっていないと届かず、
+  # 既定の「Normal」では ç が入力されるだけです。設定を変えると Option+文字で
+  # アクセント記号が打てなくなるので、それは本人の判断に任せ、設定を変えなくても
+  # 使えるキーを用意しておく。
+  if (( $+widgets[fzf-cd-widget] )); then
+    bindkey '^G' fzf-cd-widget
   fi
   if (( $+commands[bat] )); then
     export FZF_CTRL_T_OPTS="--preview 'bat --color=always --style=numbers --line-range=:200 {}'"

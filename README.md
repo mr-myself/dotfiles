@@ -67,6 +67,7 @@ ln -s ~/mr-myself/setup/dotfiles/_takt/projects/track-manager \
 | `prefix w` | Pick any window in any session. squad and deck name their windows after the run, so this is the index of work in flight. |
 | `prefix C` | A new window in the MAIN repository rather than the squad worktree the pane is in. |
 | `main` | The same jump, in the current shell. |
+| `ctrl-g` | Jump to any project directory by name. `proj-dirs` is the candidate list - fzf's own default walks $HOME and never finishes here. |
 | `deck check` | Open a rendered deck's PDF. |
 
 Run any of them with `--help`.
