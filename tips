@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ==============================================================================
+# tips - what to reach for, indexed by the situation you are in
+# ==============================================================================
+#
+#   tips              everything
+#   tips <word>       only the lines that mention it
+#   tips -r           one at random
+#   tips --here       the ones that apply where you are standing right now
+#
+# This exists because a key that is not remembered is the same as a key that
+# does not exist. Everything below was added because a specific moment of
+# friction came up, so the LEFT column is that moment rather than a description
+# of the tool: the way to find something here is to recognise what you are
+# about to do the slow way.
+#
+# The lines are the single source of truth for the cheat sheet. Keep them one
+# screen's worth per section and under 80 columns, so this is readable in a
+# split pane.
+
+# --- colour, only for a terminal ---------------------------------------------
+# Piping into grep or less -F has to produce plain text, so every escape is
+# conditional on stdout being a tty.
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "${TERM:-dumb}" != dumb ]]; then
+  B="$(tput bold)"; D="$(tput dim)"; R="$(tput sgr0)"
+  C1="$(tput setaf 3)"   # the key or command
+  C2="$(tput setaf 6)"   # section heading
+else
+  B=""; D=""; R=""; C1=""; C2=""
+fi
+
+# --- column alignment over DISPLAY width, not bytes --------------------------
+#
+# printf '%-34s' pads by bytes, and a Japanese character is three bytes wide and
+# two columns wide, so every line with Japanese in it came out ragged. bash's
+# ${#s} counts CHARACTERS in a UTF-8 locale, so the width is the ASCII count
+# plus twice everything else - exact here, because the only non-ASCII in this
+# file is Japanese.
+dwidth() {
+  local s="$1" ascii nchars nascii
+  ascii="${s//[!$'\x20'-$'\x7e']/}"
+  nchars=${#s}
+  nascii=${#ascii}
+  printf '%s' "$(( nascii + (nchars - nascii) * 2 ))"
+}
+
+# pad_to <width> <string> - the string, then spaces up to that display width.
+pad_to() {
+  local target="$1" s="$2" w pad
+  w="$(dwidth "$s")"
+  pad=$(( target - w ))
+  (( pad < 0 )) && pad=0
+  printf '%s%*s' "$s" "$pad" ""
+}
+
+# Each entry is "section<TAB>what you are about to do<TAB>what to type".
+# A tab-separated list rather than a formatted block, so filtering by word and
+# picking one at random both work on the same data.
+TAB=$'\t'
+read -r -d '' ENTRIES <<EOF
+移動${TAB}走っている run に行きたい${TAB}Ctrl+b w
+移動${TAB}どのセッションか選んで入りたい${TAB}Ctrl+b f  /  t
+移動${TAB}さっきのセッションに戻りたい${TAB}Ctrl+b Space
+移動${TAB}worktree から本体リポジトリへ${TAB}Ctrl+b C  /  main
+移動${TAB}名前は分かっている、そこへ行きたい${TAB}Ctrl+G
+移動${TAB}よく行く場所へ最短で${TAB}z <断片>
+探す${TAB}前に打った長いコマンドをまた打つ${TAB}Ctrl+R
+探す${TAB}コマンドの途中でパスが必要${TAB}Ctrl+T
+探す${TAB}名前を忘れた、目で探したい${TAB}y
+探す${TAB}ファイルの中身を色付きで読む${TAB}catp <file>
+探す${TAB}ディレクトリ構造をざっと見る${TAB}lt  /  lg
+git${TAB}一部だけステージしてコミット${TAB}lzg
+git${TAB}差分を読む（n/N でファイル移動）${TAB}git diff
+git${TAB}履歴をたどって読む${TAB}tig
+squad${TAB}タスクを3エージェントに投げる${TAB}squad "<やること>"
+squad${TAB}いま何が走っているか${TAB}squad list
+squad${TAB}終わった run を閉じる${TAB}squad close
+squad${TAB}閉じた run のディスクを回収${TAB}squad clean
+squad${TAB}PR を2人のレビュアーで見る${TAB}vet <pr番号>
+squad${TAB}資料を作る${TAB}deck "<タイトル>"
+squad${TAB}できた資料の PDF を開く${TAB}deck check
+squad${TAB}今日やったことを集める${TAB}whatdid today
+別PC${TAB}ssh 越しに画像を見るだけ${TAB}imgcat <file>
+別PC${TAB}ssh 越しに実ファイルを手元へ${TAB}it2dl <file>
+別PC${TAB}端末間で直接ファイルを渡す${TAB}tailscale file cp <f> <端末>:
+別PC${TAB}ディレクトリをブラウザで見る${TAB}tailscale serve <dir>
+EOF
+
+# --- notes: the things that are not a key ------------------------------------
+print_notes() {
+  printf '%s%s覚えておくこと%s\n' "$B" "$C2" "$R"
+  printf '  %s・%s squad が PO 待ちになると macOS 通知が出る。クリックで iTerm に戻る\n' "$D" "$R"
+  printf '  %s・%s z は行った場所を覚えてから効く。使うほど当たるようになる\n' "$D" "$R"
+  printf '  %s・%s y と Ctrl+G は q / Esc で抜けると、その場所にシェルが移動する\n' "$D" "$R"
+  printf '  %s・%s 迷ったら y は ~ 、lzg は ? でそのキー一覧が出る\n' "$D" "$R"
+}
+
+# emit <text> - all output in ONE write, with the error of that write dropped.
+#
+# `tips | head -5` closes the pipe early, and bash's builtin printf reports the
+# EPIPE as "write error: Broken pipe" on stderr before anything can trap it.
+# Piping this into head or grep is an ordinary thing to do, so it must be
+# silent. Only this single write is silenced - a failure anywhere else still
+# reaches the terminal.
+emit_out() {
+  printf '%s\n' "$1" 2>/dev/null
+}
+
+print_entries() {
+  local filter="${1:-}"
+  local last_section="" section what how
+  local shown=0
+
+  while IFS="$TAB" read -r section what how; do
+    [[ -n "$section" ]] || continue
+    if [[ -n "$filter" ]]; then
+      # Case-insensitive, over the whole line, so `tips squad`, `tips 通知` and
+      # `tips ctrl` all find something.
+      printf '%s %s %s' "$section" "$what" "$how" |
+        grep -qi -- "$filter" || continue
+    fi
+    if [[ "$section" != "$last_section" ]]; then
+      [[ -n "$last_section" ]] && printf '\n'
+      printf '%s%s%s%s\n' "$B" "$C2" "$section" "$R"
+      last_section="$section"
+    fi
+    printf '  %s %s%s%s\n' "$(pad_to 36 "$what")" "$C1" "$how" "$R"
+    shown=$((shown + 1))
+  done <<< "$ENTRIES"
+
+  printf '%s' "$shown" > "$COUNT_FILE"
+}
+
+COUNT_FILE="$(mktemp -t tips-count.XXXXXX)" || exit 1
+trap 'rm -f "$COUNT_FILE"' EXIT
+
+case "${1:-}" in
+  -h|--help)
+    cat <<'USAGE'
+Usage: tips              すべて表示
+       tips <word>       その語を含むものだけ
+       tips -r           ランダムに1つ
+       tips --here       いまいる場所で効くもの
+USAGE
+    exit 0
+    ;;
+
+  -r|--random)
+    # One line, formatted the same way, for when the whole sheet is too much.
+    line="$(printf '%s\n' "$ENTRIES" | grep -v '^$' | sort -R | head -1)"
+    IFS="$TAB" read -r section what how <<< "$line"
+    emit_out "$(printf '%s%s%s%s  %s → %s%s%s' "$B" "$C2" "$section" "$R" "$what" "$C1" "$how" "$R")"
+    exit 0
+    ;;
+
+  --here)
+    here_out="$(
+    # The situation this session is actually in. Nothing here is a guess about
+    # intent - each test is a fact about the current directory or tmux.
+    printf '%s%sいまここで効くもの%s\n' "$B" "$C2" "$R"
+    if git rev-parse --git-dir >/dev/null 2>&1; then
+      common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+      root="$(dirname "${common:-}")"
+      if [[ -n "$common" && "$root" != "$PWD" ]]; then
+        printf '  %s %s%s%s\n' "$(pad_to 36 "ここは worktree。本体リポジトリへ")" "$C1" "Ctrl+b C  /  main" "$R"
+      fi
+      printf '  %s %s%s%s\n' "$(pad_to 36 "差分を選んでコミット")" "$C1" "lzg" "$R"
+    fi
+    if [[ -n "${TMUX:-}" ]]; then
+      printf '  %s %s%s%s\n' "$(pad_to 36 "別の run に移る")" "$C1" "Ctrl+b w" "$R"
+    else
+      printf '  %s %s%s%s\n' "$(pad_to 36 "tmux に入る")" "$C1" "t" "$R"
+    fi
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+      printf '  %s %s%s%s\n' "$(pad_to 36 "ssh 中。ファイルを手元に落とす")" "$C1" "it2dl <file>" "$R"
+    fi
+    if [[ -d "$PWD/out/png" || -f "$PWD/out/deck.pdf" ]]; then
+      printf '  %s %s%s%s\n' "$(pad_to 36 "ここは deck の作業場")" "$C1" "deck check" "$R"
+    fi
+    printf '  %s %s%s%s' "$(pad_to 36 "全部見る")" "$C1" "tips" "$R"
+    )"
+    emit_out "$here_out"
+    exit 0
+    ;;
+
+  "")
+    emit_out "$(
+      print_entries ""
+      printf '\n'
+      print_notes
+      printf '\n%s絞り込み: tips <語>   ランダム: tips -r   いまここ: tips --here%s' "$D" "$R"
+    )"
+    exit 0
+    ;;
+
+  -*)
+    printf 'tips: 知らないオプションです: %s\n' "$1" >&2
+    printf "tips: 使い方は tips --help\n" >&2
+    exit 2
+    ;;
+
+  *)
+    emit_out "$(print_entries "$1")"
+    if [[ "$(cat "$COUNT_FILE" 2>/dev/null || echo 0)" -eq 0 ]]; then
+      printf '%s に当てはまるものはありません。tips で全部出ます。\n' "$1"
+      exit 1
+    fi
+    exit 0
+    ;;
+esac

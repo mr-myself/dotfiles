@@ -114,6 +114,7 @@ link tmux-pick-window   .local/bin/tmux-pick-window
 link tmux-pick-session  .local/bin/tmux-pick-session
 link tmux-main-window   .local/bin/tmux-main-window
 link proj-dirs          .local/bin/proj-dirs
+link tips               .local/bin/tips
 
 say ""
 say "linked/repointed: $LINKED   already correct: $KEPT   skipped: $SKIPPED"
