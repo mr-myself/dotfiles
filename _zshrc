@@ -216,20 +216,6 @@ if (( $+commands[yazi] )); then
     fi
     command rm -f -- "$tmp"
   }
-
-  # Pick a deck run and browse its rendered slides as thumbnails. This replaces
-  # the `open ~/decks/<run>/out/png/` round trip through Finder.
-  dpng() {
-    local run dir
-    run="$(command ls -t "$HOME/decks" 2>/dev/null | fzf --prompt 'deck > ')" || return 0
-    [[ -n "$run" ]] || return 0
-    dir="$HOME/decks/$run/out/png"
-    if [[ ! -d "$dir" ]]; then
-      printf 'No rendered slides yet: %s\n' "$dir" >&2
-      return 1
-    fi
-    y "$dir"
-  }
 fi
 
 # --- bat / eza: cat and ls with syntax highlighting ---------------------------
@@ -269,3 +255,28 @@ setopt HIST_IGNORE_SPACE       # 先頭にスペースを付けたコマンド�
 if (( $+commands[sesh] )); then
   alias t='tmux-pick-session'
 fi
+
+# --- main: worktree から本体リポジトリへ --------------------------------------
+# squad は run ごとに ~/.local/share/squad/worktrees 以下の worktree を作るので、
+# そこから master を見たい・pull したいときに本体リポジトリのパスを探して cd する
+# ことになる。`git rev-parse --git-common-dir` は worktree からでも本体からでも
+# 本体の .git を返すので、どちら側にいるかを知らなくても同じ1コマンドで済む。
+# tmux で新しいウィンドウごと本体で開きたいときは prefix C。
+main() {
+  local common_dir root
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+    printf 'main: ここは git リポジトリではありません\n' >&2
+    return 1
+  }
+  root="$(dirname "$common_dir")"
+  [[ -d "$root" ]] || {
+    printf 'main: 本体リポジトリが見つかりません: %s\n' "$root" >&2
+    return 1
+  }
+  if [[ "$root" == "$PWD" ]]; then
+    printf 'main: すでに本体です (%s)\n' "${root:t}"
+    return 0
+  fi
+  builtin cd -- "$root" || return 1
+  printf 'main: %s\n' "$root"
+}

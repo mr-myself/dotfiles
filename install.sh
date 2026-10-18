@@ -112,6 +112,7 @@ link deck               .local/bin/deck
 link whatdid            .local/bin/whatdid
 link tmux-pick-window   .local/bin/tmux-pick-window
 link tmux-pick-session  .local/bin/tmux-pick-session
+link tmux-main-window   .local/bin/tmux-main-window
 
 say ""
 say "linked/repointed: $LINKED   already correct: $KEPT   skipped: $SKIPPED"

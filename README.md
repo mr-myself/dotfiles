@@ -65,6 +65,9 @@ ln -s ~/mr-myself/setup/dotfiles/_takt/projects/track-manager \
 | `whatdid [date]` | Collects what you did from git, squad, Claude logs, reviews and the calendar. |
 | `t` | Pick a tmux session by name (running sessions, sesh projects, zoxide history). Outside tmux. |
 | `prefix w` | Pick any window in any session. squad and deck name their windows after the run, so this is the index of work in flight. |
+| `prefix C` | A new window in the MAIN repository rather than the squad worktree the pane is in. |
+| `main` | The same jump, in the current shell. |
+| `deck check` | Open a rendered deck's PDF. |
 
 Run any of them with `--help`.
 

@@ -39,6 +39,7 @@ usage() {
   local status="${1:-1}"
   cat <<'EOF'
 Usage: deck <title> [--source <notion-url|file>] [options]
+       deck check [run-id|part of a title]
        deck list
        deck resume [run-id]
        deck close [run-id]
@@ -67,6 +68,12 @@ Launch options:
                    $DECK_DECKS_ROOT/<date>-<title>, or the deck you are
                    already standing in.
   --theme <name>   Theme for a new workspace. Default: watercolor.
+
+Reviewing the result:
+  deck check            Open the newest rendered deck's PDF, or pick one when
+                        there are several. The PDF is the artefact to read; the
+                        PNGs are for the linter and for pasting single slides.
+  deck check <what>     A run id, or any part of a title.
 
 Lifecycle, as squad has:
   deck list             List retained runs, their phase and their status.
@@ -367,6 +374,79 @@ process.stdin.on("end", () => {
   try { process.stdout.write(String(JSON.parse(s).phase || "unknown")); }
   catch { process.stdout.write("unknown"); }
 });' 2>/dev/null || printf 'unknown'
+}
+
+# Open a deck's finished PDF.
+#
+# The artefact the PO actually reviews is out/deck.pdf - the PNGs exist for the
+# linter's measurements and for pasting single slides, not for reading the deck.
+# Without this, checking a deck meant remembering the workspace name, typing
+# `open ~/decks/<name>/out/deck.pdf`, and getting it wrong when the name
+# contained Japanese.
+#
+# With no argument: the newest deck that has a PDF, or a picker when fzf is
+# installed and there is more than one. A run id or a unique part of a title
+# also works.
+check_run() {
+  local wanted="${1:-}"
+  local state_file chosen_pdf chosen_label
+  local -a labels=() pdfs=()
+
+  while IFS= read -r state_file; do
+    unset RUN_ID RUN_DIR DECK_DIR TASK
+    # shellcheck disable=SC1090
+    source "$state_file"
+    [[ -n "${DECK_DIR:-}" && -f "$DECK_DIR/out/deck.pdf" ]] || continue
+    local title
+    title="$(cat "$RUN_DIR/title.txt" 2>/dev/null || printf '%s' "${TASK:-unknown}")"
+    # A run id or any part of the title narrows the list; nothing matches
+    # everything.
+    if [[ -n "$wanted" ]]; then
+      [[ "$RUN_ID" == *"$wanted"* || "$title" == *"$wanted"* ]] || continue
+    fi
+    labels+=("$RUN_ID  $title")
+    pdfs+=("$DECK_DIR/out/deck.pdf")
+  done < <(
+    find "$DECK_RUN_ROOT" -mindepth 3 -maxdepth 3 -name state.env -type f 2>/dev/null | sort -r
+  )
+
+  if [[ ${#pdfs[@]} -eq 0 ]]; then
+    if [[ -n "$wanted" ]]; then
+      echo "deck: no rendered deck matches '$wanted'." >&2
+    else
+      echo "deck: no rendered deck yet." >&2
+    fi
+    echo "deck: 'deck list' shows every run and the phase it reached;" >&2
+    echo "deck: a deck has a PDF once it reaches 'rendered'." >&2
+    return 1
+  fi
+
+  if [[ ${#pdfs[@]} -eq 1 ]]; then
+    chosen_pdf="${pdfs[0]}"
+    chosen_label="${labels[0]}"
+  elif command -v fzf >/dev/null 2>&1 && [[ -t 0 ]]; then
+    local picked
+    picked="$(printf '%s\n' "${labels[@]}" | fzf --reverse --no-sort --prompt 'deck > ')" || return 0
+    [[ -n "$picked" ]] || return 0
+    local i
+    for i in "${!labels[@]}"; do
+      if [[ "${labels[$i]}" == "$picked" ]]; then
+        chosen_pdf="${pdfs[$i]}"
+        chosen_label="${labels[$i]}"
+        break
+      fi
+    done
+  else
+    # No fzf, or not a terminal: the newest wins, and says which it took so the
+    # PO can name another.
+    chosen_pdf="${pdfs[0]}"
+    chosen_label="${labels[0]}"
+    echo "deck: ${#pdfs[@]} rendered decks; opening the newest." >&2
+  fi
+
+  printf '%s\n' "$chosen_label"
+  printf '%s\n' "$chosen_pdf"
+  open "$chosen_pdf"
 }
 
 list_runs() {
@@ -2190,6 +2270,10 @@ case "${1:-}" in
   list)
     list_runs
     exit 0
+    ;;
+  check)
+    check_run "${2:-}"
+    exit $?
     ;;
   close)
     close_run "${2:-}"

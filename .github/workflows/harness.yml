@@ -50,7 +50,7 @@ jobs:
         run: ln -s "$PWD/_vet" "$HOME/.vet"
 
       - name: shellcheck the launchers
-        run: shellcheck -S error squad squad-herdr vet deck whatdid tmux-pick-window tmux-pick-session install.sh
+        run: shellcheck -S error squad squad-herdr vet deck whatdid tmux-pick-window tmux-pick-session tmux-main-window install.sh
 
       # install.sh is what a new machine runs first, so the thing worth proving
       # is that it is safe: HOME is pointed at a throwaway directory holding a

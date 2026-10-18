@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ==============================================================================
+# tmux-main-window - open a window in the MAIN repository, not the worktree
+# ==============================================================================
+#
+# squad puts each run in its own git worktree under
+# ~/.local/share/squad/worktrees, and `prefix c` inherits pane_current_path -
+# so a new window opened from a squad pane lands in the worktree. That is right
+# for looking at the run and wrong for nearly everything else: checking master,
+# pulling, running the app, comparing against what is actually shipped.
+#
+# `git rev-parse --git-common-dir` is the answer and it works from either side:
+# in a linked worktree it resolves to the MAIN repository's .git, and in the
+# main repository it resolves to its own. So one key does the right thing
+# without knowing which of the two the pane is in.
+#
+# Bound to `prefix C`, next to `prefix c`.
+
+if [[ -z "${TMUX:-}" ]]; then
+  printf 'tmux-main-window: not inside tmux.\n' >&2
+  exit 1
+fi
+
+here="${1:-$PWD}"
+
+common_dir="$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+if [[ -z "$common_dir" ]]; then
+  # Not a repository at all. Opening a window in the same place is what
+  # `prefix c` would have done, which is better than refusing.
+  tmux new-window -c "$here"
+  tmux display-message 'not a git repository; opened here instead'
+  exit 0
+fi
+
+main_root="$(dirname "$common_dir")"
+
+if [[ ! -d "$main_root" ]]; then
+  tmux new-window -c "$here"
+  tmux display-message "main repository not found at $main_root; opened here instead"
+  exit 0
+fi
+
+tmux new-window -c "$main_root"
+
+if [[ "$main_root" == "$here" ]]; then
+  tmux display-message "already the main repository: ${main_root##*/}"
+else
+  tmux display-message "main repository: ${main_root##*/}"
+fi
