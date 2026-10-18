@@ -50,7 +50,26 @@ jobs:
         run: ln -s "$PWD/_vet" "$HOME/.vet"
 
       - name: shellcheck the launchers
-        run: shellcheck -S error squad squad-herdr vet deck whatdid tmux-pick-window tmux-pick-session
+        run: shellcheck -S error squad squad-herdr vet deck whatdid tmux-pick-window tmux-pick-session install.sh
+
+      # install.sh is what a new machine runs first, so the thing worth proving
+      # is that it is safe: HOME is pointed at a throwaway directory holding a
+      # hand-written .zshrc, and that file has to survive.
+      - name: install.sh links a fresh HOME without clobbering a real file
+        run: |
+          fresh="$(mktemp -d)"
+          printf '# hand written\nexport MINE=1\n' > "$fresh/.zshrc"
+          HOME="$fresh" ./install.sh
+          test -f "$fresh/.zshrc" && ! test -L "$fresh/.zshrc" \
+            || { echo "install.sh replaced a real ~/.zshrc"; exit 1; }
+          grep -q 'export MINE=1' "$fresh/.zshrc" \
+            || { echo "install.sh altered a real ~/.zshrc"; exit 1; }
+          for l in .tmux.conf .vimrc .vet .takt .local/bin/squad .local/bin/tmux-pick-window; do
+            test -L "$fresh/$l" || { echo "install.sh did not link $l"; exit 1; }
+          done
+          # Idempotent: a second run must change nothing.
+          HOME="$fresh" ./install.sh | grep -q 'linked/repointed: 0' \
+            || { echo "install.sh is not idempotent"; exit 1; }
 
       - name: squad wiring
         run: ./test-squad-wiring.sh

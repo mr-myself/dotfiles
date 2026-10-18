@@ -1,0 +1,33 @@
+# delta as git's pager. Included from ~/.gitconfig rather than committed as a
+# whole .gitconfig, because this repository is PUBLIC and a real .gitconfig
+# carries an email address and the paths of private repositories in its
+# safe.directory entries. Nothing personal belongs in this file.
+#
+#   [include]
+#       path = /Users/<you>/mr-myself/setup/dotfiles/_gitconfig.delta
+#
+# `include` is unconditional and later values win, so keep this line BELOW any
+# [core] section of your own that you want to take precedence.
+
+[core]
+	pager = delta
+
+[interactive]
+	diffFilter = delta --color-only
+
+[delta]
+	# n / N move between files inside the diff, which is what makes a big
+	# agent-written change readable in one pass.
+	navigate = true
+	line-numbers = true
+	# Terminal hyperlinks are off: they turn paths into OSC 8 escapes, which
+	# iTerm renders but a pipe into grep or pbcopy does not.
+	hyperlinks = false
+
+[merge]
+	# zdiff3 shows the common ancestor's text in a conflict, so it is possible
+	# to tell which side changed what.
+	conflictstyle = zdiff3
+
+[diff]
+	colorMoved = default
