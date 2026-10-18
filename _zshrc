@@ -124,7 +124,6 @@ if [ -f '/Users/keisuke/mr-myself/google-cloud-sdk/completion.zsh.inc' ]; then
 fi
 
 export PATH="/Users/keisuke/mr-myself/istio-1.19.0/bin:$PATH"
-export COMVEX_GIT_HOOKS_DIR="/Users/keisuke/mr-myself/organization/comvex/git-hooks"
 export PATH="/opt/homebrew/opt/node@23/bin:$PATH"
 
 # pnpm
