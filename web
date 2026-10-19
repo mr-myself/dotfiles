@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# web - URL を Arc の「正しい space」に開く
+# ==============================================================================
+#
+# ルールの出どころは Arc 自身の設定ファイルひとつだけ:
+#
+#     ~/Library/Application Support/Arc/StorableLinkRouting.json
+#
+# Arc の Settings -> Links で編集するあの表を、web はそのまま読む。だから
+# 「ブラウザは kotoage に開くのに CLI は mr-myself に開く」というズレが原理的に
+# 起きない。ルールを増やしたいときは Arc の UI で足せばよく、このファイルに
+# ドメインを書き足す必要はない。
+#
+# なぜ `open <url>` では足りないか。`open` は Arc に URL を渡すだけなので、
+# 行き先は Arc の routing 任せになる。それで足りる場面も多いが、
+#
+#   - space を明示して開きたい  (web kotoage <url>)
+#   - どこに開くかを事前に知りたい (web which <url>)
+#   - squad / deck / vet から確実に特定 space へ投げたい
+#
+# が落ちる。web はそこを AppleScript で直接撃つ。
+#
+# space とプロファイルの対応（= Google アカウントの対応）はこう:
+#
+#     mr-myself  Default     個人
+#     kotoage    Profile 2   kotoage
+#     理科大      Profile 5   東京理科大
+#     OYKOT      Profile 7   OYKOT
+#
+# 誤爆のコストが高いのはこのためで、space を間違えるとログイン壁に当たる。
+
+ARC_SUPPORT="$HOME/Library/Application Support/Arc"
+ROUTING_JSON="$ARC_SUPPORT/StorableLinkRouting.json"
+SIDEBAR_JSON="$ARC_SUPPORT/StorableSidebar.json"
+
+usage() {
+  local status="${1:-1}"
+  cat <<'EOF'
+Usage: web <url|query>              ルールで判定して正しい space に開く
+       web <space> <url|query>      space を明示して開く
+       web here <url|query>         今いる space に開く（ルールを無視）
+       web which <url>              どこに開くかだけ表示する（開かない）
+       web move <space>             いま見ているタブを別の space に移す
+       web ls                       ウインドウと space の現在の状態
+       web spaces                   space の一覧（ID 付き）
+       web rules                    Arc の Link Routing ルール一覧
+
+URL を Arc の正しい space に開く。判定には Arc 自身の Link Routing の設定を
+読むので、ブラウザでリンクを踏んだときと同じ space に必ず着弾する。
+
+space 名は前方一致でよい（ko -> kotoage, 理 -> 理科大）。
+URL に見えない引数は Google 検索として扱う。
+
+Examples:
+  web https://github.com/OYKOT-jp/destination_operating_system
+  web ko localhost:3010
+  web which https://letus.ed.tus.ac.jp/
+  web move OYKOT
+  web ls
+EOF
+  exit "$status"
+}
+
+die() { printf 'web: %s\n' "$1" >&2; exit 1; }
+
+[ -f "$ROUTING_JSON" ] || die "Arc の設定が見つからない: $ROUTING_JSON"
+
+# ---- Arc の設定を読む -------------------------------------------------------
+# space ID -> space 名 の対応を StorableSidebar.json から作り、
+# Link Routing のルールを「パターン<TAB>space名」の行に落として返す。
+dump_rules() {
+  python3 - "$SIDEBAR_JSON" "$ROUTING_JSON" <<'PY'
+import json, sys
+
+sidebar, routing = sys.argv[1], sys.argv[2]
+
+names = {}
+try:
+    d = json.load(open(sidebar))
+    for c in d["sidebar"]["containers"]:
+        for s in c.get("spaces", []):
+            if isinstance(s, dict) and "id" in s:
+                names[s["id"]] = s.get("title") or s["id"]
+except Exception:
+    pass
+
+def space_of(dest):
+    # {"space": {"_0": {"space": {"_0": "<id>"}}}} / ... {"mostRecent": {}}
+    for window_kind, inner in (dest or {}).items():
+        sel = (inner or {}).get("_0") or {}
+        if "space" in sel:
+            sid = sel["space"].get("_0")
+            return names.get(sid, sid), window_kind
+        if "mostRecent" in sel:
+            return "", window_kind
+    return "", ""
+
+for r in json.load(open(routing)).get("rules", []):
+    for comp in r.get("sourceComponents", []):
+        m = comp.get("componentType", {}).get("urlMatch")
+        if not m:
+            continue
+        kind = next(iter(m.get("_0", {"contains": {}})), "contains")
+        pattern = m.get("_1", "")
+        space, _ = space_of(r.get("destination"))
+        if pattern and space:
+            print(f"{kind}\t{pattern}\t{space}")
+PY
+}
+
+list_spaces() {
+  python3 - "$SIDEBAR_JSON" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for c in d["sidebar"]["containers"]:
+    for s in c.get("spaces", []):
+        if isinstance(s, dict) and "id" in s:
+            prof = s.get("profile", {})
+            label = "Default" if prof.get("default") else \
+                    prof.get("custom", {}).get("_0", {}).get("directoryBasename", "?")
+            print(f"{s.get('title'):<12} {label:<10} {s['id']}")
+PY
+}
+
+# ---- URL の正規化と判定 -----------------------------------------------------
+urlencode() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1"; }
+
+# 入力を「種別<TAB>URL」に正規化する。種別は url か search。
+#
+# search を url と区別するのは手抜きではなく必要で、検索クエリをそのまま
+# ルール判定にかけると `web "notion 使い方"` が google.com/search?q=notion... に
+# なって `notion` ルールに引っかかり OYKOT に飛ぶ。検索はルール判定しない。
+classify() {
+  local raw="$1"
+  case "$raw" in
+    http://*|https://*|file://*|about:*|chrome://*)
+      printf 'url\t%s\n' "$raw" ;;
+    localhost:*|127.0.0.1:*|*.localhost:*)
+      printf 'url\thttp://%s\n' "$raw" ;;
+    *[[:space:]]*)
+      printf 'search\thttps://www.google.com/search?q=%s\n' "$(urlencode "$raw")" ;;
+    *.*)
+      printf 'url\thttps://%s\n' "$raw" ;;
+    *)
+      printf 'search\thttps://www.google.com/search?q=%s\n' "$(urlencode "$raw")" ;;
+  esac
+}
+
+# ルールに照らして space 名を返す（無ければ空文字 = 今の space）
+resolve_space() {
+  local url="$1" kind pattern space
+  while IFS=$'\t' read -r kind pattern space; do
+    [ -n "${pattern:-}" ] || continue
+    case "$kind" in
+      contains)
+        case "$url" in *"$pattern"*) printf '%s' "$space"; return 0 ;; esac ;;
+      startsWith)
+        case "$url" in "$pattern"*) printf '%s' "$space"; return 0 ;; esac ;;
+      exactly)
+        if [ "$url" = "$pattern" ]; then printf '%s' "$space"; return 0; fi ;;
+    esac
+  done < <(dump_rules)
+  return 0
+}
+
+# space 名の前方一致解決（ko -> kotoage）
+match_space() {
+  local want="$1" titles t
+  titles=$(list_spaces | awk '{print $1}')
+  while read -r t; do
+    [ "$t" = "$want" ] && { printf '%s' "$t"; return; }
+  done <<<"$titles"
+  while read -r t; do
+    case "$t" in "$want"*) printf '%s' "$t"; return ;; esac
+  done <<<"$titles"
+  printf ''
+}
+
+# ---- Arc を叩く -------------------------------------------------------------
+ensure_arc() {
+  pgrep -qf '/Applications/Arc.app/Contents/MacOS/Arc' && return 0
+  open -a Arc
+  osascript -e 'delay 3' >/dev/null
+}
+
+open_in_space() {
+  ensure_arc
+  osascript - "$1" "$2" >/dev/null <<'AS'
+on run argv
+  set spaceName to item 1 of argv
+  set theURL to item 2 of argv
+  tell application "Arc"
+    activate
+    if (count of windows) is 0 then make new window
+    tell window 1
+      tell space spaceName
+        make new tab with properties {URL:theURL}
+      end tell
+    end tell
+  end tell
+end run
+AS
+}
+
+open_here() {
+  ensure_arc
+  osascript - "$1" >/dev/null <<'AS'
+on run argv
+  tell application "Arc"
+    activate
+    if (count of windows) is 0 then make new window
+    tell window 1 to make new tab with properties {URL:(item 1 of argv)}
+  end tell
+end run
+AS
+}
+
+# いま見ているタブを別の space に移す。
+#
+# Arc には「タブを移動する」AppleScript コマンドが無いので、URL を読んで
+# 閉じて、相手の space で開き直す。プロファイルが違えば相手側のセッションで
+# 開くことになるが、それこそが移したい理由なので正しい挙動。
+# スクロール位置と戻る履歴は失われる。
+move_tab() {
+  ensure_arc
+  osascript - "$1" >/dev/null <<'AS'
+on run argv
+  set spaceName to item 1 of argv
+  tell application "Arc"
+    tell window 1
+      set theURL to URL of active tab
+      close active tab
+      tell space spaceName
+        make new tab with properties {URL:theURL}
+      end tell
+    end tell
+  end tell
+end run
+AS
+}
+
+current_url() {
+  osascript -e 'tell application "Arc" to tell window 1 to return URL of active tab' 2>/dev/null || printf ''
+}
+
+show_ls() {
+  osascript <<'AS' 2>/dev/null
+tell application "Arc"
+  set out to ""
+  if (count of windows) is 0 then return "Arc にウインドウがありません"
+  repeat with w in windows
+    set out to out & "win " & (index of w) & "  " & (title of active space of w)
+    try
+      set out to out & "  " & (URL of active tab of w)
+    end try
+    set out to out & linefeed
+  end repeat
+  tell window 1
+    set out to out & linefeed & "tabs per space (window 1):" & linefeed
+    repeat with s in spaces
+      set out to out & "  " & (title of s) & "  " & (count of tabs of s) & linefeed
+    end repeat
+  end tell
+  return out
+end tell
+AS
+}
+
+# ---- 本体 -------------------------------------------------------------------
+[ $# -eq 0 ] && usage 0
+
+case "$1" in
+  -h|--help|help) usage 0 ;;
+  ls)     show_ls; exit 0 ;;
+  spaces) list_spaces; exit 0 ;;
+  rules)
+    printf '%-11s %-28s %s\n' MATCH PATTERN SPACE
+    dump_rules | while IFS=$'\t' read -r k p s; do printf '%-11s %-28s %s\n' "$k" "$p" "$s"; done
+    exit 0 ;;
+  which)
+    [ $# -ge 2 ] || die "URL を渡してください"
+    shift
+    IFS=$'\t' read -r kind url < <(classify "$*")
+    if [ "$kind" = search ]; then
+      printf '%s\n  -> (検索なので今いる space に開く)\n' "$url"
+    else
+      space=$(resolve_space "$url")
+      if [ -n "$space" ]; then printf '%s\n  -> %s\n' "$url" "$space"
+      else printf '%s\n  -> (ルールなし / 今いる space に開く)\n' "$url"; fi
+    fi
+    exit 0 ;;
+  move)
+    [ $# -ge 2 ] || die "移す先の space を渡してください  (web spaces で一覧)"
+    space=$(match_space "$2")
+    [ -n "$space" ] || die "そんな space はありません: $2  (web spaces で一覧)"
+    url=$(current_url)
+    [ -n "$url" ] || die "いま見ているタブの URL が取れません"
+    move_tab "$space"
+    printf 'web: %s -> %s に移しました\n' "$url" "$space"
+    exit 0 ;;
+  here)
+    [ $# -ge 2 ] || die "URL を渡してください"
+    shift
+    IFS=$'\t' read -r kind url < <(classify "$*")
+    open_here "$url"
+    printf 'web: %s -> (今いる space)\n' "$url"
+    exit 0 ;;
+esac
+
+# web <space> <url>  か  web <url>  かを見分ける。
+# 第1引数が space 名に前方一致し、かつ引数が2つ以上あるときだけ space 指定とみなす。
+if [ $# -ge 2 ]; then
+  space=$(match_space "$1")
+  if [ -n "$space" ]; then
+    shift
+    IFS=$'\t' read -r kind url < <(classify "$*")
+    open_in_space "$space" "$url"
+    printf 'web: %s -> %s\n' "$url" "$space"
+    exit 0
+  fi
+fi
+
+IFS=$'\t' read -r kind url < <(classify "$*")
+if [ "$kind" = url ]; then
+  space=$(resolve_space "$url")
+else
+  space=""
+fi
+if [ -n "$space" ]; then
+  open_in_space "$space" "$url"
+  printf 'web: %s -> %s\n' "$url" "$space"
+else
+  open_here "$url"
+  printf 'web: %s -> (今いる space)\n' "$url"
+fi

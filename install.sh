@@ -102,6 +102,9 @@ say "tool configuration"
 # through ~/.local/bin finds them here and nowhere else.
 link _vet   .vet
 link _takt  .takt
+# Raycast reads its script commands out of a directory you register in its
+# settings; pointing that directory here keeps the scripts in the repo.
+link _raycast .config/raycast/scripts
 
 say ""
 say "commands (~/.local/bin)"
@@ -115,6 +118,7 @@ link tmux-pick-session  .local/bin/tmux-pick-session
 link tmux-main-window   .local/bin/tmux-main-window
 link proj-dirs          .local/bin/proj-dirs
 link tips               .local/bin/tips
+link web                .local/bin/web
 
 say ""
 say "linked/repointed: $LINKED   already correct: $KEPT   skipped: $SKIPPED"

@@ -1,0 +1,58 @@
+[
+  {
+    "name": "Amazon 検索",
+    "link": "https://www.amazon.co.jp/s?k={argument name=\"検索語\"}"
+  },
+  {
+    "name": "新幹線予約 EX",
+    "link": "https://shinkansen2.jr-central.co.jp/"
+  },
+  {
+    "name": "出前館",
+    "link": "https://demae-can.com/"
+  },
+  {
+    "name": "一休",
+    "link": "https://www.ikyu.com/"
+  },
+  {
+    "name": "ふるなび",
+    "link": "https://furunavi.jp/"
+  },
+  {
+    "name": "楽天証券",
+    "link": "https://member.rakuten-sec.co.jp/"
+  },
+  {
+    "name": "はてブ テクノロジー",
+    "link": "https://b.hatena.ne.jp/hotentry/it"
+  },
+  {
+    "name": "Claude",
+    "link": "https://claude.ai/"
+  },
+  {
+    "name": "freee 給与明細",
+    "link": "https://p.secure.freee.co.jp/"
+  },
+  {
+    "name": "CircleCI",
+    "link": "https://app.circleci.com/pipelines/github/mr-myself"
+  },
+  {
+    "name": "Rollbar",
+    "link": "https://app.rollbar.com/"
+  },
+  {
+    "name": "Cloudflare",
+    "link": "https://dash.cloudflare.com/"
+  },
+  {
+    "name": "GitHub OYKOT 検索",
+    "link": "https://github.com/search?q=org%3AOYKOT-jp+{argument name=\"検索語\"}&type=code"
+  },
+  {
+    "name": "Notion 検索",
+    "link": "https://www.notion.so/search?q={argument name=\"検索語\"}"
+  }
+]

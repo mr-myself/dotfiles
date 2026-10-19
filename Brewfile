@@ -44,3 +44,8 @@ brew "lazygit"
 # deck renders through the INSTALLED Chrome rather than a bundled headless
 # build, so that what the geometry linter measures is what a human would see.
 cask "google-chrome"
+
+# Raycast runs the `_raycast/` script commands (Open in Arc Space, Move Tab to
+# Space). The scripts shell out to `web`, so Raycast is a front-end here and not
+# a second source of truth about where a URL belongs.
+cask "raycast"
