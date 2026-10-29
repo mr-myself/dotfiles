@@ -436,6 +436,39 @@ check_eq "plain markup and real media are still documentation" \
   "docs-only" "$CLASSIFY_SCOPE"
 
 # ---------------------------------------------------------------------------
+# A path list far larger than the pipe buffer.
+#
+# The classifier used to take the first code path with `| head -n 1`. `head`
+# closes the pipe after the line it wants, SIGPIPE kills `sort` upstream,
+# pipefail makes that the exit status of the assignment, and set -e took the
+# whole classifier down with exit 141 - no scope file, no delta file and no
+# changed-file list, so every later round lost the delta scope and re-read the
+# full diff. It is invisible while the path list fits in the pipe buffer, so
+# the only test that can see it is one whose list does not: hence the file
+# count, deliberately several times past any pipe buffer in use.
+BIG_DIR="$(mktemp -d "$ROOT/classify-big.XXXXXX")"
+git_quiet init -q "$BIG_DIR/repo" 2>/dev/null
+git_quiet -C "$BIG_DIR/repo" commit -q --allow-empty -m init 2>/dev/null
+mkdir -p "$BIG_DIR/repo/app/models/generated"
+awk 'BEGIN { for (i = 1; i <= 3000; i++) printf "app/models/generated/thing_%05d.rb\n", i }' \
+  > "$BIG_DIR/paths.txt"
+while IFS= read -r big_path; do
+  printf 'class Thing; end\n' > "$BIG_DIR/repo/$big_path"
+done < "$BIG_DIR/paths.txt"
+BIG_BYTES="$(wc -c < "$BIG_DIR/paths.txt" | tr -d '[:space:]')"
+if classify "$BIG_DIR/repo" "$BIG_DIR.scope" "$BIG_DIR.round" 3 >/dev/null 2>&1; then
+  ok "classify-diff survives a $BIG_BYTES-byte path list (no SIGPIPE)"
+else
+  no "classify-diff survives a $BIG_BYTES-byte path list (no SIGPIPE)" \
+    "it exited non-zero; 141 is the SIGPIPE regression this case exists for"
+fi
+check_eq "a 3000-file code change is still classified code" \
+  "code" "$(sed -n 's/^scope=//p' "$BIG_DIR.scope" 2>/dev/null)"
+check_eq "the first code path is reported from the large list" \
+  "app/models/generated/thing_00001.rb" \
+  "$(sed -n 's/^first_code_path=//p' "$BIG_DIR.scope" 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
 # A documentation EXTENSION is necessary but not sufficient: markup can carry
 # active content, so the classifier reads the file. These drive one document at
 # a time with exact content, alongside an inert baseline document, so the

@@ -2321,9 +2321,17 @@ count_paths() {
 TOTAL="$(count_paths "$ALL_PATHS")"
 CODE="$(count_paths "$CODE_PATHS")"
 DOCS=$((TOTAL - CODE))
-FIRST_CODE_PATH="$(
-  printf '%s' "$CODE_PATHS" | sed '/^[[:space:]]*$/d' | sort -u | head -n 1
-)"
+# The sorted list is materialised and the first line taken from the VARIABLE,
+# because `| head -n 1` here was a latent crash. `head` closes the pipe after
+# the line it wants, SIGPIPE kills `sort` upstream, `pipefail` makes that the
+# exit status of this assignment, and `set -e` then aborts the whole classifier
+# - exit 141, with no scope file, no delta and no changed-file list written, so
+# every later round silently loses the delta scope and re-reads the full diff.
+# It is invisible while the path list fits in the pipe buffer, which is why it
+# survived every small change and first fired on a 1287-file one. Reading the
+# pipeline to the end leaves no reader to close it early.
+CODE_PATHS_SORTED="$(printf '%s' "$CODE_PATHS" | sed '/^[[:space:]]*$/d' | sort -u)"
+FIRST_CODE_PATH="${CODE_PATHS_SORTED%%$'\n'*}"
 
 if [[ "$TOTAL" -eq 0 ]]; then
   # NOT "docs only": nothing was classified at all. Running both lenses is the
