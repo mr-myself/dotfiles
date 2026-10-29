@@ -1143,6 +1143,156 @@ check_contains "a brand new untracked file IS in the delta" \
 check_contains "the new untracked file is in the changed-file list too" \
   "$(cat "$DELTA_DIR/scope.changed")" "newly_added.rb"
 
+# --- the untracked half of the baseline -------------------------------------
+#
+# `git stash create` records TRACKED state only, and two things followed from
+# that. A change made entirely of new files got NO baseline at all - capture
+# reported "nothing to capture" and every later round re-read the full diff -
+# and where a delta did engage, every untracked file was appended to it in
+# full, round after round. On the change that exposed it, 1287 files with
+# almost all of them new, the delta therefore saved nothing whatsoever.
+#
+# capture-review-baseline now records a tree of the untracked files as the
+# review read them, so classify-diff can tell one that was already read from
+# one that moved. Everything below is about the two directions that tree can
+# go wrong in: re-sending what was already reviewed, and - far worse - leaving
+# out something that changed.
+NEW_DIR="$(mktemp -d "$ROOT/untracked-baseline.XXXXXX")"
+NEW_REPO="$NEW_DIR/repo"
+mkdir -p "$NEW_REPO"
+git_quiet init -q "$NEW_REPO" 2>/dev/null
+printf 'ignored_dir/\n' > "$NEW_REPO/.gitignore"
+git_quiet -C "$NEW_REPO" add -A 2>/dev/null
+git_quiet -C "$NEW_REPO" commit -qm init 2>/dev/null
+# No tracked modification anywhere: this is the shape that used to get nothing.
+printf 'class Alpha; end\n' > "$NEW_REPO/alpha.rb"
+printf 'class Beta; end\n' > "$NEW_REPO/beta.rb"
+mkdir -p "$NEW_REPO/ignored_dir"
+printf 'class Ignored; end\n' > "$NEW_REPO/ignored_dir/ignored.rb"
+
+new_classify() {
+  classify "$NEW_REPO" "$NEW_DIR/scope" "$NEW_DIR/round" 9 "$NEW_DIR/baseline" \
+    >/dev/null 2>&1
+  NEW_MODE="$(sed -n 's/^review_mode=//p' "$NEW_DIR/scope")"
+  NEW_WHY="$(sed -n 's/^review_scope_reason=//p' "$NEW_DIR/scope")"
+}
+
+new_classify                                        # round 1 is full, as always
+check_eq "a change made only of new files is still full in round 1" "full" "$NEW_MODE"
+if "$CAPTURE" "$NEW_REPO" "$NEW_DIR/baseline" 1 >/dev/null 2>&1; then
+  ok "a state with no tracked modification at all still captures a baseline"
+else
+  no "a state with no tracked modification at all still captures a baseline" \
+    "capture exited non-zero, so every later round re-reads the full diff"
+fi
+check_contains "the baseline records the untracked files it read" \
+  "$(cat "$NEW_DIR/baseline" 2>/dev/null)" "untracked_baseline="
+check_eq "the commit sha is still the first line on its own" \
+  "1" "$(head -n 1 "$NEW_DIR/baseline" 2>/dev/null | wc -w | tr -d '[:space:]')"
+
+# What the tree holds decides what a later round can skip, so it is read
+# directly rather than inferred from a delta.
+NEW_TREE="$(sed -n 's/^untracked_baseline=//p' "$NEW_DIR/baseline" 2>/dev/null)"
+NEW_TREE_PATHS="$(git_quiet -C "$NEW_REPO" ls-tree -r --name-only "$NEW_TREE" 2>/dev/null)"
+check_contains "the recorded tree holds the untracked file" "$NEW_TREE_PATHS" "alpha.rb"
+check_absent "the recorded tree excludes an IGNORED file" \
+  "$NEW_TREE_PATHS" "ignored.rb"
+
+# Round 2: one recorded file fixed, one file that did not exist at the review,
+# and one recorded file left exactly as the review read it.
+printf 'class Alpha; def call; :the_fix; end; end\n' > "$NEW_REPO/alpha.rb"
+printf 'class Gamma; end\n' > "$NEW_REPO/gamma.rb"
+new_classify
+check_eq "a round whose only work is untracked now deltas" "delta" "$NEW_MODE"
+NEW_DELTA="$(cat "$NEW_DIR/scope.delta" 2>/dev/null)"
+check_contains "the fix to a recorded untracked file is in the delta" \
+  "$NEW_DELTA" ":the_fix"
+check_contains "an untracked file written since the review is in the delta" \
+  "$NEW_DELTA" "gamma.rb"
+check_absent "an untracked file the review already read is NOT re-sent" \
+  "$NEW_DELTA" "beta.rb"
+check_contains "the scope states how many untracked files were not re-sent" \
+  "$NEW_WHY" "unchanged since that review"
+check_contains "the changed-file list still names every path in the change" \
+  "$(cat "$NEW_DIR/scope.changed" 2>/dev/null)" "beta.rb"
+
+# Silence is still not a pass. Nothing changes between this capture and the
+# next round, and an untracked-only state must not turn that into a delta of
+# nothing - it falls back to the full diff like any other quiet round.
+"$CAPTURE" "$NEW_REPO" "$NEW_DIR/baseline" 2 >/dev/null 2>&1
+new_classify
+check_eq "a round where nothing changed is full, not an empty delta" \
+  "full" "$NEW_MODE"
+check_contains "and it says nothing changed since the last review" \
+  "$NEW_WHY" "came back EMPTY"
+
+# An untracked file that is DELETED between rounds leaves nothing to review in
+# it, and must not keep a round deltaing on its own.
+rm -f "$NEW_REPO/gamma.rb"
+new_classify
+check_eq "a round whose only event is an untracked file disappearing is full" \
+  "full" "$NEW_MODE"
+
+# --- a baseline from a squad that predates the untracked half ----------------
+#
+# Its baseline file has no untracked_baseline line. Every untracked file must
+# then be appended in full, exactly as that squad did: a bigger delta, never a
+# smaller one.
+delta_repo
+printf 'stray\n' > "$DELTA_REPO/stray_helper.rb"
+delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+grep -v '^untracked_baseline=' "$DELTA_DIR/baseline" > "$DELTA_DIR/baseline.trimmed"
+mv "$DELTA_DIR/baseline.trimmed" "$DELTA_DIR/baseline"
+printf 'v3 fixed\n' > "$DELTA_REPO/app.rb"
+delta_classify
+check_eq "a baseline with no untracked record still deltas" "delta" "$DELTA_MODE"
+check_contains "and it carries every untracked file in full, as before" \
+  "$(cat "$DELTA_DIR/scope.delta")" "stray_helper.rb"
+
+# ...and a baseline that DOES record them skips the one that did not move,
+# while the tracked fix still comes through. This is the pair that proves the
+# saving comes from the record and not from the file simply being dropped.
+delta_repo
+printf 'stray\n' > "$DELTA_REPO/stray_helper.rb"
+delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'v3 fixed\n' > "$DELTA_REPO/app.rb"
+delta_classify
+check_contains "a recorded baseline still carries the tracked fix" \
+  "$(cat "$DELTA_DIR/scope.delta")" "v3 fixed"
+check_absent "an unchanged untracked file is not re-sent beside a tracked fix" \
+  "$(cat "$DELTA_DIR/scope.delta")" "stray_helper.rb"
+
+# A recorded untracked file that is MODIFIED must come back, or the record
+# would be hiding exactly the work a review round exists to check.
+delta_repo
+printf 'stray v1\n' > "$DELTA_REPO/stray_helper.rb"
+delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+printf 'stray v2 CHANGED SINCE THE REVIEW\n' > "$DELTA_REPO/stray_helper.rb"
+delta_classify
+check_eq "a modified untracked file alone keeps the round deltaing" \
+  "delta" "$DELTA_MODE"
+check_contains "a modified untracked file is back in the delta" \
+  "$(cat "$DELTA_DIR/scope.delta")" "CHANGED SINCE THE REVIEW"
+
+# A recorded tree that this repository cannot resolve is worth nothing. It must
+# widen the delta back out, not be half-trusted.
+delta_repo
+printf 'stray\n' > "$DELTA_REPO/stray_helper.rb"
+delta_classify
+"$CAPTURE" "$DELTA_REPO" "$DELTA_DIR/baseline" 1 >/dev/null 2>&1
+sed 's/^untracked_baseline=.*/untracked_baseline=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/' \
+  "$DELTA_DIR/baseline" > "$DELTA_DIR/baseline.bogus"
+mv "$DELTA_DIR/baseline.bogus" "$DELTA_DIR/baseline"
+printf 'v3 fixed\n' > "$DELTA_REPO/app.rb"
+delta_classify
+check_eq "a bogus untracked record still deltas on the tracked half" \
+  "delta" "$DELTA_MODE"
+check_contains "and every untracked file comes back in full" \
+  "$(cat "$DELTA_DIR/scope.delta")" "stray_helper.rb"
+
 # --- every fallback widens back to the full diff ---
 delta_fallback() {
   local label="$1"

@@ -1580,12 +1580,29 @@ printf '%s\n' "$ALL_PATHS" | sed '/^[[:space:]]*$/d' | sort -u > "$CHANGED_FILES
 REVIEW_MODE="full"
 DELTA_REASON="round 1: the first review of a run always reads the full uncommitted diff"
 BASELINE=""
+UNTRACKED_BASELINE=""
 
 if [[ "$ROUND" -gt 1 ]]; then
   REVIEW_MODE="full"
   DELTA_REASON="no usable review baseline was found, so this round re-reads the full diff"
   if [[ -s "$BASELINE_FILE" ]]; then
     BASELINE="$(head -n 1 "$BASELINE_FILE" | tr -d '[:space:]')"
+    # The untracked half of the baseline: a tree of the untracked files as the
+    # last review read them, written on its own line by capture-review-baseline.
+    # awk reads the FILE, so there is no pipe for anything to close early. A
+    # baseline file from an older squad simply has no such line, and then every
+    # untracked file counts as changed - exactly what it did before this line.
+    UNTRACKED_BASELINE="$(
+      awk -F= '/^untracked_baseline=/ { print $2; exit }' "$BASELINE_FILE" |
+        tr -d '[:space:]'
+    )"
+    # A recorded tree this repository cannot resolve is worth nothing, and a
+    # half-trusted one is worse than none: drop it, and every untracked file
+    # goes back to counting as changed.
+    if [[ -n "$UNTRACKED_BASELINE" ]] &&
+      ! git -C "$WORKDIR" cat-file -e "${UNTRACKED_BASELINE}^{tree}" 2>/dev/null; then
+      UNTRACKED_BASELINE=""
+    fi
   fi
 
   if [[ -z "$BASELINE" ]]; then
@@ -1597,23 +1614,16 @@ if [[ "$ROUND" -gt 1 ]]; then
   else
     # Two halves, and the second one matters more than it looks.
     #
-    # `git diff <baseline> --` covers TRACKED changes only. `git stash create`
-    # does not record untracked files, so a file that is untracked now appears
-    # in NEITHER the baseline NOR that diff - a brand new source file the Coder
-    # just wrote would be invisible to a delta review. So every currently
-    # untracked file is appended as a full addition.
+    # `git diff <baseline> --` covers TRACKED changes only: the baseline commit
+    # records the tracked worktree, and an untracked file appears in neither it
+    # nor that diff - a brand new source file the Coder just wrote would be
+    # invisible to a delta review. The untracked files are therefore handled
+    # separately, further down, against the untracked TREE the same capture
+    # recorded.
     #
-    # DOCUMENTED CONSEQUENCE: an untracked file that stays untracked reappears
-    # in full in EVERY delta, round after round. That is deliberate. It is the
-    # fail-safe direction - reviewed again rather than missed - and the
-    # alternative would need the index touched, which is forbidden here.
     # The TRACKED half is computed first and ON ITS OWN, because it is the only
-    # honest answer to "did any new work land since the last review?".
-    #
-    # The emptiness test MUST be made here, before untracked files are appended.
-    # Untracked files reappear in every delta by construction, so a delta that
-    # has already been padded with them is never empty and the "nothing changed"
-    # signal would never fire - measured, not assumed.
+    # honest answer to "did any tracked work land since the last review?". The
+    # untracked half then widens that answer; it never narrows it.
     DELTA_TMP="$(mktemp "${DELTA_FILE}.XXXXXX")"
     DELTA_OK=true
     if ! git -c core.quotePath=false -C "$WORKDIR" diff "$BASELINE" -- > "$DELTA_TMP" 2>/dev/null; then
@@ -1693,19 +1703,80 @@ if [[ "$ROUND" -gt 1 ]]; then
       done <<< "$DIVERGENT_PATHS"
     fi
 
+    # WHICH untracked files changed since the last review?
+    #
+    # An untracked file whose content still hashes to the blob the baseline
+    # recorded for it was READ, in full, by the review that captured that
+    # baseline. It is not part of what changed since - and on a change made
+    # mostly of new files that is very nearly the whole diff, which is what
+    # every later round used to re-send to both lenses.
+    #
+    # Everything else counts as CHANGED and is re-reviewed in full: a file
+    # absent from the tree (written since the review), a hash that cannot be
+    # taken (unreadable, or gone mid-round), or no recorded tree at all.
+    #
+    # MEASURED COST: one or two git invocations per untracked file, about 35
+    # seconds for the 1287-file change this was built for. Asking git for every
+    # hash in one batch is several times faster and was deliberately not done:
+    # a batch answers in input ORDER, so a single slipped line pairs a path
+    # with another file's hash, and two new files with identical content would
+    # then match and be dropped from the delta silently. Per file, the lookup
+    # is by path and a wrong answer can only ever mean "changed".
+    UNTRACKED_CHANGED=""
+    UNTRACKED_SKIPPED=0
+    if [[ "$DELTA_OK" == "true" ]]; then
+      while IFS= read -r untracked_path; do
+        [[ -n "$untracked_path" ]] || continue
+        if [[ -n "$UNTRACKED_BASELINE" ]]; then
+          baseline_blob="$(
+            git -C "$WORKDIR" rev-parse --verify --quiet \
+              "${UNTRACKED_BASELINE}:${untracked_path}" 2>/dev/null || true
+          )"
+          # Absent from the tree needs no hash: it is a file written since the
+          # review, and it goes in whole.
+          if [[ -n "$baseline_blob" ]]; then
+            current_blob="$(
+              git -C "$WORKDIR" hash-object -- "$untracked_path" 2>/dev/null || true
+            )"
+            if [[ -n "$current_blob" && "$baseline_blob" == "$current_blob" ]]; then
+              UNTRACKED_SKIPPED=$((UNTRACKED_SKIPPED + 1))
+              continue
+            fi
+          fi
+        fi
+        UNTRACKED_CHANGED="$UNTRACKED_CHANGED$untracked_path"$'\n'
+      done <<< "$UNTRACKED"
+    fi
+
+    # "Nothing landed" has to stay true to its name now that untracked work can
+    # land without the tracked half moving at all. The tracked half is still
+    # what is tested first; the untracked half only ever widens the test:
+    #
+    #   - no recorded untracked tree: an empty tracked half means a full
+    #     re-read, exactly as it did before the tree existed;
+    #   - a tree, and no untracked file differing from it: nothing landed
+    #     anywhere this baseline can see, and silence is not a pass;
+    #   - a tree, and untracked files that DO differ: real work landed, so this
+    #     is a real delta rather than a full re-read.
+    NOTHING_LANDED="false"
+    if [[ ! -s "$DELTA_TMP" ]]; then
+      if [[ -z "$UNTRACKED_BASELINE" || -z "${UNTRACKED_CHANGED//[[:space:]]/}" ]]; then
+        NOTHING_LANDED="true"
+      fi
+    fi
+
     if [[ "$DELTA_OK" != "true" ]]; then
       rm -f "$DELTA_TMP"
       DELTA_REASON="the delta since baseline $BASELINE could not be computed, so this round reads the full diff"
-    elif [[ ! -s "$DELTA_TMP" ]]; then
-      # No tracked file changed since the state the last review read. Whatever
-      # the Coder reported, no fix landed anywhere this baseline can see, and
-      # silence is not a pass. A change that created ONLY a new untracked file
-      # also lands here, and re-reading the full diff is the safe answer.
+    elif [[ "$NOTHING_LANDED" == "true" ]]; then
+      # Nothing landed anywhere this baseline can see: no tracked file changed,
+      # and no untracked file the last review read has moved since. Whatever the
+      # Coder reported, silence is not a pass - re-read everything.
       rm -f "$DELTA_TMP"
-      DELTA_REASON="the delta since baseline $BASELINE came back EMPTY - no tracked file changed since the last review - so this round reads the full diff"
+      DELTA_REASON="the delta since baseline $BASELINE came back EMPTY - nothing changed since the last review - so this round reads the full diff"
     else
-      # Only now append the untracked files, so they enrich a real delta rather
-      # than manufacture one.
+      # Only now append the untracked files that CHANGED, so they enrich a real
+      # delta rather than manufacture one.
       while IFS= read -r untracked_path; do
         [[ -n "$untracked_path" ]] || continue
         # --no-index exits 0 when the files match and 1 when they differ; only
@@ -1718,7 +1789,7 @@ if [[ "$ROUND" -gt 1 ]]; then
           DELTA_OK=false
           break
         fi
-      done <<< "$UNTRACKED"
+      done <<< "$UNTRACKED_CHANGED"
 
       if [[ "$DELTA_OK" != "true" ]]; then
         rm -f "$DELTA_TMP"
@@ -1726,7 +1797,10 @@ if [[ "$ROUND" -gt 1 ]]; then
       else
         mv "$DELTA_TMP" "$DELTA_FILE"
         REVIEW_MODE="delta"
-        DELTA_REASON="reviewing only what changed since the state round $((ROUND - 1)) reviewed (baseline $BASELINE)"
+        # The skipped count travels to PO. An untracked file silently left out
+        # of a delta is exactly the kind of thing nobody notices for four
+        # rounds, so it is stated every time rather than inferred.
+        DELTA_REASON="reviewing only what changed since the state round $((ROUND - 1)) reviewed (baseline $BASELINE; $UNTRACKED_SKIPPED untracked file(s) unchanged since that review and not re-sent)"
       fi
     fi
   fi
@@ -1793,11 +1867,19 @@ HELPER
   # it is the lens reading the whole diff and exploring the repo from scratch,
   # every round. Only round 1 needs to do that.
   #
-  # `git stash create` is the mechanism. It writes a commit object for the
-  # current working state and prints its sha, WITHOUT touching the working tree,
-  # the stash list, or what the index actually holds. This runs in the middle of
-  # live agent work, so corrupting a Coder's in-progress edit would be far worse
-  # than any token saving, and there are tests for all of it.
+  # `git stash create` is the mechanism for the TRACKED half. It writes a commit
+  # object for the current working state and prints its sha, WITHOUT touching the
+  # working tree, the stash list, or what the index actually holds. This runs in
+  # the middle of live agent work, so corrupting a Coder's in-progress edit would
+  # be far worse than any token saving, and there are tests for all of it.
+  #
+  # The UNTRACKED half is a tree of its own, written through a TEMPORARY index
+  # file: stash create cannot record untracked files, and `git stash create -u`
+  # does not exist. GIT_INDEX_FILE points git at a scratch file outside the
+  # repository, so the repository's own index is never the one being written.
+  # Without that tree every untracked file is re-sent to both lenses in full in
+  # every later round, which on a change made mostly of new files is the whole
+  # diff, every round.
   #
   # Measured caveat, stated because "does not touch the index" is too strong a
   # claim: git DOES rewrite the .git/index FILE, refreshing its cached stat
@@ -1841,37 +1923,118 @@ ROUND="$3"
 rm -f "$BASELINE_FILE"
 
 # `git stash create` on a clean tree prints nothing and exits 0. That is not a
-# failure, but it is also not a usable baseline, so it is treated the same as
-# any other failure: no file, next review is full.
-BASELINE=""
-if ! BASELINE="$(git -C "$WORKDIR" stash create 2>/dev/null)"; then
+# failure, but on its own it is not a usable baseline either.
+STASH=""
+if ! STASH="$(git -C "$WORKDIR" stash create 2>/dev/null)"; then
   printf 'capture-review-baseline: could not capture a baseline; the next review will read the FULL diff.\n' >&2
   exit 70
 fi
-BASELINE="${BASELINE//[[:space:]]/}"
-if [[ -z "$BASELINE" ]]; then
-  printf 'capture-review-baseline: nothing to capture (no tracked modifications); the next review will read the FULL diff.\n' >&2
+STASH="${STASH//[[:space:]]/}"
+
+# The untracked files are listed by EXACTLY the command classify-diff uses, so
+# the two helpers can never disagree about what counts as untracked - the same
+# .gitignore, the same exclusions, files and never directories.
+UNTRACKED_COUNT=""
+if ! UNTRACKED_COUNT="$(
+  git -C "$WORKDIR" ls-files --others --exclude-standard 2>/dev/null |
+    wc -l | tr -d '[:space:]'
+)"; then
+  printf 'capture-review-baseline: could not list the untracked files; the next review will read the FULL diff.\n' >&2
   exit 70
+fi
+[[ "$UNTRACKED_COUNT" =~ ^[0-9]+$ ]] || UNTRACKED_COUNT=0
+
+if [[ -z "$STASH" && "$UNTRACKED_COUNT" -eq 0 ]]; then
+  printf 'capture-review-baseline: nothing to capture (no modifications of any kind); the next review will read the FULL diff.\n' >&2
+  exit 70
+fi
+
+BASELINE="$STASH"
+if [[ -z "$BASELINE" ]]; then
+  # Nothing TRACKED has moved, but there are untracked files, and those are
+  # recorded below - so this state IS worth a baseline, where before it was
+  # thrown away and every later round re-read the full diff. A change made
+  # entirely out of new files is the ordinary shape of a feature, and it was
+  # exactly the shape that got no delta at all.
+  #
+  # A commit of HEAD's own tree is the honest tracked baseline here: the
+  # worktree's tracked content IS HEAD's at this moment, so `git diff
+  # <baseline>` in the next round reports precisely the tracked work that
+  # lands between now and then.
+  #
+  # It deliberately has NO second parent. `<baseline>^2` is how classify-diff
+  # asks what the index looked like at the last review; leaving it absent makes
+  # that question unanswerable, and classify-diff answers an unanswerable one
+  # by taking every divergent path - more review, never less.
+  if ! BASELINE="$(
+    git -C "$WORKDIR" commit-tree "$(git -C "$WORKDIR" rev-parse 'HEAD^{tree}' 2>/dev/null)" \
+      -p HEAD -m 'squad review baseline (untracked work only)' 2>/dev/null
+  )"; then
+    printf 'capture-review-baseline: could not record a baseline for an untracked-only state; the next review will read the FULL diff.\n' >&2
+    exit 70
+  fi
+  BASELINE="${BASELINE//[[:space:]]/}"
 fi
 
 # Never write a sha that is not actually a commit in this repository.
 if ! git -C "$WORKDIR" cat-file -e "${BASELINE}^{commit}" 2>/dev/null; then
-  printf 'capture-review-baseline: ERROR: git stash create returned something that is not a commit: %s\n' "$BASELINE" >&2
+  printf 'capture-review-baseline: ERROR: the captured baseline is not a commit: %s\n' "$BASELINE" >&2
   printf 'capture-review-baseline: the next review will read the FULL diff.\n' >&2
   exit 70
 fi
 
+# The UNTRACKED half of the baseline: a tree of every untracked file exactly as
+# the review that just finished read it.
+#
+# `git stash create` records tracked state only. Without this tree,
+# classify-diff cannot tell an untracked file a lens has already read from one
+# written since, so it appends EVERY untracked file to EVERY delta in full,
+# round after round - and on a mostly-new-file change that is the entire diff,
+# every round, with the delta saving nothing.
+#
+# It is built in a TEMPORARY index file, never the repository's own. This runs
+# in the middle of live agent work and a Coder's staged work is not ours to
+# touch; the real index is left byte-identical, and there is a test for that.
+# mktemp's file has to be removed first: git rejects a zero-byte index as
+# "index file smaller than expected", and wants the path to simply not exist.
+UNTRACKED_TREE=""
+if [[ "$UNTRACKED_COUNT" -gt 0 ]]; then
+  TMP_INDEX="$(mktemp "${BASELINE_FILE}.index.XXXXXX")"
+  trap 'rm -f "$TMP_INDEX"' EXIT
+  rm -f "$TMP_INDEX"
+  if git -C "$WORKDIR" ls-files --others --exclude-standard -z 2>/dev/null |
+    GIT_INDEX_FILE="$TMP_INDEX" git -C "$WORKDIR" update-index --add -z --stdin 2>/dev/null
+  then
+    UNTRACKED_TREE="$(
+      GIT_INDEX_FILE="$TMP_INDEX" git -C "$WORKDIR" write-tree 2>/dev/null || true
+    )"
+    UNTRACKED_TREE="${UNTRACKED_TREE//[[:space:]]/}"
+  fi
+  rm -f "$TMP_INDEX"
+  trap - EXIT
+  if [[ -z "$UNTRACKED_TREE" ]]; then
+    # Not fatal, and deliberately not. With no tree recorded, classify-diff
+    # treats every untracked file as changed, which is what it did before this
+    # existed: a bigger delta, nothing missed.
+    printf 'capture-review-baseline: could not record the untracked files; the next delta will carry all %s of them in full.\n' \
+      "$UNTRACKED_COUNT" >&2
+  fi
+fi
+
+# The commit sha stays the FIRST line, on its own: that is what classify-diff
+# reads, and a baseline file written by an older squad has no further lines.
 BASELINE_TMP="$(mktemp "${BASELINE_FILE}.XXXXXX")"
 trap 'rm -f "$BASELINE_TMP"' EXIT
 {
   printf '%s\n' "$BASELINE"
   printf 'round=%s\n' "$ROUND"
+  [[ -z "$UNTRACKED_TREE" ]] || printf 'untracked_baseline=%s\n' "$UNTRACKED_TREE"
 } > "$BASELINE_TMP"
 mv "$BASELINE_TMP" "$BASELINE_FILE"
 trap - EXIT
 
-printf 'capture-review-baseline: round %s reviewed state %s; round %s will review the delta since it.\n' \
-  "$ROUND" "$BASELINE" "$((ROUND + 1))"
+printf 'capture-review-baseline: round %s reviewed state %s (%s untracked file(s) recorded); round %s will review the delta since it.\n' \
+  "$ROUND" "$BASELINE" "$([[ -n "$UNTRACKED_TREE" ]] && printf '%s' "$UNTRACKED_COUNT" || printf '0')" "$((ROUND + 1))"
 HELPER
   chmod +x "$SQUAD_DIR/capture-review-baseline"
 
@@ -3049,9 +3212,10 @@ merge-reviews, whether the verdict was pass or must_fix:
   '$SQUAD_DIR/capture-review-baseline' '$WORKDIR' '$SQUAD_DIR/review-baseline.txt' '<round>'
 
 It records the working state this round just reviewed, so the next round can
-review only what changed since. It uses \`git stash create\`, which writes a
-commit object WITHOUT touching the working tree, the stash list, or anything
-staged in the index - it is safe to run while Coder has work in progress.
+review only what changed since: tracked changes through \`git stash create\`,
+and the untracked files as a tree of their own. Nothing it does touches the
+working tree, the stash list, or anything staged in the index - it is safe to
+run while Coder has work in progress.
 
 Run it AFTER the review, never before. A baseline captured before a review that
 then does not happen would move the starting line past work no lens ever read.
