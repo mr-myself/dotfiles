@@ -271,6 +271,30 @@ check_contains "the merged checklist is named as the audit record, not an input"
 check_contains "the empty per-lens checklist case still works" \
   "$PROMPT" '(no checklist items)'
 
+# The writing conventions. The Coder's own system prompt carries them too, so
+# they survive a Manager that forgets to restate them.
+check_contains "the prompt carries the writing conventions" \
+  "$PROMPT" "## Writing conventions"
+check_contains "the conventions keep comments to what the code cannot say" \
+  "$PROMPT" "Comment only what the code cannot say"
+check_contains "the conventions keep squad-local detail out of the code" \
+  "$PROMPT" "never belongs in source code"
+check_contains "the conventions ask for English unless the project says otherwise" \
+  "$PROMPT" "Write English. The exception is a project that asks for another"
+check_contains "every Coder task restates the conventions" \
+  "$PROMPT" "Every Coder task file MUST restate the writing conventions"
+check_contains "the fix round keeps the checklist ID out of the code" \
+  "$PROMPT" "must not appear in the code"
+check_contains "convention violations are should_fix, never must_fix" \
+  "$PROMPT" "go in should_fix,"
+CODER_SYS="$(sed -n 's/^  --append-system-prompt "\(.*\)" \\$/\1/p' "$GEN/run-coder")"
+check_contains "the Coder system prompt carries the comment rule" \
+  "$CODER_SYS" "Comment only what the code cannot say"
+check_contains "the Coder system prompt names the review ID as off limits" \
+  "$CODER_SYS" "never write a review checklist ID such as SEC-001"
+check_contains "the Coder system prompt asks for English" \
+  "$CODER_SYS" "commit messages and pull-request descriptions in English"
+
 # The output contract must stay FIRST in the review task file. That is a
 # hard-won property: a lens that answers in prose costs a whole re-run.
 check_contains "the output contract is still required first in the task file" \

@@ -1770,7 +1770,7 @@ else
 fi
 claude -p \
   --dangerously-skip-permissions \
-  --append-system-prompt "Never run 'tmux kill-server' under any circumstances, with or without -L or TMUX_TMPDIR. Never run tmux commands that kill sessions, windows, panes, or servers unless the PO explicitly requests that exact tmux operation. If temporary tmux test servers are created, leave them running and report the cleanup command instead of executing it." \
+  --append-system-prompt "Never run 'tmux kill-server' under any circumstances, with or without -L or TMUX_TMPDIR. Never run tmux commands that kill sessions, windows, panes, or servers unless the PO explicitly requests that exact tmux operation. If temporary tmux test servers are created, leave them running and report the cleanup command instead of executing it. Comment only what the code cannot say: no comment that restates the code, and none that narrates the change - the diff already says what changed. A comment must still make sense to someone reading the file months from now with no access to this squad, so never write a review checklist ID such as SEC-001, a review round or lens name, a squad or run ID, a squad artifact path, a date, or 'per PO request' into source code; give the reason the code is this way, or leave the comment out. Write code comments, commit messages and pull-request descriptions in English, unless the project's own rules or the language of the comments already in the files you edit call for another language, in which case follow the project." \
   "${SESSION_ARGS[@]}" \
   --output-format stream-json \
   --include-partial-messages \
@@ -3791,6 +3791,25 @@ likewise takes a role, not a pane ID.
 - NEVER create additional git worktrees, including Claude Code default locations
   such as .claude/worktree or .claude/worktrees. Use only the isolated squad
   worktree: $WORKDIR.
+- Every Coder task file MUST restate the writing conventions below - the initial
+  task and every fix task alike. Fix rounds are where they break: a Coder fixing
+  [SEC-001] tends to write that ID into the code it touches.
+
+## Writing conventions
+
+These apply to the code Coder writes and to anything any agent writes into the
+repository - comments, commit messages, pull-request descriptions.
+
+- Comment only what the code cannot say. No comment that restates the code, and
+  none that narrates the change; the diff already says what changed.
+- A comment must still make sense to someone reading the file months from now
+  with no access to this squad. A review checklist ID such as [SEC-001], a
+  review round or lens name, a squad or run ID, a path under the squad
+  artifacts directory, a date, or "per PO request" never belongs in source code.
+  The reason the code is this way does.
+- Write English. The exception is a project that asks for another language, in
+  its own rules or in the language of the comments already in the files being
+  edited - then follow the project. Your reports to PO stay Japanese either way.
 
 ## Status handling
 
@@ -3923,7 +3942,8 @@ pull-request creation unless PO requested that specific Git operation. Explicitl
 prohibit creating any additional git worktree, including .claude/worktree or
 .claude/worktrees. Explicitly prohibit tmux kill-server, tmux kill-session,
 tmux kill-window, and tmux kill-pane; tell Coder to leave any temporary tmux
-test server running and report the cleanup command instead. Then run:
+test server running and report the cleanup command instead. State the writing
+conventions above in the task file. Then run:
 
   '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/coder-status.txt' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json initial $SQUAD_DIR/title.txt'
   '$SQUAD_DIR/run-wait' '$coder_event' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder'
@@ -4121,8 +4141,11 @@ $SQUAD_DIR/review-correctness-task.txt. Tell Advisor to inspect the change
 against the approved acceptance criteria, the Coder's test report, and the
 mandatory RuboCop, Brakeman and extra gate results, and to cover correctness,
 data integrity, tests, compatibility, performance, and the project's own
-conventions. Report findings only. A pass verdict is allowed only when relevant
-tests ran and the RuboCop, Brakeman and extra gate statuses are ALL 0. The lens
+conventions. Report findings only. Violations of the writing conventions above -
+a comment that only restates the code, a checklist ID or round reference left in
+a comment, prose in a language the project does not use - go in should_fix,
+never in must_fix. A pass verdict is allowed only when relevant tests ran and
+the RuboCop, Brakeman and extra gate statuses are ALL 0. The lens
 may cite the Brakeman and extra gate results as evidence.
 
 Scope the task from review_mode, as described above:
@@ -4272,7 +4295,9 @@ tests and all three gates green. When Brakeman failed, quote the offending warni
 $SQUAD_DIR/brakeman-result.txt and require a real fix - never a narrowed scan. Reiterate that Coder must not
 create additional git worktrees and must keep all work in $WORKDIR. Reiterate
 that Coder must not run tmux kill-server, tmux kill-session, tmux kill-window,
-or tmux kill-pane, including for test cleanup. Continue the exact Coder session:
+or tmux kill-pane, including for test cleanup. Restate the writing conventions,
+and say explicitly that a finding's checklist ID is for the task file only and
+must not appear in the code. Continue the exact Coder session:
 
   '$SQUAD_DIR/send-to' --status-file '$SQUAD_DIR/coder-status.txt' coder '$SQUAD_DIR/run-coder $SQUAD_DIR/coder-task.txt $SQUAD_DIR/coder-result.txt $SQUAD_DIR/coder-status.txt $coder_event $CODER_SESSION_ID $SQUAD_DIR/coder-schema.json resume $SQUAD_DIR/title.txt'
   '$SQUAD_DIR/run-wait' '$coder_event' '$SQUAD_DIR/coder-status.txt' coder '$WAIT_TIMEOUT_SECONDS' 'Coder fix'
