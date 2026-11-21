@@ -62,9 +62,13 @@ Environment:
   SQUAD_EXTRA_GATE_COMMAND  One extra gate command, run over the WHOLE
                             repository and required to exit 0. This is the gate
                             for projects the Ruby gates cannot see. When unset,
-                            it is detected from a ci:gates script in
-                            package.json; set it to the empty string to turn the
-                            gate off.
+                            it is a ci:gates script in package.json if there is
+                            one, and otherwise an install plus whichever of
+                            typecheck, lint and test the package.json declares.
+                            A gate squad composed that way runs only in a round
+                            that changed a JS/TS file; one the project declared
+                            itself always runs. Set it to the empty string to
+                            turn the gate off.
   SQUAD_STATE_ROOT          Where run state is kept. Default
                             ~/.local/state/squad.
   SQUAD_WORKTREE_ROOT       Where squad worktrees are created. Default
@@ -197,6 +201,10 @@ write_state() {
     # the extra gate existed has no such key in state.env, and resume sources
     # that file before calling write_state.
     printf 'EXTRA_GATE_COMMAND=%q\n' "${EXTRA_GATE_COMMAND:-}"
+    # Defaulted for the same reason, and `always` is what a run created before
+    # the scope existed actually had: its gate was either an override or a
+    # ci:gates script, and both of those are always.
+    printf 'EXTRA_GATE_SCOPE=%q\n' "${EXTRA_GATE_SCOPE:-always}"
     printf 'WAIT_TIMEOUT_SECONDS=%q\n' "$WAIT_TIMEOUT_SECONDS"
     # Defaulted for the same reason BRAKEMAN_COMMAND is: a run created before
     # the review round cap existed has no such key in state.env.
@@ -3606,8 +3614,73 @@ if [[ -z "$BASE_COMMAND" ]]; then
   exit 0
 fi
 
+# Does this gate apply to the change that was actually made?
+#
+# The scope sits beside the command file and records how squad arrived at the
+# command. `always` - an explicit SQUAD_EXTRA_GATE_COMMAND, or a ci:gates script
+# the project itself wrote - is the project's own statement about its WHOLE
+# repository and runs for every change, whatever it touched. Scoping that to JS
+# extensions would be squad overruling the project: the one real ci:gates in
+# this fleet bundles gitleaks and a DB-schema check, and a JS filter would skip
+# it for exactly the SQL-only change that needs it most.
+#
+# `js-ts` is a gate squad COMPOSED from package.json, so squad also owns the
+# question of when it is relevant, and answers it the way run-rubocop always has
+# - from the changed files. A repository carrying both toolchains then behaves
+# the way PO expects: a .rb-only change runs RuboCop and not this, a .ts-only
+# change runs this and not RuboCop, and a change touching both runs both.
+#
+# A missing scope file means `always`. A run created before the scope existed
+# had either an override or a ci:gates script, and both of those are always.
+SCOPE_FILE="${COMMAND_FILE%.txt}.scope"
+GATE_SCOPE="always"
+if [[ -s "$SCOPE_FILE" ]]; then
+  GATE_SCOPE="$(head -n 1 "$SCOPE_FILE" | tr -d '[:space:]')"
+fi
+
+# Deletions are INCLUDED in the diff filter, which is where this parts company
+# with the Ruby gate: RuboCop cannot lint a file that is gone, but deleting a
+# module is exactly the kind of change that breaks a typecheck everywhere else.
+#
+# Two things below look like oversights and are not. There is no `break` on the
+# first match, because breaking early closes the pipe, SIGPIPE kills sort, and
+# pipefail turns that into an abort - the bug this file already carries a long
+# note about further up. And no comment inside the process substitution carries
+# an apostrophe, because /bin/bash on macOS is 3.2, where an unmatched quote in
+# a comment inside <( ) is a parse error: "bad substitution".
+if [[ "$GATE_SCOPE" == "js-ts" ]]; then
+  GATE_APPLIES=""
+  while IFS= read -r file; do
+    case "$file" in
+      *.ts|*.tsx|*.mts|*.cts|*.js|*.jsx|*.mjs|*.cjs|*.vue|*.svelte)
+        GATE_APPLIES="yes" ;;
+      package.json|*/package.json|tsconfig.json|*/tsconfig.json|tsconfig.*.json|*/tsconfig.*.json)
+        GATE_APPLIES="yes" ;;
+      pnpm-lock.yaml|yarn.lock|package-lock.json|bun.lock|bun.lockb)
+        GATE_APPLIES="yes" ;;
+    esac
+  done < <(
+    {
+      # HEAD does not exist in a repository without commits; everything is
+      # untracked there and covered by ls-files below.
+      if git rev-parse --verify --quiet HEAD >/dev/null; then
+        git diff --name-only --diff-filter=ACMRTD HEAD --
+      fi
+      git ls-files --others --exclude-standard
+    } | sort -u
+  )
+  if [[ -z "$GATE_APPLIES" ]]; then
+    {
+      log ">>> Extra gate skipped: no changed JS/TS file."
+      printf 'Extra gate skipped: no changed JS/TS file.\n'
+    } | tee "$RESULT_FILE"
+    exit 0
+  fi
+fi
+
 {
   printf 'Extra gate command: %s\n' "$BASE_COMMAND"
+  printf 'Gate scope: %s\n' "$GATE_SCOPE"
   printf 'Working directory: %s\n\n' "$PWD"
 } > "$RESULT_FILE"
 log ">>> Extra gate command: $BASE_COMMAND"
@@ -3615,8 +3688,14 @@ log ">>> Extra gate command: $BASE_COMMAND"
 # PIPESTATUS, not the pipeline's status: tee and the logging loop must never be
 # able to turn a failing gate into a pass, and the status the Manager reads has
 # to be the COMMAND's own exit code.
+# CI, because a gate must terminate. A project whose `test` script is bare
+# `vitest` or `jest` starts a WATCH that never exits, and the gate would sit
+# there until the wait timeout fires - two hours of a squad doing nothing. Both
+# runners treat a set CI as "run once and exit", which is also what the
+# project's own CI relies on. Pre-set by the caller wins, so a PO who exports
+# CI for some other reason is not overruled here.
 set +e
-bash -lc "$BASE_COMMAND" 2>&1 |
+CI="${CI:-1}" bash -lc "$BASE_COMMAND" 2>&1 |
   tee -a "$RESULT_FILE" |
   while IFS= read -r line; do log "$line"; done
 GATE_STATUS="${PIPESTATUS[0]}"
@@ -4458,6 +4537,7 @@ resume_run() {
   # Same reason, for a run created before the extra gate existed: it resolves to
   # the empty command, which the helper reports as a skip.
   printf '%s\n' "${EXTRA_GATE_COMMAND:-}" > "$SQUAD_DIR/extra-gate-command.txt"
+  printf '%s\n' "${EXTRA_GATE_SCOPE:-always}" > "$SQUAD_DIR/extra-gate-command.scope"
   # Same reason: a squad created before the review round cap existed has no
   # REVIEW_MAX_ROUNDS in state.env, and the Manager prompt interpolates it. The
   # recorded value wins over the environment, exactly as WAIT_TIMEOUT_SECONDS
@@ -4629,6 +4709,7 @@ case "$1" in
     printf '%s\n' "${SQUAD_GEN_RUBOCOP_COMMAND:-}" > "$SQUAD_DIR/rubocop-command.txt"
     printf '%s\n' "${SQUAD_GEN_BRAKEMAN_COMMAND:-}" > "$SQUAD_DIR/brakeman-command.txt"
     printf '%s\n' "${SQUAD_GEN_EXTRA_GATE_COMMAND:-}" > "$SQUAD_DIR/extra-gate-command.txt"
+    printf '%s\n' "${SQUAD_GEN_EXTRA_GATE_SCOPE:-always}" > "$SQUAD_DIR/extra-gate-command.scope"
     printf '%s\n' "$SQUAD_TITLE" > "$SQUAD_DIR/title.txt"
     generate_schemas
     generate_review_checklist
@@ -4850,57 +4931,229 @@ fi
 # It exists because the other two gates are Ruby tools. In a TypeScript, Go or
 # Python repository both resolve to the empty command and skip, and the squad
 # then runs with NO quality gate at all - the two review lenses are a review,
-# not a gate. squad deliberately does not know what a non-Ruby project should
-# check: the project bundles its own checks behind one script, and squad
-# requires exit status 0 from it.
+# not a gate. A project can bundle its own checks behind one ci:gates script,
+# and squad requires exit status 0 from it. When it has not, squad composes the
+# gate from the scripts a JS/TS project already declares - typecheck, lint,
+# test - because the alternative, measured over 107 of 109 runs, is a TypeScript
+# squad running with no gate at all and nobody noticing.
 #
 # Detection has the same shape as the other two, with one deliberate
 # difference: the override is honoured even when EMPTY (tested with +x, not
 # -n). Setting SQUAD_EXTRA_GATE_COMMAND to the empty string is how a project
-# that HAS a ci:gates script turns this gate off for a run; for the Ruby gates
-# the equivalent is simply not having the tool installed.
-extra_gate_script_declared() {
-  # A non-empty `ci:gates` entry under "scripts". jq when it is available,
-  # because a regex over JSON is a guess; the grep fallback only has to be right
-  # about a key the project itself wrote.
-  local package_json="$1"
+# that HAS a gate turns it off for a run; for the Ruby gates the equivalent is
+# simply not having the tool installed.
+
+# A non-empty entry under "scripts". jq when it is available, because a regex
+# over JSON is a guess; the grep fallback only has to be right about a key the
+# project itself wrote.
+#
+# That fallback is only ever reached for `ci:gates`, a key nothing but a gate
+# declares. The composed gate below refuses to run without jq, because "test"
+# and "lint" are ordinary enough words to appear elsewhere in a package.json,
+# and a wrong guess there would invent a gate the project never asked for.
+package_script_declared() {
+  local package_json="$1" script="$2"
   if command -v jq >/dev/null 2>&1; then
-    jq -e '(.scripts["ci:gates"] // empty) | select(. != "")' "$package_json" >/dev/null 2>&1
+    jq -e --arg s "$script" '(.scripts[$s] // empty) | select(. != "")' \
+      "$package_json" >/dev/null 2>&1
   else
-    grep -qE '"ci:gates"[[:space:]]*:' "$package_json"
+    grep -qE "\"$script\"[[:space:]]*:" "$package_json"
   fi
 }
 
+# The package manager this repository is run with, as a bare name, or the empty
+# string when none is available. The committed lockfile decides, because that is
+# what the repository itself chose; only then whatever happens to be installed.
+detect_package_manager() {
+  if [[ -f "$REPO_ROOT/pnpm-lock.yaml" ]] && command -v pnpm >/dev/null 2>&1; then
+    printf 'pnpm'
+  elif [[ -f "$REPO_ROOT/yarn.lock" ]] && command -v yarn >/dev/null 2>&1; then
+    printf 'yarn'
+  elif [[ -f "$REPO_ROOT/bun.lockb" || -f "$REPO_ROOT/bun.lock" ]] &&
+    command -v bun >/dev/null 2>&1; then
+    printf 'bun'
+  elif [[ -f "$REPO_ROOT/package-lock.json" ]] &&
+    command -v npm >/dev/null 2>&1; then
+    printf 'npm'
+  elif command -v pnpm >/dev/null 2>&1; then
+    printf 'pnpm'
+  elif command -v npm >/dev/null 2>&1; then
+    printf 'npm'
+  fi
+}
+
+# Does package.json PIN this manager, through the `packageManager` field that
+# corepack reads? jq when it is available, for the same reason
+# package_script_declared prefers it; the grep fallback only has to be right
+# about a key written as `"packageManager": "pnpm@10.6.5"`.
+package_manager_pinned() {
+  local package_json="$1" manager="$2"
+  [[ -f "$package_json" ]] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    jq -e --arg m "$manager@" '(.packageManager // "") | startswith($m)' \
+      "$package_json" >/dev/null 2>&1
+  else
+    grep -qE "\"packageManager\"[[:space:]]*:[[:space:]]*\"$manager@" "$package_json"
+  fi
+}
+
+# How the detected manager is INVOKED, which is not always its own name: a pnpm
+# the project PINS is run as `corepack pnpm`, so the gate uses the version the
+# repository chose rather than whatever pnpm happens to be first on PATH. That
+# gap is what the squads asked to stop tripping over - the pnpm on PATH in this
+# fleet is 8.7.3 while the pinned repositories ask for 9.4.0, 10.6.5 and
+# 10.30.1, and `--frozen-lockfile` across that gap fails on the lockfile instead
+# of on the change.
+#
+# BOTH halves of the condition are load-bearing, and the second is why this is
+# NOT a blanket rewrite of every `pnpm` to `corepack pnpm`. Asked for pnpm with
+# no pin, corepack answers with its own built-in default - measured here as pnpm
+# 6.11.0, older than anything on PATH and unable to read a modern lockfile at
+# all. An unpinned repository is strictly better off with the bare name, which
+# is what it already had.
+#
+# yarn is deliberately left alone even where it is pinned: the request was about
+# pnpm, and adding a `yarn` arm to the case below is the whole change if the
+# yarn repositories ever want the same.
+package_manager_exec() {
+  local manager="$1"
+  case "$manager" in
+    pnpm)
+      if command -v corepack >/dev/null 2>&1 &&
+        package_manager_pinned "$REPO_ROOT/package.json" "$manager"; then
+        printf 'corepack %s' "$manager"
+        return
+      fi
+      ;;
+  esac
+  printf '%s' "$manager"
+}
+
+# Restore node_modules EXACTLY as the committed lockfile pins it.
+#
+# This is the first link of a COMPOSED gate, and it is not optional. The gate
+# runs in the squad worktree, and git creates a worktree WITHOUT node_modules -
+# it is an ignored directory, so nothing is carried over from the original
+# checkout. `typecheck && lint && test` in a fresh worktree therefore fails on
+# missing modules rather than on the change, and a gate that fails for an
+# environmental reason blocks every round of the squad: strictly worse than the
+# gate skipping. CI installs first for exactly this reason, and the install is a
+# fast no-op once satisfied, so paying it every round costs nothing.
+#
+# Frozen/immutable deliberately: a gate must never be able to move the
+# lockfile. A package.json that disagrees with its lockfile fails here, which is
+# the same answer CI gives.
+package_manager_install() {
+  # The name still decides WHICH install this is; package_manager_exec decides
+  # what actually runs it.
+  local run
+  run="$(package_manager_exec "$1")"
+  case "$1" in
+    pnpm) printf '%s install --frozen-lockfile' "$run" ;;
+    # Berry rejects --frozen-lockfile and classic does not know --immutable.
+    # A .yarnrc.yml is what tells the two apart.
+    yarn)
+      if [[ -f "$REPO_ROOT/.yarnrc.yml" ]]; then
+        printf '%s install --immutable' "$run"
+      else
+        printf '%s install --frozen-lockfile' "$run"
+      fi
+      ;;
+    bun) printf '%s install --frozen-lockfile' "$run" ;;
+    npm) printf '%s ci' "$run" ;;
+  esac
+}
+
+# `always` unless squad composed the gate itself. run-extra-gate reads this and,
+# for a composed gate only, decides from the changed files whether it applies.
+EXTRA_GATE_SCOPE="always"
 if [[ -n "${SQUAD_EXTRA_GATE_COMMAND+x}" ]]; then
   EXTRA_GATE_COMMAND="$SQUAD_EXTRA_GATE_COMMAND"
-elif [[ ! -f "$REPO_ROOT/package.json" ]] ||
-  ! extra_gate_script_declared "$REPO_ROOT/package.json"; then
-  # Nothing declared: run-extra-gate reports the step as skipped instead of
-  # failing the squad, exactly as the two Ruby gates do outside Ruby.
+elif [[ ! -f "$REPO_ROOT/package.json" ]]; then
+  # Not a JS/TS project either: run-extra-gate sees the empty command and
+  # reports the step as skipped instead of failing the squad, exactly as the two
+  # Ruby gates do outside Ruby.
   EXTRA_GATE_COMMAND=""
-elif [[ -f "$REPO_ROOT/pnpm-lock.yaml" ]] && command -v pnpm >/dev/null 2>&1; then
-  EXTRA_GATE_COMMAND="pnpm run ci:gates"
-elif [[ -f "$REPO_ROOT/yarn.lock" ]] && command -v yarn >/dev/null 2>&1; then
-  EXTRA_GATE_COMMAND="yarn run ci:gates"
-elif [[ -f "$REPO_ROOT/bun.lockb" || -f "$REPO_ROOT/bun.lock" ]] &&
-  command -v bun >/dev/null 2>&1; then
-  EXTRA_GATE_COMMAND="bun run ci:gates"
-elif [[ -f "$REPO_ROOT/package-lock.json" ]] && command -v npm >/dev/null 2>&1; then
-  EXTRA_GATE_COMMAND="npm run ci:gates"
-elif command -v pnpm >/dev/null 2>&1; then
-  EXTRA_GATE_COMMAND="pnpm run ci:gates"
-elif command -v npm >/dev/null 2>&1; then
-  EXTRA_GATE_COMMAND="npm run ci:gates"
 else
-  # A declared ci:gates script with nothing to run it is a broken toolchain, not
-  # an absent gate - and in a non-Ruby project it is the ONLY gate there is.
-  # Fail at LAUNCH, where the PO sees it immediately, rather than reporting
-  # green every round. Brakeman skips instead because a Ruby project still has
-  # RuboCop; here there is nothing left.
-  echo "Error: package.json declares a ci:gates script but no package manager was found to run it." >&2
-  echo "Install pnpm, yarn or npm, or set SQUAD_EXTRA_GATE_COMMAND to the project-specific command." >&2
-  echo "Set SQUAD_EXTRA_GATE_COMMAND to the empty string to turn the extra gate off." >&2
-  exit 1
+  PACKAGE_MANAGER="$(detect_package_manager)"
+  PACKAGE_MANAGER_RUN="$(package_manager_exec "$PACKAGE_MANAGER")"
+  if package_script_declared "$REPO_ROOT/package.json" ci:gates; then
+    if [[ -z "$PACKAGE_MANAGER" ]]; then
+      # A declared ci:gates script with nothing to run it is a broken
+      # toolchain, not an absent gate - and in a non-Ruby project it is the
+      # ONLY gate there is. Fail at LAUNCH, where PO sees it immediately,
+      # rather than reporting green every round. Brakeman skips instead because
+      # a Ruby project still has RuboCop; here there would be nothing left.
+      echo "Error: package.json declares a ci:gates script but no package manager was found to run it." >&2
+      echo "Install pnpm, yarn or npm, or set SQUAD_EXTRA_GATE_COMMAND to the project-specific command." >&2
+      echo "Set SQUAD_EXTRA_GATE_COMMAND to the empty string to turn the extra gate off." >&2
+      exit 1
+    fi
+    # An explicit ci:gates is the project's own statement of what its gate is,
+    # and it is taken EXACTLY as written - nothing is prepended to it. A project
+    # that bundles its checks behind one script owns what that script assumes.
+    EXTRA_GATE_COMMAND="$PACKAGE_MANAGER_RUN run ci:gates"
+  elif [[ -z "$PACKAGE_MANAGER" ]] || ! command -v jq >/dev/null 2>&1; then
+    # Nothing was declared, so nothing was promised: skip rather than fail.
+    # Unlike the ci:gates branch above, PO is not owed an error here.
+    #
+    # A resolved Ruby gate is NOT a reason to skip. Which gates a repository has
+    # is decided from its toolchains, and which of them run is decided per round
+    # from the changed files - the same axis RuboCop has always used. A Rails
+    # repository with a TypeScript frontend gets both gates, and each one stays
+    # quiet for a change it has nothing to say about.
+    EXTRA_GATE_COMMAND=""
+  else
+    # The "look at the language and pick the tools" branch, and the reason the
+    # header above no longer claims squad cannot know what a non-Ruby project
+    # should check.
+    #
+    # It composes ONLY scripts THE PROJECT WROTE, in fail-fast order: typecheck
+    # is the fastest and catches the most, test is the slowest. squad never
+    # invents a command - a repository declaring none of the three still skips -
+    # and a project wanting something else declares ci:gates or sets
+    # SQUAD_EXTRA_GATE_COMMAND, both of which win over this.
+    #
+    # A composed gate is also SCOPED to the files it is about, exactly as
+    # RuboCop is: run-extra-gate skips it when the change touched no JS/TS file.
+    # That is what lets a Rails-plus-TypeScript repository carry both gates
+    # without either running over a change it has nothing to say about.
+    #
+    # What squad still CANNOT check is whether these scripts are fit to be a
+    # gate. A `lint` carrying --fix rewrites the worktree - acceptable, because
+    # RuboCop autocorrects too and the result lands in the review as part of the
+    # uncommitted change. A `test` of bare `vitest` or `jest` is WATCH MODE and
+    # would hang until the wait timeout; that one is handled by the CI variable
+    # run-extra-gate exports, which both runners read as "run once and exit".
+    # The resolved command is printed in run-info.txt at launch, worth a glance
+    # the first time a squad runs in a new repository, and
+    # SQUAD_EXTRA_GATE_COMMAND is the answer when it is wrong.
+    #
+    # Accumulated into a string rather than an array because /bin/bash on macOS
+    # is 3.2, where expanding an empty array under `set -u` is an
+    # unbound-variable error.
+    AUTO_GATE_PARTS=""
+    for auto_gate_script in typecheck lint test; do
+      package_script_declared "$REPO_ROOT/package.json" "$auto_gate_script" ||
+        continue
+      AUTO_GATE_PARTS="$AUTO_GATE_PARTS && $PACKAGE_MANAGER_RUN run $auto_gate_script"
+    done
+    if [[ -z "$AUTO_GATE_PARTS" ]]; then
+      EXTRA_GATE_COMMAND=""
+    else
+      EXTRA_GATE_COMMAND="$(package_manager_install "$PACKAGE_MANAGER")$AUTO_GATE_PARTS"
+      EXTRA_GATE_SCOPE="js-ts"
+    fi
+  fi
+fi
+
+# A composed gate is squad's guess at what this project checks, so run-info says
+# so out loud. PO reading one line is the only review this guess ever gets.
+if [[ "$EXTRA_GATE_SCOPE" == "js-ts" ]]; then
+  EXTRA_GATE_SCOPE_NOTE="
+                   (composed by squad from package.json; runs in a round that changed a JS/TS file)"
+else
+  EXTRA_GATE_SCOPE_NOTE=""
 fi
 
 if [[ "$HAS_COMMITS" == "true" ]]; then
@@ -4948,7 +5201,7 @@ Manager session:   $MANAGER_SESSION_ID
 Coder session:     $CODER_SESSION_ID
 RuboCop command:   ${RUBOCOP_COMMAND:-(none: not a Ruby project, RuboCop step is skipped)}
 Brakeman command:  ${BRAKEMAN_COMMAND:-(none: not a Ruby project or Brakeman not installed, Brakeman step is skipped)}
-Extra gate:        ${EXTRA_GATE_COMMAND:-(none: no ci:gates script and no SQUAD_EXTRA_GATE_COMMAND, extra gate is skipped)}
+Extra gate:        ${EXTRA_GATE_COMMAND:-(none: no package.json gate script and no SQUAD_EXTRA_GATE_COMMAND, extra gate is skipped)}$EXTRA_GATE_SCOPE_NOTE
 Wait timeout:      $WAIT_TIMEOUT_SECONDS seconds
 Review rounds:     $REVIEW_MAX_ROUNDS maximum
 INFO
@@ -4988,6 +5241,7 @@ generate_schemas
 printf '%s\n' "$RUBOCOP_COMMAND" > "$SQUAD_DIR/rubocop-command.txt"
 printf '%s\n' "$BRAKEMAN_COMMAND" > "$SQUAD_DIR/brakeman-command.txt"
 printf '%s\n' "$EXTRA_GATE_COMMAND" > "$SQUAD_DIR/extra-gate-command.txt"
+printf '%s\n' "$EXTRA_GATE_SCOPE" > "$SQUAD_DIR/extra-gate-command.scope"
 
 # --- Generated helper scripts and Manager prompt ------------------------------
 # All three are regenerated verbatim by resume_run, so they must never contain a

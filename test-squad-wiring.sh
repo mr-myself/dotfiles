@@ -1829,6 +1829,102 @@ check_contains "the resume prompt carries the extra gate too" \
 check_contains "the extra gate is documented in the usage text" \
   "$("$SQUAD" --help 2>&1)" "SQUAD_EXTRA_GATE_COMMAND"
 
+# The scope travels beside the command, so gen-helpers has to write it too.
+check_eq "a declared gate is scoped always" \
+  "always" "$(cat "$GEN_GATE/extra-gate-command.scope" 2>/dev/null)"
+
+# --- which change a gate applies to -------------------------------------------
+#
+# A gate squad COMPOSED from package.json is scoped the way RuboCop has always
+# been scoped: by the changed files. A gate the PROJECT declared is not, because
+# the project is talking about its whole repository - the one real ci:gates in
+# this fleet bundles a secret scan and a DB-schema check, and skipping those for
+# a SQL-only change would be squad overruling the project.
+#
+# These run the generated helper against a throwaway repository, because the
+# whole question is what git reports as changed.
+SCOPE_REPO="$(mktemp -d "$ROOT/scope-repo.XXXXXX")"
+(
+  cd "$SCOPE_REPO" &&
+    git init -q . &&
+    git config user.email harness@test &&
+    git config user.name harness &&
+    printf 'class A; end\n' > a.rb &&
+    printf 'export const b = 1\n' > b.ts &&
+    git add -A &&
+    git commit -qm init
+) >/dev/null 2>&1
+
+# Runs the helper with a scope, after `setup` has dirtied the repository, and
+# prints whether the gate command actually executed. The command touches a
+# marker file, so "did it run" is a fact on disk rather than a reading of the
+# log.
+run_scoped_gate() {
+  local name="$1" scope="$2" setup="$3"
+  local mark="$GATE_DIR/$name.ran"
+  rm -f "$mark"
+  printf "touch '%s'\n" "$mark" > "$GATE_DIR/$name.txt"
+  printf '%s\n' "$scope" > "$GATE_DIR/$name.scope"
+  (
+    cd "$SCOPE_REPO" &&
+      git reset -q --hard HEAD &&
+      git clean -qfd &&
+      eval "$setup" &&
+      "$GEN/run-extra-gate" "$GATE_DIR/$name.txt" "$GATE_DIR/$name.result" \
+        "$GATE_DIR/$name.status" "squad-test-gate-scope-$name" \
+        "$GATE_DIR/title.txt"
+  ) >/dev/null 2>&1
+  if [[ -f "$mark" ]]; then printf 'ran'; else printf 'skipped'; fi
+}
+
+check_eq "a composed gate stays out of a Ruby-only change" \
+  "skipped" "$(run_scoped_gate rb_only js-ts "printf '# t\n' >> a.rb")"
+check_eq "and records that as a skip, not a block" \
+  "0" "$(cat "$GATE_DIR/rb_only.status")"
+check_contains "and says which change it was not for" \
+  "$(cat "$GATE_DIR/rb_only.result")" "no changed JS/TS file"
+check_eq "a composed gate runs on a TypeScript change" \
+  "ran" "$(run_scoped_gate ts_only js-ts "printf '// t\n' >> b.ts")"
+# A deleted module is the change most likely to break a typecheck elsewhere, and
+# it is the one a --diff-filter copied from run-rubocop would have dropped.
+check_eq "a DELETED TypeScript file still runs a composed gate" \
+  "ran" "$(run_scoped_gate ts_gone js-ts "git rm -q b.ts")"
+check_eq "an untracked .tsx runs a composed gate" \
+  "ran" "$(run_scoped_gate tsx_new js-ts "printf 'export const c = 2\n' > c.tsx")"
+check_eq "a lockfile-only change runs a composed gate" \
+  "ran" "$(run_scoped_gate lock_only js-ts "printf 'x\n' > pnpm-lock.yaml")"
+check_eq "a docs-only change stays out of a composed gate" \
+  "skipped" "$(run_scoped_gate docs_only js-ts "printf 'hi\n' > README.md")"
+check_eq "a gate the project declared runs whatever changed" \
+  "ran" "$(run_scoped_gate declared always "printf '# t\n' >> a.rb")"
+
+# A run created before the scope existed has no scope file, and its gate was
+# either an override or a ci:gates script. Both of those are always.
+rm -f "$GATE_DIR/legacy.ran" "$GATE_DIR/legacy.scope"
+printf "touch '%s'\n" "$GATE_DIR/legacy.ran" > "$GATE_DIR/legacy.txt"
+(
+  cd "$SCOPE_REPO" && git reset -q --hard HEAD && git clean -qfd &&
+    printf '# t\n' >> a.rb &&
+    "$GEN/run-extra-gate" "$GATE_DIR/legacy.txt" "$GATE_DIR/legacy.result" \
+      "$GATE_DIR/legacy.status" "squad-test-gate-scope-legacy" \
+      "$GATE_DIR/title.txt"
+) >/dev/null 2>&1
+check_eq "a run with no scope file behaves as always" \
+  "0" "$([[ -f "$GATE_DIR/legacy.ran" ]]; echo $?)"
+
+# A `test` script of bare `vitest` or `jest` is a WATCH, and a watching gate
+# hangs until the wait timeout instead of failing. Both runners read CI as "run
+# once", which is the only reason composing a project's `test` script is safe.
+printf 'printf "CI=%%s\\n" "${CI:-unset}"\n' > "$GATE_DIR/ci.txt"
+printf 'always\n' > "$GATE_DIR/ci.scope"
+(
+  cd "$GATE_DIR" &&
+    "$GEN/run-extra-gate" "$GATE_DIR/ci.txt" "$GATE_DIR/ci.result" \
+      "$GATE_DIR/ci.status" "squad-test-gate-scope-ci" "$GATE_DIR/title.txt"
+) >/dev/null 2>&1
+check_contains "the gate runs its command with CI set, so a watch cannot hang it" \
+  "$(cat "$GATE_DIR/ci.result")" "CI=1"
+
 echo ""
 
 # =================================================================== squad-herdr ==
