@@ -784,11 +784,16 @@ require_readable_checklist_config() {
 # format guarantees. Three groups, decided from the IDs the merged file really
 # contains:
 #
-#   correctness only  COR, ARCH, TEST, PERF
+#   correctness only  COR, ARCH, TEST, PERF, A11Y, DOC, INTEG
 #   security only     SEC
 #   BOTH lenses       DAT (data integrity), ERR (error and information
 #                     handling), COMPAT (compatibility) - each genuinely serves
 #                     both lenses - and every other prefix, known or not.
+#
+# A11Y, DOC and INTEG are named here rather than left to the unknown-prefix
+# default, which sends an item to BOTH lenses: contrast, stale prose and an
+# unconsumed form field are correctness questions, and the security lens pays
+# their token cost twice while having nothing to say about them.
 #
 # The two "only" sets are DISJOINT, so every item in checklist.merged.md lands
 # in at least one derived file. An unrecognised prefix (a project's own ID) goes
@@ -800,7 +805,8 @@ LENS_CHECKLIST_SELECT='
   | select(
       lens_prefix as $p
       | if $lens == "security"
-        then ($p != "COR" and $p != "ARCH" and $p != "TEST" and $p != "PERF")
+        then ($p != "COR" and $p != "ARCH" and $p != "TEST" and $p != "PERF"
+              and $p != "A11Y" and $p != "DOC" and $p != "INTEG")
         else ($p != "SEC")
         end
     )

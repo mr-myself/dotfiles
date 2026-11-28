@@ -369,11 +369,23 @@ for shared_id in DAT-002 ERR-001 COMPAT-001; do
 done
 
 # The vet parse contract again, from the other side: an indented retired ID must
-# never appear as an item in anything squad generates.
+# never appear as an item in anything squad generates. Both sentinels must be
+# IDs that are STILL retired - INTEG-001 was one until it came back as a live
+# item, at which point the security-side check stayed green because the item is
+# correctness-only, and stopped testing the parse contract at all.
 check_absent "no retired ID leaks into the correctness lens file" \
   "$correctness_ids" "MNT-001"
 check_absent "no retired ID leaks into the security lens file" \
-  "$security_ids" "INTEG-001"
+  "$security_ids" "OBS-001"
+
+# The correctness-only prefixes beyond COR: contrast, stale prose and an
+# unconsumed form field cost the security lens tokens and tell it nothing, so
+# the routing must keep them out of it rather than fall through to the
+# unknown-prefix default of BOTH.
+for own_id in A11Y-001 DOC-001 INTEG-001 TEST-001 PERF-001 ARCH-001; do
+  check_contains "$own_id reaches the correctness lens" "$correctness_ids" "$own_id"
+  check_absent "$own_id does not reach the security lens" "$security_ids" "$own_id"
+done
 
 # An unrecognised prefix is fail-safe: it goes to BOTH lenses rather than
 # vanishing from the review.
